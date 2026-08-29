@@ -10,7 +10,7 @@
 ## Запуск
 
 ```powershell
-cd "C:\Users\STEPWICE\Desktop\Новая папка (2)\provider-studio"
+cd provider-studio
 npm start
 ```
 
