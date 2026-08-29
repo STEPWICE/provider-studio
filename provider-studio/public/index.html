@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Provider Studio</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">PS</div>
+        <div>
+          <div class="brand-name">Provider Studio</div>
+          <div class="brand-sub">провайдеры и модели</div>
+        </div>
+      </div>
+      <div class="side-section">
+        <div class="side-title">Инструменты</div>
+        <div class="targets" id="targets"></div>
+      </div>
+      <div class="side-section">
+        <div class="side-title">Сохранённые провайдеры <span class="provider-count" id="providerCount"></span></div>
+        <input type="text" id="providerSearch" class="provider-search" placeholder="Поиск… (/)" aria-label="Поиск по сохранённым провайдерам" />
+        <div class="provider-list" id="providerList"></div>
+        <button class="btn btn-soft side-sync" id="btnImport">Импортировать из opencode</button>
+      </div>
+      <div class="side-foot">
+        <button class="btn btn-primary side-sync" id="btnWizard">Мастер настройки</button>
+        <button class="btn btn-ghost side-sync" id="btnNew">+ Новый провайдер</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-title">
+          <h1>Настройки моделей</h1>
+          <p class="muted">Добавь кастомный API-эндпоинт и его модели.</p>
+        </div>
+        <div class="topbar-right">
+          <select id="configPicker" class="config-picker" aria-label="Какой конфиг править" title="Какой файл конфигурации править"></select>
+          <div class="opencode-chip" id="openCodeChip" title=""></div>
+        </div>
+      </header>
+
+      <!-- Two columns on a wide window. Everything used to be one 760px stack,
+           so the diagnostics output appeared far below the fold while the right
+           half of the screen stayed empty. -->
+      <div class="workspace">
+      <div class="col-main">
+      <div class="card" id="editor">
+        <!-- Провайдер -->
+        <div class="card-head">
+          <div class="form-grid">
+            <div class="field">
+              <label>Название</label>
+              <input type="text" id="f-name" placeholder="например BAI / DeepSeek" />
+            </div>
+            <div class="field">
+              <label>Base URL</label>
+              <input type="text" id="f-baseurl" placeholder="https://api.example.com/v1" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label>API-ключ</label>
+            <div class="key-row">
+              <input type="password" id="f-apikey" placeholder="Введи API-ключ" autocomplete="off" />
+              <button type="button" class="btn-eye" id="btnEye" title="Показать/скрыть ключ">&#x1F441;</button>
+              <label class="env-toggler" title="Писать в конфиг ссылку на переменную окружения вместо самого ключа">
+                <input type="checkbox" id="f-env" checked />
+                <span class="ck"></span><span>$ENV</span>
+              </label>
+            </div>
+            <input type="text" id="f-envname" class="envname" placeholder="Имя переменной, например BAI_API_KEY" aria-label="Имя переменной окружения" />
+            <div class="env-state" id="envState" hidden></div>
+            <div class="fmt-note" id="keyHint"></div>
+          </div>
+
+          <div class="field">
+            <label>Формат API</label>
+            <select id="f-format"></select>
+            <div class="fmt-note" id="f-format-note"></div>
+          </div>
+
+          <div class="field field-inline">
+            <button class="btn btn-ghost btn-sm" id="btnDiscover" title="Получить список моделей с сервера">&#x1F50D; Обнаружить модели</button>
+          </div>
+        </div>
+
+        <!-- Модели -->
+        <div class="models-block">
+          <div class="models-head">
+            <span>Список моделей</span>
+            <div class="row-actions">
+              <button class="btn btn-ghost btn-sm" id="btnTestAll" title="Отправить пробный запрос к каждой модели по очереди">&#x26A1; Проверить все</button>
+              <button class="btn btn-soft" id="btnAddModel">+ Добавить модель</button>
+            </div>
+          </div>
+          <div class="batch-status" id="batchStatus" hidden></div>
+          <div class="model-list" id="modelList"></div>
+        </div>
+
+        <!-- Таргеты -->
+        <div class="targets-block">
+          <div class="side-title">Добавить в</div>
+          <div class="target-chips" id="targetChips"></div>
+        </div>
+
+        <div class="actions">
+          <label class="check-line">
+            <input type="checkbox" id="f-default" checked />
+            <span>Сделать моделью по умолчанию</span>
+          </label>
+          <select id="f-defaultmodel" class="default-model" aria-label="Модель по умолчанию"></select>
+          <span class="spacer"></span>
+          <button class="btn btn-ghost" id="btnPaste">Скопировать JSON</button>
+          <button class="btn btn-soft" id="btnTest" title="Проверить соединение">Проверить</button>
+          <button class="btn btn-soft" id="btnPreview" title="Показать, что изменится в файле (Ctrl+D)">Показать diff</button>
+          <button class="btn btn-primary" id="btnApply" title="Записать в конфиг (Ctrl+S)">Применить</button>
+        </div>
+      </div>
+
+      </div>
+
+      <aside class="col-side">
+        <!-- These three buttons all render into this column, so they belong at
+             the top of it. At the bottom of the left stack they sat below the
+             fold, which meant the placeholder was telling the user to press a
+             button that was not on screen. -->
+        <div class="toolbar">
+          <button class="btn btn-soft" id="btnDiag" title="Проверить всё: конфиг + соединение">Диагностика</button>
+          <button class="btn btn-soft" id="btnValidate">Проверить конфиг</button>
+          <button class="btn btn-soft" id="btnBackupNow">Бэкап</button>
+          <span class="muted" id="backupInfo"></span>
+        </div>
+        <!-- Placeholder rather than an empty column: an unexplained blank area
+             reads as a rendering bug, and this is also the natural place to say
+             what the buttons above it will produce. -->
+        <div class="side-empty" id="sideEmpty">
+          <div class="side-empty-title">Здесь появятся результаты</div>
+          <p>Нажми «Диагностика», чтобы проверить, какие провайдеры отвечают и какая модель стоит по умолчанию.</p>
+        </div>
+        <div class="issues" id="issues" hidden></div>
+        <div class="backups" id="backups" hidden></div>
+        <div class="results" id="results" hidden></div>
+      </aside>
+      </div>
+    </main>
+  </div>
+
+  <!-- Toast lives at body level: inside .actions it stretched the flex row and
+       its fixed positioning fought the row's alignment. -->
+  <div class="status" id="status" role="status" aria-live="polite"></div>
+
+  <!-- Модалка «Добавить модель» -->
+  <div class="modal-backdrop" id="modalBackdrop" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <span>Добавить модель</span>
+        <button class="close" id="modalClose">&times;</button>
+      </div>
+      <div class="field">
+        <label>ID модели</label>
+        <input type="text" id="m-id" placeholder="Model ID" />
+      </div>
+      <div class="field">
+        <label>Отображаемое имя</label>
+        <input type="text" id="m-name" placeholder="Имя (необязательно)" />
+      </div>
+        <div class="form-grid">
+          <div class="field">
+            <label>Контекст (окно)</label>
+            <input type="number" id="m-context" placeholder="напр. 200000" min="0" />
+          </div>
+          <div class="field">
+            <label>Макс. токенов на выход</label>
+            <input type="number" id="m-output" placeholder="напр. 65536" min="0" />
+          </div>
+        </div>
+
+      <div class="field">
+        <label>Типы входа</label>
+        <div class="chips" id="m-inputs"></div>
+      </div>
+      <div class="field">
+        <label>Типы выхода</label>
+        <div class="chips" id="m-outputs"></div>
+      </div>
+      <div class="field">
+        <label class="check-line">
+          <input type="checkbox" id="m-reasoning" />
+          Поддержка reasoning (thinking)
+        </label>
+        <label class="check-line">
+          <input type="checkbox" id="m-tools" checked />
+          Поддержка вызова инструментов (tools)
+        </label>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" id="m-cancel">Отмена</button>
+        <button class="btn btn-primary" id="m-save">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модалка «Обнаружить модели» -->
+  <div class="modal-backdrop" id="discoverBackdrop" hidden>
+    <div class="modal modal-wide">
+      <div class="modal-head">
+        <span>Найденные модели</span>
+        <button class="close" id="discoverClose">&times;</button>
+      </div>
+      <div class="discover-status" id="discoverStatus"></div>
+      <div class="discover-filters">
+        <input type="text" id="disc-search" placeholder="Поиск по названию…" />
+        <span class="filter-chip" data-f="free">Бесплатные</span>
+        <span class="filter-chip" data-f="vision">С вижном</span>
+        <span class="filter-chip" data-f="reasoning">С reasoning</span>
+      </div>
+      <div class="discover-list" id="discoverList"></div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" id="discoverCancel">Отмена</button>
+        <button class="btn btn-primary" id="discoverAdd">Добавить выбранные (0)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Мастер настройки. Существует потому, что новичок не может угадать
+       Base URL, а неверная догадка проявляется намного позже — уже внутри
+       opencode, как 404 на каждом запросе. -->
+  <div class="modal-backdrop" id="wizardBackdrop" hidden>
+    <div class="modal modal-wide wizard" role="dialog" aria-modal="true" aria-labelledby="wizTitle">
+      <div class="modal-head">
+        <span id="wizTitle">Мастер настройки</span>
+        <button class="close" id="wizClose" aria-label="Закрыть">&times;</button>
+      </div>
+
+      <ol class="wiz-steps" id="wizSteps">
+        <li data-step="0">Провайдер</li>
+        <li data-step="1">Ключ</li>
+        <li data-step="2">Модели</li>
+        <li data-step="3">Запись</li>
+      </ol>
+
+      <!-- Шаг 1: выбор пресета -->
+      <section class="wiz-pane" id="wizPane0">
+        <p class="wiz-lead">Выбери сервис. Base URL и формат API подставятся сами.</p>
+        <div class="preset-grid" id="presetGrid"></div>
+      </section>
+
+      <!-- Шаг 2: ключ -->
+      <section class="wiz-pane" id="wizPane1" hidden>
+        <p class="wiz-lead" id="wizKeyLead"></p>
+        <div class="field">
+          <label>Название провайдера</label>
+          <input type="text" id="wiz-name" placeholder="например DeepSeek" />
+        </div>
+        <div class="field">
+          <label>Base URL</label>
+          <input type="text" id="wiz-baseurl" placeholder="https://api.example.com/v1" />
+        </div>
+        <div class="field">
+          <label>API-ключ</label>
+          <div class="key-row">
+            <input type="password" id="wiz-apikey" placeholder="Вставь ключ" autocomplete="off" />
+            <button type="button" class="btn-eye" id="wizEye" title="Показать/скрыть ключ">&#x1F441;</button>
+          </div>
+          <div class="fmt-note" id="wizKeyNote"></div>
+        </div>
+        <label class="check-line">
+          <input type="checkbox" id="wiz-env" checked />
+          <span>Не писать ключ в конфиг — использовать переменную окружения (рекомендуется)</span>
+        </label>
+        <div class="field" id="wizEnvField">
+          <label>Имя переменной</label>
+          <input type="text" id="wiz-envname" placeholder="DEEPSEEK_API_KEY" />
+          <div class="env-state" id="wizEnvState" hidden></div>
+        </div>
+      </section>
+
+      <!-- Шаг 3: модели -->
+      <section class="wiz-pane" id="wizPane2" hidden>
+        <p class="wiz-lead">Отметь модели, которые хочешь использовать.</p>
+        <div class="discover-status" id="wizModelStatus"></div>
+        <div class="discover-filters">
+          <input type="text" id="wiz-search" placeholder="Поиск по названию…" />
+          <span class="filter-chip" id="wizFreeOnly" data-f="free" title="Показать только модели, за которые провайдер не берёт денег">Только бесплатные</span>
+          <button class="btn btn-ghost btn-sm" id="wizReload" title="Запросить список заново">Обновить</button>
+        </div>
+        <div class="discover-list" id="wizModelList"></div>
+      </section>
+
+      <!-- Шаг 4: итог перед записью -->
+      <section class="wiz-pane" id="wizPane3" hidden>
+        <p class="wiz-lead">Проверь итог. Ничего не записано, пока не нажмёшь кнопку.</p>
+        <div class="wiz-summary" id="wizSummary"></div>
+      </section>
+
+      <div class="modal-foot">
+        <span class="muted" id="wizHint"></span>
+        <button class="btn btn-ghost" id="wizBack">Назад</button>
+        <button class="btn btn-primary" id="wizNext">Далее</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модалка «Что изменится в файле». Показывается перед записью, чтобы
+       правка конфига не была операцией на доверии. -->
+  <div class="modal-backdrop" id="diffBackdrop" hidden>
+    <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="diffTitle">
+      <div class="modal-head">
+        <span id="diffTitle">Что изменится в конфиге</span>
+        <button class="close" id="diffClose" aria-label="Закрыть">&times;</button>
+      </div>
+      <div class="diff-meta" id="diffMeta"></div>
+      <div class="diff-view" id="diffView"></div>
+      <div class="modal-foot">
+        <span class="muted" id="diffHint"></span>
+        <button class="btn btn-ghost" id="diffCancel">Отмена</button>
+        <button class="btn btn-primary" id="diffConfirm">Записать в файл</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

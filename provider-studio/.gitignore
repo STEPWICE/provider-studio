@@ -1,0 +1,7 @@
+# Local state — may contain provider endpoints and config snapshots.
+data/providers.json
+data/backups/
+node_modules/
+
+# Build output: the exe embeds a whole Node runtime (~88 MB).
+dist/

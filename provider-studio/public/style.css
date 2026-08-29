@@ -1,0 +1,655 @@
+:root {
+  --bg: #09090b;
+  --panel: #18181b;
+  --panel-2: #27272a;
+  --card: #18181b;
+  --border: #27272a;
+  --border-2: #3f3f46;
+  --text: #fafafa;
+  --muted: #a1a1aa;
+  --accent: #6366f1;
+  --accent-2: #818cf8;
+  --ok: #22c55e;
+  --err: #ef4444;
+  --radius: 8px;
+  --warn: #fbbf24;
+  /* The exe ships offline, so a webfont name would silently fall back to a
+     different metric. Name only fonts that are actually installed. */
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Noto Sans", sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+/* min-width:0 on both flex children: without it a long config path or provider
+   name forces the whole app wider than the window and adds a page-level
+   horizontal scrollbar that nothing can scroll away. */
+.app { display: flex; height: 100vh; min-width: 0; }
+
+/* A dark page with default light scrollbars looks broken; keep them subtle. */
+* { scrollbar-width: thin; scrollbar-color: var(--border-2) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 6px; border: 2px solid var(--bg); }
+*::-webkit-scrollbar-thumb:hover { background: #52525b; }
+
+/* Keyboard users had no visible focus anywhere: the default ring was removed
+   by `outline: none` on inputs and never replaced. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+.sidebar {
+  width: 260px;
+  min-width: 260px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 20px 16px;
+  gap: 24px;
+  overflow-y: auto;
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.logo {
+  width: 32px; height: 32px; border-radius: 8px;
+  background: var(--accent);
+  display: grid; place-items: center; font-weight: 700; font-size: 12px; color: #fff;
+}
+.brand-name { font-weight: 600; font-size: 15px; }
+.brand-sub { color: var(--muted); font-size: 11px; }
+
+/* Had no rule at all: the provider list could not scroll independently, so a
+   long list pushed "+ Новый провайдер" off the bottom of the sidebar. */
+.side-section { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+/* The saved-providers section is the one that grows, so it takes the slack and
+   scrolls internally instead of stretching the sidebar. */
+.side-section:has(.provider-list) { flex: 1; min-height: 0; }
+.side-section:has(.provider-list) .provider-list { overflow-y: auto; flex: 1; min-height: 0; }
+
+.side-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--muted); margin-bottom: 8px; font-weight: 500;
+  display: flex; align-items: baseline; gap: 6px; min-width: 0;
+}
+
+.targets { display: flex; flex-direction: column; gap: 2px; }
+.target-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border-radius: 6px; cursor: pointer;
+  color: var(--muted); font-size: 13px; transition: all .15s;
+}
+.target-item:hover { background: var(--panel-2); color: var(--text); }
+.target-item.on { background: rgba(99,102,241,.1); color: var(--accent-2); }
+.target-item .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--border-2); }
+.target-item.on .dot { background: var(--accent); }
+
+.provider-list { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.provider-row {
+  display: flex; align-items: center; gap: 4px;
+  padding: 6px 8px; border-radius: 6px; background: transparent;
+  border: 1px solid transparent; cursor: pointer; font-size: 13px;
+  transition: background .15s, border-color .15s;
+  min-width: 0;
+}
+.provider-row:hover { background: var(--panel-2); }
+/* flex:1 + min-width:0 + ellipsis: long provider names used to push the action
+   buttons out of the 260px sidebar and scroll it sideways. */
+.provider-row .nm {
+  font-weight: 500; flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.provider-row .badge { flex-shrink: 0; }
+
+/* All three row actions share one look. `.ren` previously had no rule at all,
+   so it rendered as a default bordered browser button that was always visible
+   — the single most out-of-place element in the UI. */
+.provider-row .ren,
+.provider-row .wipe,
+.provider-row .del {
+  color: var(--muted); border: 0; background: none; cursor: pointer;
+  font-size: 13px; line-height: 1; border-radius: 4px;
+  flex-shrink: 0; font-family: inherit;
+  /* Hidden means gone, not merely invisible. At opacity:0 the three buttons
+     still reserved ~70px of a 227px row, so "GenSparkOSNOVA" was clipped to
+     make space for controls nobody could see. Collapsing the width gives the
+     name the room and hands it back on hover. */
+  opacity: 0; width: 0; padding: 3px 0; overflow: hidden;
+  transition: opacity .15s, width .15s, padding .15s, color .15s, background .15s;
+}
+.provider-row:hover .ren,
+.provider-row:hover .wipe,
+.provider-row:hover .del,
+.provider-row:focus-within .ren,
+.provider-row:focus-within .wipe,
+.provider-row:focus-within .del { opacity: 1; width: auto; padding: 3px 4px; }
+.provider-row .ren:hover { color: var(--accent-2); background: rgba(99,102,241,.12); }
+/* Both deletions read red; the tooltips spell out which one touches the file. */
+.provider-row .wipe:hover,
+.provider-row .del:hover { color: var(--err); background: rgba(239,68,68,.12); }
+/* Touch has no hover, so hiding the actions there would strand them. */
+@media (hover: none) {
+  .provider-row .ren, .provider-row .wipe, .provider-row .del { opacity: 1; width: auto; padding: 3px 4px; }
+}
+
+.provider-search { margin-bottom: 8px; font-size: 12px; padding: 7px 10px; }
+.provider-count { font-size: 11px; color: var(--muted); font-weight: 400; text-transform: none; letter-spacing: 0; }
+
+.side-foot { margin-top: auto; }
+
+.main { flex: 1; min-width: 0; overflow-y: auto; overflow-x: hidden; padding: 32px 40px; }
+.topbar {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 16px; margin-bottom: 24px; min-width: 0;
+}
+.topbar h1 { margin: 0 0 4px; font-size: 24px; font-weight: 600; letter-spacing: -0.02em; }
+.topbar-title { min-width: 0; }
+.muted { color: var(--muted); }
+
+/* One chip instead of two. The path used to appear twice — once inside the
+   picker, once in the chip — which ate the whole right half of the header.
+   `direction: rtl` truncates from the left because the tail (…/opencode.jsonc)
+   is the part that identifies the file. */
+.opencode-chip {
+  font-size: 11px; color: var(--muted); background: var(--panel-2);
+  padding: 5px 9px; border-radius: 6px; border: 1px solid var(--border);
+  max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono);
+  direction: rtl; text-align: left; cursor: default;
+}
+.opencode-chip .cfg-state { direction: ltr; unicode-bidi: embed; }
+
+/* Two columns once there is room for them. The editor was capped at 760px and
+   everything else stacked underneath it, so on a normal-width window the right
+   half of the page was blank while diagnostics output sat below the fold.
+   `minmax(0, …)` on both tracks: without it a long unbroken path in the results
+   forces the column wider than its share and pushes the layout sideways.
+   The right track has a floor: measured at 1264px of window it was handed 88px,
+   which turned a two-line hint into a 195px-tall column one word wide. A track
+   that cannot show a sentence is worse than no second column, so the editor
+   gives up width first (its own track may shrink below 760px) and the side
+   panel never goes under 300px. */
+.workspace {
+  display: grid;
+  /* The side panel is a companion, not the main event: on a 1920px screen a
+     bare `1fr` handed it 786px against the editor's 760px, so diagnostics
+     output dominated the form the user came to fill in. Cap it and let the
+     leftover space sit as margin. */
+  grid-template-columns: minmax(460px, 760px) minmax(300px, 520px);
+  gap: 24px;
+  align-items: start;
+}
+.col-main { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+/* Sticky, but bounded: a long diagnostics list would otherwise run past the
+   bottom of the viewport with no way to reach its end, since the column no
+   longer scrolls with the page. */
+.col-side {
+  display: flex; flex-direction: column; gap: 16px; min-width: 0;
+  position: sticky; top: 0;
+  max-height: calc(100vh - 64px); overflow-y: auto;
+}
+
+/* Below this the second column would be too narrow to read, so collapse to the
+   original single stack rather than shipping two cramped columns.
+   The threshold counts the whole window, but the workspace only gets what is
+   left after the 260px sidebar and 80px of padding. The old 1180px let a 1264px
+   window keep two columns with only 88px for the second one. The floor is what
+   the two tracks actually need: 260 + 80 + 460 (editor) + 24 (gap) + 300 (side)
+   = 1124px, so anything narrower stacks instead of cramming. */
+@media (max-width: 1124px) {
+  .workspace { grid-template-columns: minmax(0, 1fr); }
+  .col-side { position: static; }
+}
+
+.side-empty {
+  border: 1px dashed var(--border); border-radius: var(--radius);
+  padding: 20px; color: var(--muted); font-size: 13px; line-height: 1.5;
+}
+.side-empty-title { font-weight: 600; color: var(--text); margin-bottom: 6px; font-size: 13px; }
+.side-empty p { margin: 0; }
+
+.card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 24px; max-width: 760px; min-width: 0;
+}
+.card-head { display: flex; flex-direction: column; gap: 16px; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field label { font-size: 12px; color: var(--muted); font-weight: 500; }
+input, select {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 12px; font-size: 13px; outline: none;
+  font-family: inherit; width: 100%; transition: border-color .15s;
+}
+input:focus, select:focus { border-color: var(--accent); }
+input::placeholder { color: #52525b; }
+
+.key-row { display: flex; gap: 8px; align-items: stretch; }
+.key-row input { flex: 1; min-width: 0; }
+.env-toggler {
+  display: flex; align-items: center; gap: 7px; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 6px; padding: 0 12px;
+  height: 38px; flex-shrink: 0;
+  color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .02em;
+  white-space: nowrap; transition: color .15s, border-color .15s, background .15s;
+  user-select: none;
+}
+.env-toggler:hover { border-color: var(--border-2); color: var(--text); }
+.env-toggler.on { color: var(--accent-2); border-color: var(--accent); background: rgba(99,102,241,.08); }
+/* The native checkbox clashed with the pill: replaced by a chip-style square
+   driven by the same `.on` class the script already toggles. */
+.env-toggler input[type="checkbox"] { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.env-toggler .ck {
+  width: 11px; height: 11px; border-radius: 3px; border: 1px solid currentColor;
+  display: inline-block; flex-shrink: 0; transition: background .15s;
+}
+.env-toggler.on .ck { background: var(--accent); border-color: var(--accent); }
+.envname { margin-top: 8px; }
+
+/* State of the environment variable the config will reference. Writing
+   {env:FOO} while FOO is unset authenticates with an empty string. */
+.env-state { display: flex; align-items: center; gap: 6px; font-size: 11px; margin-top: 6px; flex-wrap: wrap; }
+.env-state.is-set { color: var(--ok); }
+.env-state.is-unset { color: var(--warn); }
+/* Set persistently, but not inherited by this process: a terminal opened before
+   `setx` ran still sees nothing, so opencode must be restarted from a new one. */
+.env-state.is-warn { color: var(--warn); }
+.env-state .setx {
+  font-family: var(--mono); font-size: 10px; color: var(--muted);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 1px 6px; user-select: all; word-break: break-all;
+}
+
+select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23a1a1aa' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E"); background-position: calc(100% - 12px) 50%; background-repeat: no-repeat; }
+/* These are the explanations a first-time user actually needs to read ("укажи
+   имя переменной…", "OpenAI-совместимый…"), and they were set in the smallest
+   type on the page. 12px with looser leading keeps them secondary without
+   making them the hardest thing to read. */
+.fmt-note { font-size: 12px; color: var(--muted); margin-top: 5px; line-height: 1.5; }
+.fmt-note.warn { color: #fbbf24; }
+
+.models-block { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 20px; }
+.models-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.models-head span { font-size: 12px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: .05em; }
+.model-list { display: flex; flex-direction: column; gap: 6px; }
+.model-row {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 12px 14px; transition: border-color .15s;
+}
+.model-row:hover { border-color: var(--border-2); }
+.model-row .mi { flex: 1; min-width: 0; }
+.model-row .mi .mid { font-weight: 500; font-size: 13px; }
+.model-row .mi .meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.model-row .tags { display: flex; gap: 4px; flex-wrap: wrap; }
+.tag { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: var(--panel-2); color: var(--muted); font-weight: 500; }
+.tag.vis { color: #38bdf8; background: rgba(56,189,248,.1); }
+.tag.reason { color: #c084fc; background: rgba(192,132,252,.1); }
+/* Cost badges. Free is the one the user is hunting for, so it is the only
+   green thing in the row; a price is neutral (it is information, not a
+   warning); an unknown price is muted and italic so it never reads as "0". */
+.tag.free { color: #34d399; background: rgba(52,211,153,.12); font-weight: 600; }
+.tag.paid { color: var(--muted); background: var(--panel-2); font-variant-numeric: tabular-nums; }
+.tag.unknown { color: var(--muted); background: transparent; border: 1px dashed var(--border); font-style: italic; }
+/* Borrowed from models.dev, not stated by this provider. Deliberately quieter
+   than the capability tags: it describes where a number came from, not what the
+   model can do, and must not compete with the model id for attention. */
+.tag.cat { color: var(--muted); background: transparent; border: 1px dotted var(--accent); opacity: .85; }
+/* Live-probe verdicts. A model that was never checked shows no mark at all —
+   an absent verdict must not be styled like a failed one. */
+.pmark { font-weight: 700; }
+.pmark.ok { color: var(--ok); }
+.pmark.bad { color: var(--err); }
+.pmark.plan { color: var(--warn); }
+.pmark.wait { color: var(--warn); }
+.pnote { color: var(--muted); }
+.batch-status { margin: 8px 0; padding: 8px 10px; border-radius: 6px; font-size: 12px; border: 1px solid var(--border); color: var(--muted); }
+.batch-status.ok { border-color: var(--ok); color: var(--ok); }
+.batch-status.err { border-color: var(--err); color: var(--err); }
+.batch-status.warn { border-color: var(--warn); color: var(--warn); }
+.batch-stop { margin-top: 4px; color: var(--muted); }
+.model-row .rm { color: var(--muted); background: none; border: 0; cursor: pointer; font-size: 14px; opacity: 0; transition: all .15s; }
+.model-row:hover .rm { opacity: 1; }
+.model-row .rm:hover { color: var(--err); }
+.row-actions { display: flex; gap: 4px; align-items: center; }
+.row-actions .rm.ed:hover { color: var(--accent); }
+/* A bare dashed rectangle read as a broken container. Give it an icon line and
+   tighter height so it looks like a deliberate empty state. */
+.empty-models {
+  color: var(--muted); font-size: 12px; padding: 18px 16px; text-align: center;
+  border: 1px dashed var(--border); border-radius: 6px; line-height: 1.6;
+  background: repeating-linear-gradient(45deg, transparent, transparent 10px, rgba(255,255,255,.012) 10px, rgba(255,255,255,.012) 20px);
+}
+.empty-models b { color: var(--text); font-weight: 500; }
+
+.badge { font-size: 9px; padding: 2px 6px; border-radius: 4px; background: rgba(99,102,241,.1); color: var(--accent-2); font-weight: 500; margin-left: 4px; }
+.side-sync { width: 100%; margin-top: 8px; font-size: 12px; }
+
+.targets-block { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 20px; }
+.target-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px;
+  font-size: 12px; color: var(--muted); background: var(--bg); transition: all .15s;
+}
+.chip.on { color: var(--text); border-color: var(--accent); background: rgba(99,102,241,.1); }
+.chip .ck { width: 10px; height: 10px; border-radius: 3px; border: 1px solid currentColor; display: inline-block; }
+.chip.on .ck { background: var(--accent); border-color: var(--accent); }
+
+.actions {
+  margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+/* Push the write actions to the right edge so the destructive-ish "Применить"
+   is not adjacent to the default-model picker it has nothing to do with. */
+.actions .spacer { flex: 1; min-width: 0; }
+
+/* The toast lives outside .actions now: as a flex child it stretched the row
+   and its fixed positioning fought the row's alignment. */
+.status {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(12px);
+  max-width: min(560px, 90vw);
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 18px; font-size: 12px; color: var(--text);
+  box-shadow: 0 8px 28px rgba(0,0,0,.5); z-index: 100;
+  opacity: 0; pointer-events: none; visibility: hidden;
+  transition: opacity .18s ease, transform .18s ease, visibility .18s;
+}
+.status.toast-show { opacity: 1; transform: translateX(-50%) translateY(0); visibility: visible; }
+.status.ok { border-color: var(--ok); }
+.status.err { border-color: var(--err); }
+
+.toolbar { max-width: 720px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#backupInfo { font-size: 11px; color: var(--muted); }
+
+/* No max-width or top margin any more: these live in the side column, which
+   sets its own width and spacing. Keeping the 720px cap would have left a gap
+   inside a column that is often narrower than that anyway. */
+.issues, .backups { min-width: 0; }
+.backup-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border); }
+.backup-row:first-child { border-top: 0; }
+.backup-row .bname { flex: 1; font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.backup-row .bsize { color: var(--muted); font-size: 11px; }
+.backup-row .bs { padding: 4px 10px; font-size: 11px; }
+
+.diag-sect {
+  margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border);
+  font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 500;
+}
+.diag-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+.diag-name { font-weight: 500; font-size: 13px; }
+.diag-meta { color: var(--muted); font-size: 11px; }
+.diag-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.diag-row .ok-line, .diag-row .err-line, .diag-row .warn-line,
+.diag-row .muted-line { margin-left: auto; font-size: 11px; }
+/* Deliberately not probed (no baseURL of its own): not a success, not a fault. */
+.muted-line { color: var(--muted); font-size: 12px; }
+/* A reachable endpoint that rejects the key is neither green nor red: the
+   server is fine, the credential is not. */
+.warn-line { color: var(--warn); font-size: 12px; }
+.diag-fix { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.diag-fix select {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 10px; font-size: 12px; font-family: inherit; min-width: 220px;
+}
+
+.btn {
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  border-radius: 6px; padding: 8px 16px; font-size: 13px; cursor: pointer;
+  font-family: inherit; transition: all .15s; font-weight: 500;
+}
+.btn:hover { border-color: var(--accent); background: var(--panel); }
+.btn-primary { background: var(--accent); color: #fff; border-color: transparent; }
+.btn-primary:hover { background: var(--accent-2); }
+.btn-soft { background: rgba(99,102,241,.1); border-color: transparent; color: var(--accent-2); }
+.btn-soft:hover { background: rgba(99,102,241,.15); }
+/* Availability dot in the sidebar. Grey until a diagnostics run has actually
+   probed the provider — an unprobed provider must not look healthy. */
+.hdot {
+  width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
+  background: var(--border); display: inline-block;
+}
+.hdot.is-up { background: var(--ok); }
+.hdot.is-warn { background: var(--warn); }
+.hdot.is-down { background: var(--err); }
+
+/* Result of the live-fire request in the wizard summary. */
+.chat-probe { font-size: 11px; color: var(--muted); margin-left: 6px; }
+.chat-probe.is-ok { color: var(--ok); }
+.chat-probe.is-bad { color: var(--err); }
+
+/* Inline action inside a status line (e.g. "задать переменную сейчас"). */
+.btn-mini { padding: 3px 9px; font-size: 11px; border-radius: 5px; margin: 0 4px; vertical-align: middle; }
+.btn-ghost { background: transparent; border-color: transparent; color: var(--muted); }
+.btn-ghost:hover { color: var(--text); background: var(--panel-2); }
+
+.results {
+  min-width: 0;
+  display: grid; gap: 12px;
+}
+.results[hidden] { display: none !important; }
+.result-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px;
+}
+.result-card h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+.result-card .ok-line { color: var(--ok); font-size: 12px; }
+.result-card .err-line { color: var(--err); font-size: 12px; }
+.result-card pre {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px; font-size: 11px; overflow-x: auto; white-space: pre-wrap;
+  font-family: var(--mono); color: var(--text); margin: 12px 0 0;
+}
+
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.6); backdrop-filter: blur(4px);
+  display: grid; place-items: center; z-index: 50;
+}
+.modal-backdrop[hidden] { display: none !important; }
+.modal {
+  width: 440px; max-width: 90vw; background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 24px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.modal-head { display: flex; justify-content: space-between; align-items: center; font-weight: 600; font-size: 16px; }
+.close { background: none; border: 0; color: var(--muted); font-size: 20px; cursor: pointer; transition: color .15s; }
+.close:hover { color: var(--text); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips .chip { user-select: none; }
+.modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.check-line { display: flex; align-items: center; gap: 8px; flex-direction: row !important; font-size: 12px !important; }
+input[type="checkbox"] { width: auto; accent-color: var(--accent); }
+
+/* Model rows now carry a price alongside the capability tags, which crowded
+   the id out of a 600px dialog. */
+.modal-wide { width: 720px; max-width: 92vw; }
+.discover-status { font-size: 12px; color: var(--muted); }
+.discover-status.ok { color: var(--ok); }
+.discover-status.err { color: var(--err); }
+.discover-filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.discover-filters input[type="text"] { flex: 1; min-width: 140px; }
+.filter-chip {
+  border: 1px solid var(--border); border-radius: 4px; padding: 5px 10px;
+  font-size: 11px; color: var(--muted); cursor: pointer; user-select: none; background: var(--bg); transition: all .15s;
+}
+.filter-chip.on { color: var(--text); border-color: var(--accent); background: rgba(99,102,241,.1); }
+/* A fixed 300px showed six of a hundred models on a screen with room for
+   thirty, turning model picking into an exercise in scrolling. Grow with the
+   viewport, keeping enough margin for the modal's own header and footer. */
+.discover-list {
+  max-height: min(56vh, 640px); min-height: 200px;
+  overflow-y: auto; display: flex; flex-direction: column; gap: 4px; margin: 8px 0;
+}
+.dmodel {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; transition: all .15s;
+}
+.dmodel:hover { border-color: var(--border-2); }
+.dmodel.selected { border-color: var(--accent); background: rgba(99,102,241,.05); }
+.dmodel .ck2 { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--border-2); flex-shrink: 0; display: grid; place-items: center; font-size: 10px; }
+.dmodel.selected .ck2 { background: var(--accent); border-color: var(--accent); color: #fff; }
+.dmodel .dname { flex: 1; min-width: 0; font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dmodel .dmeta { font-size: 10px; color: var(--muted); }
+.dmodel .tags { gap: 4px; }
+.dmodel .tag { font-size: 9px; padding: 1px 5px; }
+.discover-empty { color: var(--muted); font-size: 12px; text-align: center; padding: 16px; }
+
+/* Fixed square matching the input height (10px padding + 1px border + 13px
+   line-height ≈ 38px). The emoji glyph varies in width between fonts, so a
+   padding-based button ended up a different height than the field next to it. */
+.btn-eye {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  width: 38px; height: 38px; flex-shrink: 0;
+  cursor: pointer; font-size: 15px; line-height: 1; color: var(--muted);
+  transition: color .15s, border-color .15s, background .15s;
+  display: grid; place-items: center; padding: 0;
+}
+.btn-eye:hover { color: var(--text); border-color: var(--border-2); background: var(--panel-2); }
+
+.btn-sm { padding: 6px 12px; font-size: 12px; }
+
+.field-inline { flex-direction: row; align-items: center; }
+
+.btn:disabled {
+  opacity: .5; cursor: not-allowed; pointer-events: none;
+}
+
+/* Toast visuals live with .status above; nothing to add here. */
+
+/* --- Diff preview ------------------------------------------------------- */
+/* The diff is read line by line, so it needs a monospace grid where the
+   +/- column stays put and long lines wrap instead of scrolling sideways. */
+#diffBackdrop .modal-wide { width: 860px; }
+.diff-meta { display: flex; flex-direction: column; gap: 6px; }
+.diff-path { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 11px; color: var(--muted); word-break: break-all; }
+.diff-stat { display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 600; }
+.diff-stat .plus { color: var(--ok); }
+.diff-stat .minus { color: var(--err); }
+.tag.warn { color: #fbbf24; background: rgba(251,191,36,.12); }
+
+.diff-view {
+  max-height: 52vh; overflow-y: auto;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.55; padding: 4px 0;
+}
+.hunk-head {
+  padding: 4px 12px; color: var(--muted); background: var(--panel-2);
+  font-size: 10px; position: sticky; top: 0;
+}
+.dline { display: flex; gap: 8px; padding: 0 12px; white-space: pre-wrap; }
+.dline .sign { width: 8px; flex-shrink: 0; opacity: .7; user-select: none; }
+.dline .txt { flex: 1; min-width: 0; word-break: break-word; }
+.dline.add { background: rgba(34,197,94,.10); color: #86efac; }
+.dline.del { background: rgba(239,68,68,.10); color: #fca5a5; }
+.dline.ctx { color: var(--muted); }
+.diff-empty { color: var(--muted); font-size: 12px; text-align: center; padding: 24px; font-family: var(--font); }
+.modal-foot .muted { margin-right: auto; font-size: 11px; color: var(--muted); }
+
+/* --- Topbar config picker ---------------------------------------------- */
+/* Right-aligned column so the chip and the picker share one edge instead of
+   forming a ragged two-item row that grew with the path length. */
+.topbar-right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; min-width: 0; flex-shrink: 0; }
+/* The picker lists short scope labels now, so it no longer needs to be wide
+   enough for a full Windows path. */
+.config-picker { max-width: 220px; font-size: 11px; padding: 5px 26px 5px 8px; width: auto; }
+.opencode-chip.has-error { border-color: var(--err); color: var(--err); }
+.opencode-chip.is-missing { border-color: var(--warn); color: var(--warn); }
+
+/* Row actions are styled together up in the sidebar block; keeping only the
+   focus ring override here so the outline hugs the row instead of overflowing
+   the narrow sidebar. */
+.provider-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.provider-row:focus-visible .ren,
+.provider-row:focus-visible .wipe,
+.provider-row:focus-visible .del { opacity: 1; }
+
+.default-model { max-width: 220px; font-size: 12px; padding: 6px 8px; }
+
+/* --- Setup wizard ------------------------------------------------------- */
+/* Exists because "what do I put in Base URL?" is the one question a newcomer
+   cannot answer, and a wrong answer only fails later, inside opencode. */
+#wizardBackdrop .wizard { width: 720px; }
+.wizard { gap: 14px; }
+
+.wiz-steps {
+  display: flex; gap: 6px; list-style: none; margin: 0; padding: 0;
+  counter-reset: wizstep;
+}
+.wiz-steps li {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px;
+  font-size: 11px; color: var(--muted); padding: 7px 4px 7px 0;
+  border-top: 2px solid var(--border); transition: color .15s, border-color .15s;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  counter-increment: wizstep;
+}
+.wiz-steps li::before {
+  content: counter(wizstep);
+  width: 17px; height: 17px; border-radius: 50%; flex-shrink: 0;
+  display: grid; place-items: center; font-size: 10px; font-weight: 600;
+  background: var(--panel-2); color: var(--muted); transition: all .15s;
+}
+.wiz-steps li.on { color: var(--text); border-top-color: var(--accent); }
+.wiz-steps li.on::before { background: var(--accent); color: #fff; }
+/* Completed steps stay marked so the user can see how far they have come. */
+.wiz-steps li.done { border-top-color: var(--accent); color: var(--muted); }
+.wiz-steps li.done::before { content: "\2713"; background: rgba(99,102,241,.25); color: var(--accent-2); }
+
+.wiz-pane { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.wiz-pane[hidden] { display: none !important; }
+.wiz-lead { margin: 0; font-size: 12px; color: var(--muted); }
+
+.preset-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 8px; max-height: 46vh; overflow-y: auto; padding: 2px;
+}
+.preset-card {
+  text-align: left; cursor: pointer; min-width: 0;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 11px 13px; color: var(--text); font-family: inherit;
+  transition: border-color .15s, background .15s;
+}
+.preset-card:hover { border-color: var(--border-2); background: var(--panel-2); }
+.preset-card.on { border-color: var(--accent); background: rgba(99,102,241,.08); }
+.preset-card .pname { font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 6px; }
+.preset-card .phint { font-size: 12px; color: var(--muted); margin-top: 3px; line-height: 1.45; }
+/* Every preset URL fits on one line except Google's (47 chars vs 17-27 for the
+   rest). Truncating it said less than the card title already did, so let the
+   rare long one wrap onto a second line instead of ellipsising all of them. */
+.preset-card .purl {
+  font-family: var(--mono); font-size: 10px; color: var(--muted);
+  margin-top: 5px; line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.tag.local { color: #34d399; background: rgba(52,211,153,.12); }
+/* What the provider gives away. Wrapped rather than clipped: a truncated
+   "постоянного бесплатного тарифа нет" would read as its opposite. */
+.preset-card .pfree {
+  font-size: 10px; color: var(--muted); margin-top: 6px; padding-top: 5px;
+  border-top: 1px dashed var(--border); line-height: 1.4; white-space: normal;
+}
+
+.wiz-summary { display: flex; flex-direction: column; gap: 0; font-size: 12px; }
+.wiz-summary .srow {
+  display: flex; gap: 12px; padding: 8px 0; border-top: 1px solid var(--border);
+  align-items: baseline;
+}
+.wiz-summary .srow:first-child { border-top: 0; }
+.wiz-summary .slabel { color: var(--muted); width: 150px; flex-shrink: 0; }
+.wiz-summary .sval { flex: 1; min-width: 0; word-break: break-word; }
+.wiz-summary .sval.mono { font-family: var(--mono); font-size: 11px; }
+.wiz-summary .sval.warn { color: var(--warn); }

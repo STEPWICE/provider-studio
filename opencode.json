@@ -1,0 +1,33 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "xkiro": {
+      "name": "Xkiro",
+      "api": "openai",
+      "options": {
+        "baseURL": "https://api.xkiro.com/v1"
+      },
+      "models": {
+        "qwen/qwen3.8-max:free": {
+          "name": "Qwen3.8 Max Free",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "modalities": {
+            "input": ["text", "image", "video"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 65000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        }
+      }
+    }
+  },
+  "model": "xkiro/qwen/qwen3.8-max:free"
+}
