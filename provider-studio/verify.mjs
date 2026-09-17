@@ -229,6 +229,12 @@ try {
   })).json();
   check("apply with a current hash succeeds", guarded.results?.opencode?.ok === true, JSON.stringify(guarded).slice(0, 300));
 
+  // ---- oversized bodies are a client error (413), not a server crash (500) ----
+  const oversize = await post("/api/preview", { provider: { name: "x".repeat(2 * 1024 * 1024) } });
+  check("an oversized body returns 413", oversize.status === 413, oversize.status);
+  const oversizeBody = await oversize.json().catch(() => ({}));
+  check("the 413 carries a readable error", oversizeBody.ok === false, JSON.stringify(oversizeBody).slice(0, 120));
+
   // ---- config listing ----
   const cfgList = await (await get("/api/configs")).json();
   check("/api/configs lists candidates", cfgList.ok === true && cfgList.configs.length > 0, JSON.stringify(cfgList).slice(0, 200));

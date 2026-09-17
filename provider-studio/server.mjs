@@ -165,13 +165,22 @@ function readBody(req) {
     const chunks = [];
     let size = 0;
     let done = false;
+    let overflow = false;
     req.on("data", (c) => {
       if (done) return;
       size += c.length;
       if (size > MAX_BODY) {
-        done = true;
-        reject(new Error("Тело запроса слишком большое"));
-        req.destroy();
+        // Drain, don't destroy: the client is still uploading, and a torn-down
+        // socket turns the 413 below into an ECONNRESET the client cannot read.
+        // Buffered chunks are dropped so a huge body is not held in memory.
+        // Past 10x the limit patience ends — that is abuse, not a big form.
+        overflow = true;
+        chunks.length = 0;
+        if (size > MAX_BODY * 10) {
+          done = true;
+          reject(Object.assign(new Error("Тело запроса слишком большое"), { statusCode: 413 }));
+          req.destroy();
+        }
         return;
       }
       chunks.push(c);
@@ -179,6 +188,12 @@ function readBody(req) {
     req.on("end", () => {
       if (done) return;
       done = true;
+      if (overflow) {
+        // Carries its own status: the generic catch below answers 500, but a
+        // client that sent megabytes of JSON has a request problem, not our bug.
+        reject(Object.assign(new Error("Тело запроса слишком большое"), { statusCode: 413 }));
+        return;
+      }
       const text = Buffer.concat(chunks).toString("utf8");
       try { resolve(text ? JSON.parse(text) : {}); } catch (e) { reject(e); }
     });
@@ -888,7 +903,8 @@ const server = http.createServer(async (req, res) => {
 
     return serveStatic(res, url.pathname);
   } catch (e) {
-    return json(res, 500, { ok: false, error: String(e && e.message || e) });
+    const code = Number(e?.statusCode) >= 400 && Number(e?.statusCode) < 600 ? Number(e.statusCode) : 500;
+    return json(res, code, { ok: false, error: String(e && e.message || e) });
   }
 });
 
