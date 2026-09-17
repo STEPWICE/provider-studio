@@ -1021,6 +1021,9 @@ function decodeOpenProvider(key, p) {
   return {
     id: Date.now() + Math.floor(Math.random() * 1000),
     fromOpenCode: true,
+    // The real config key, so the UI can preview which key a name maps to and
+    // warn before an accidental overwrite of a different provider.
+    key,
     // `name` doubles as the display label and the source of the opencode key.
     // Ignore it when it actually holds a package (a bug in earlier versions).
     name: !looksLikePackage(p.name) && slugify(p.name) === key ? p.name : key,

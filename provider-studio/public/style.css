@@ -113,11 +113,10 @@ body {
 }
 .provider-row .badge { flex-shrink: 0; }
 
-/* All three row actions share one look. `.ren` previously had no rule at all,
+/* Both row actions share one look. `.ren` previously had no rule at all,
    so it rendered as a default bordered browser button that was always visible
    — the single most out-of-place element in the UI. */
 .provider-row .ren,
-.provider-row .wipe,
 .provider-row .del {
   color: var(--muted); border: 0; background: none; cursor: pointer;
   font-size: 13px; line-height: 1; border-radius: 4px;
@@ -130,18 +129,17 @@ body {
   transition: opacity .15s, width .15s, padding .15s, color .15s, background .15s;
 }
 .provider-row:hover .ren,
-.provider-row:hover .wipe,
 .provider-row:hover .del,
 .provider-row:focus-within .ren,
-.provider-row:focus-within .wipe,
 .provider-row:focus-within .del { opacity: 1; width: auto; padding: 3px 4px; }
 .provider-row .ren:hover { color: var(--accent-2); background: rgba(99,102,241,.12); }
-/* Both deletions read red; the tooltips spell out which one touches the file. */
-.provider-row .wipe:hover,
+/* Deletion reads red; the tooltip spells out that it removes the provider
+   from the config as well as from the list. */
 .provider-row .del:hover { color: var(--err); background: rgba(239,68,68,.12); }
 /* Touch has no hover, so hiding the actions there would strand them. */
 @media (hover: none) {
-  .provider-row .ren, .provider-row .wipe, .provider-row .del { opacity: 1; width: auto; padding: 3px 4px; }
+  .provider-row .ren, .provider-row .del { opacity: 1; width: auto; padding: 3px 4px; }
+  .model-row .rm { opacity: 1; }
 }
 
 .provider-search { margin-bottom: 8px; font-size: 12px; padding: 7px 10px; }
@@ -323,7 +321,8 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
 .batch-status.warn { border-color: var(--warn); color: var(--warn); }
 .batch-stop { margin-top: 4px; color: var(--muted); }
 .model-row .rm { color: var(--muted); background: none; border: 0; cursor: pointer; font-size: 14px; opacity: 0; transition: all .15s; }
-.model-row:hover .rm { opacity: 1; }
+.model-row:hover .rm,
+.model-row:focus-within .rm { opacity: 1; }
 .model-row .rm:hover { color: var(--err); }
 .row-actions { display: flex; gap: 4px; align-items: center; }
 .row-actions .rm.ed:hover { color: var(--accent); }
@@ -592,7 +591,6 @@ input[type="checkbox"] { width: auto; accent-color: var(--accent); }
    the narrow sidebar. */
 .provider-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .provider-row:focus-visible .ren,
-.provider-row:focus-visible .wipe,
 .provider-row:focus-visible .del { opacity: 1; }
 
 .default-model { max-width: 220px; font-size: 12px; padding: 6px 8px; }
@@ -670,3 +668,23 @@ input[type="checkbox"] { width: auto; accent-color: var(--accent); }
 .wiz-summary .sval { flex: 1; min-width: 0; word-break: break-word; }
 .wiz-summary .sval.mono { font-family: var(--mono); font-size: 11px; }
 .wiz-summary .sval.warn { color: var(--warn); }
+
+/* --- Narrow windows ------------------------------------------------------ */
+/* Below this the fixed 260px sidebar plus the two-column workspace no longer
+   fit side by side: the sidebar used to eat over half of a phone screen while
+   the form squeezed into the rest. Stack instead — sidebar on top with a
+   capped provider list, single-column form below, page scrolls as one. */
+@media (max-width: 760px) {
+  body { overflow: auto; }
+  .app { flex-direction: column; height: auto; min-height: 100vh; }
+  .sidebar {
+    width: auto; min-width: 0; max-height: none;
+    border-right: 0; border-bottom: 1px solid var(--border);
+    gap: 16px; padding: 16px;
+  }
+  .side-section:has(.provider-list) .provider-list { max-height: 220px; }
+  .main { padding: 20px 16px; overflow: visible; }
+  .form-grid { grid-template-columns: 1fr; }
+  .topbar { flex-wrap: wrap; }
+  .col-side { max-height: none; }
+}

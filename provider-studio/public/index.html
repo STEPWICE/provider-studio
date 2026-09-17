@@ -63,6 +63,7 @@
             <div class="field">
               <label>Название</label>
               <input type="text" id="f-name" placeholder="например BAI / DeepSeek" />
+              <div class="fmt-note" id="nameKeyHint"></div>
             </div>
             <div class="field">
               <label>Base URL</label>
@@ -165,7 +166,7 @@
 
   <!-- Модалка «Добавить модель» -->
   <div class="modal-backdrop" id="modalBackdrop" hidden>
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Добавить модель">
       <div class="modal-head">
         <span>Добавить модель</span>
         <button class="close" id="modalClose">&times;</button>
@@ -216,7 +217,7 @@
 
   <!-- Модалка «Обнаружить модели» -->
   <div class="modal-backdrop" id="discoverBackdrop" hidden>
-    <div class="modal modal-wide">
+    <div class="modal modal-wide" role="dialog" aria-modal="true" aria-label="Найденные модели">
       <div class="modal-head">
         <span>Найденные модели</span>
         <button class="close" id="discoverClose">&times;</button>
@@ -256,6 +257,7 @@
       <!-- Шаг 1: выбор пресета -->
       <section class="wiz-pane" id="wizPane0">
         <p class="wiz-lead">Выбери сервис. Base URL и формат API подставятся сами.</p>
+        <input type="text" id="presetSearch" class="provider-search" placeholder="Фильтр пресетов…" aria-label="Фильтр пресетов" />
         <div class="preset-grid" id="presetGrid"></div>
       </section>
 

@@ -25,6 +25,10 @@ const state = {
   // Which config file edits go to. Empty means "let the server decide".
   configPath: "",
   configs: [],
+  // Keys present in the viewed config file, for the live key preview.
+  configKeys: [],
+  // Wizard preset filter text.
+  presetSearch: "",
   // Hash of the config as last read. Sent with every write so the server can
   // refuse when something else changed the file in the meantime.
   configHash: "",
@@ -183,9 +187,11 @@ async function init() {
   // Offer a conventional variable name, but never overwrite a manual entry.
   $("#f-name").addEventListener("input", () => {
     const box = $("#f-envname");
-    if (box.dataset.touched === "1") return;
-    box.value = suggestEnvName($("#f-name").value);
-    renderKeyHint();
+    if (box.dataset.touched !== "1") {
+      box.value = suggestEnvName($("#f-name").value);
+      renderKeyHint();
+    }
+    renderKeyPreview();
   });
   $("#f-envname").addEventListener("input", () => { $("#f-envname").dataset.touched = "1"; });
   $("#btnAddModel").addEventListener("click", () => openModelModal());
@@ -321,6 +327,15 @@ async function init() {
     wizSearchTimer = setTimeout(() => {
       state.wizSearch = e.target.value.trim().toLowerCase();
       renderWizardModels();
+    }, 150);
+  });
+  let presetSearchTimer;
+  $("#presetSearch").addEventListener("input", (e) => {
+    clearTimeout(presetSearchTimer);
+    const v = e.target.value;
+    presetSearchTimer = setTimeout(() => {
+      state.presetSearch = v;
+      renderPresetGrid();
     }, 150);
   });
   // Auto-fill the variable name from the provider name unless it was typed.
@@ -532,6 +547,26 @@ function suggestEnvName(name) {
   return base ? `${base}_API_KEY` : "";
 }
 
+/**
+ * Shows which opencode key the typed name maps to, before anything is written.
+ * A name that collides with another provider's key silently rewrites that
+ * block on save (the server merges by key), so a collision warns up front
+ * instead of surprising in the diff.
+ */
+function renderKeyPreview() {
+  const el = $("#nameKeyHint");
+  if (!el) return;
+  const name = $("#f-name") ? $("#f-name").value.trim() : "";
+  if (!name) { el.textContent = ""; el.className = "fmt-note"; return; }
+  const key = slugifyName(name);
+  if (!key) { el.textContent = ""; el.className = "fmt-note"; return; }
+  const taken = state.configKeys.includes(key) && key !== state.editingKey;
+  el.textContent = taken
+    ? `Ключ «${key}» уже есть в конфиге — запись обновит его`
+    : `Ключ в конфиге: «${key}»`;
+  el.className = "fmt-note" + (taken ? " warn" : "");
+}
+
 // Mirrors slugify() on the server so the UI can predict the opencode key.
 // The transliteration table is duplicated on purpose: keep both copies
 // identical when touching either (Cyrillic names must map to the same key).
@@ -636,6 +671,8 @@ async function refreshConfigState() {
   if (d && d.opencode) {
     state.configHash = d.opencode.hash || "";
     state.configHasComments = !!d.opencode.comments;
+    state.configKeys = asArray(d.opencode.providers).map((p) => p.key || slugifyName(p.name)).filter(Boolean);
+    renderKeyPreview();
     updateConfigChip(d.opencode);
     // A fresh read settles the external-edit question either way.
     state.extNotifiedHash = "";
@@ -916,6 +953,7 @@ function loadProviderIntoForm(name) {
   renderModelList();
   // Snapshot after the fields are filled: this is the new clean point.
   state.savedSnapshot = formSnapshot();
+  renderKeyPreview();
 }
 
 /**
@@ -1813,6 +1851,10 @@ function openWizard() {
   $("#wiz-env").checked = true;
   $("#wiz-search").value = "";
   $("#wizEnvState").hidden = true;
+  // A filter from the previous run would greet the user with a short list and
+  // no visible reason why.
+  state.presetSearch = "";
+  $("#presetSearch").value = "";
   renderPresetGrid();
   $("#wizardBackdrop").hidden = false;
   showWizardStep(0);
@@ -1850,8 +1892,18 @@ function freeTierNote(p) {
 
 function renderPresetGrid() {
   const grid = $("#presetGrid");
+  if (!grid) return;
   const chosen = state.wizardPreset;
-  grid.innerHTML = state.presets.map((p) => `
+  const q = (state.presetSearch || "").trim().toLowerCase();
+  const shown = q
+    ? state.presets.filter((p) => [p.label, p.hint, p.baseURL, p.id]
+        .some((s) => String(s || "").toLowerCase().includes(q)))
+    : state.presets;
+  if (!shown.length) {
+    grid.innerHTML = `<div class="discover-empty">Ничего не найдено по «${esc(state.presetSearch.trim())}».</div>`;
+    return;
+  }
+  grid.innerHTML = shown.map((p) => `
     <button type="button" class="preset-card ${chosen && chosen.id === p.id ? "on" : ""}" data-id="${esc(p.id)}">
       <div class="pname">${esc(p.label)}
         ${p.local ? `<span class="tag local">локально</span>` : ""}

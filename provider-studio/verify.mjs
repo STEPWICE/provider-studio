@@ -126,6 +126,9 @@ try {
   check("state reports JSONC comments", state.opencode.comments === true, state.opencode.comments);
   check("existing provider is listed", state.opencode.providers.some((p) => p.name === "Legacy" || p.name === "legacy"),
     JSON.stringify(state.opencode.providers.map((p) => p.name)));
+  check("state providers carry their real config keys",
+    state.opencode.providers.every((p) => typeof p.key === "string" && p.key.length > 0),
+    JSON.stringify(state.opencode.providers.map((p) => p.key)));
 
   // ---- apply with env-var key ----
   const applyRes = await (await post("/api/apply", {

@@ -579,11 +579,32 @@ const smartGaps = [];
 }
 console.log(smartGaps.length ? `SMART AUDIT GAPS: ${smartGaps.join("; ")}` : "the smart audit renders with its fix");
 
+// Frontend polish: the live key preview, the preset filter, dialog roles,
+// and no leftover styles for removed controls.
+const polishGaps = [];
+{
+  if (!/id="nameKeyHint"/.test(html)) polishGaps.push("no key preview under the name field");
+  else {
+    if (!/function renderKeyPreview/.test(js)) polishGaps.push("no renderKeyPreview");
+    if (!/configKeys/.test(js)) polishGaps.push("the key preview has no config keys to compare against");
+    if (!/уже есть в конфиге/.test(js)) polishGaps.push("the key preview never warns about a taken key");
+  }
+  if (!/id="presetSearch"/.test(html)) polishGaps.push("no preset filter in the wizard");
+  else if (!/state\.presetSearch/.test(js)) polishGaps.push("the preset filter is not wired");
+  const dialogs = (html.match(/role="dialog"/g) || []).length;
+  if (dialogs < 4) polishGaps.push(`only ${dialogs}/4 modals expose role=dialog`);
+  const css = readFileSync("public/style.css", "utf8");
+  if (/\.wipe/.test(css)) polishGaps.push("dead .wipe styles for a removed button");
+  if (!/max-width: 760px/.test(css)) polishGaps.push("no narrow-window stacking");
+  if (!/model-row:focus-within \.rm/.test(css)) polishGaps.push("model actions stay invisible to keyboard users");
+}
+console.log(polishGaps.length ? `POLISH GAPS: ${polishGaps.join("; ")}` : "key preview, preset filter, dialogs and small screens are covered");
+
 const failed = missingIds.length + missingClasses.length + badClick.length + leaks.length +
   unreachable.length + phantom.length + guards.length + lies.length +
   typeGaps.length + fieldGaps.length + unstyled.length + wizGaps.length +
   (ruleGap ? 1 : 0) + presetGaps.length + rankGaps.length + layoutGaps.length + costGaps.length +
   freeGaps.length + probeGaps.length + singleGaps.length + maskGaps.length + undoGaps.length + deleteGaps.length +
-  smartGaps.length;
+  smartGaps.length + polishGaps.length;
 console.log(`\n${failed ? "FAIL" : "OK"} — ${failed} issue(s)`);
 if (failed) process.exitCode = 1;
