@@ -348,6 +348,55 @@ function applyOk(configObj, label) {
   check("без whitelist пишется всё", all.length === 3, String(all.length));
 }
 
+// ------------------------------------------------------- enrich: дозаполнение
+{
+  // Заполняется только отсутствующее...
+  const p1 = D.enrichExisting({ name: "m" }, {
+    contextWindow: 1000, maxOutput: 100, costInput: 1, costOutput: 2,
+    inputTypes: ["text", "image"], declaredFields: ["contextWindow", "maxOutput", "inputTypes"],
+  });
+  eq("пустая запись дозаполняется целиком", p1,
+    { limit: { context: 1000, output: 100 }, cost: { input: 1, output: 2 }, inputTypes: ["text", "image"], attachment: true });
+  // ...а present-значения не затираются (дописывается только недостающий вижн).
+  const p2 = D.enrichExisting(
+    { limit: { context: 5, output: 5 }, cost: { input: 7, output: 7 }, modalities: { input: ["text"], output: ["text"] } },
+    { contextWindow: 1000, maxOutput: 100, costInput: 1, costOutput: 2, inputTypes: ["text", "image"], declaredFields: ["inputTypes"] });
+  eq("present-значения целы, вижн дописан", p2, { inputTypes: ["text", "image"], attachment: true });
+  // Догадка по имени — не основание для автозаписи вижена.
+  const p3 = D.enrichExisting({ name: "m" }, { inputTypes: ["text", "image"], declaredFields: [] });
+  eq("незаявленный вижн не пишется", p3, null);
+  check("мусор не роняет", D.enrichExisting(null, {}) === null && D.enrichExisting({}, null) === null);
+
+  // Сквозной план с fetch-стабом.
+  const stub = async () => ({
+    ok: true, message: "ok",
+    models: [{
+      id: "m1", contextWindow: 1000, maxOutput: 100, costInput: 1, costOutput: 2,
+      inputTypes: ["text", "image"], declaredFields: ["contextWindow", "maxOutput", "inputTypes"],
+    }],
+  });
+  const cfg = {
+    provider: {
+      a: {
+        npm: "x", options: { baseURL: "https://a.dev" },
+        models: { m1: { name: "Mine" }, ghost: { name: "g" } },
+      },
+    },
+  };
+  const plan = await D.planRefresh(cfg, { fetchFn: stub, enrich: true });
+  const row = plan.find((p) => p.key === "a");
+  check("план несёт enrichments", (row?.enrichments || []).some((e) => e.id === "m1" && e.patch?.limit && e.patch?.cost),
+    JSON.stringify(row?.enrichments));
+  check("призраков не обогащает", !(row?.enrichments || []).some((e) => e.id === "ghost"));
+  const changes = D.buildRefreshChanges(plan, { enrich: true });
+  const applied = applyChangesVerified(JSON.stringify(cfg, null, 2), changes);
+  check("правки применяются", applied.ok === true, applied.error || "");
+  const e = applied.value?.provider?.a?.models?.m1;
+  eq("limit дозаписан", e?.limit, { context: 1000, output: 100 });
+  eq("вижн дозаписан", [e?.modalities?.input, e?.attachment], [["text", "image"], true]);
+  eq("имя не затёрто", e?.name, "Mine");
+}
+
 // ------------------------------------------------------- битый конфиг
 {
   const broken = D.buildAutoFixChanges(null);

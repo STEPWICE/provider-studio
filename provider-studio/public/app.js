@@ -2330,6 +2330,9 @@ async function diagnose() {
     <div class="diag-fix">
       <label class="check-line"><input type="checkbox" id="diagPrune" /> удалять модели, которых больше нет на сервере</label>
     </div>
+    <div class="diag-fix">
+      <label class="check-line"><input type="checkbox" id="diagEnrich" /> дозаполнить характеристики существующих (лимиты, цены, вижн)</label>
+    </div>
     <div class="diag-sub" id="diagActionStatus"></div>
     <div id="diagActionOut"></div>`;
 
@@ -2353,6 +2356,8 @@ async function diagnose() {
   // the list does not show.
   const pruneBox = $("#diagPrune");
   if (pruneBox) pruneBox.onchange = () => { if (state.refreshPlan) renderRefreshPlan(); };
+  const enrichBox = $("#diagEnrich");
+  if (enrichBox) enrichBox.onchange = () => { if (state.refreshPlan) renderRefreshPlan(); };
 
   el.querySelectorAll("[data-smart-model]").forEach((b) => {
     b.onclick = async () => {
@@ -2485,11 +2490,12 @@ async function doRefreshModels() {
   const st = $("#diagActionStatus");
   const out = $("#diagActionOut");
   const prune = $("#diagPrune") ? $("#diagPrune").checked : false;
+  const enrich = $("#diagEnrich") ? $("#diagEnrich").checked : false;
   if (st) st.textContent = "Опрашиваю серверы…";
   if (out) out.innerHTML = "";
   const r = await apiSafe("/api/refresh-models", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ configPath: state.configPath, prune }),
+    body: JSON.stringify({ configPath: state.configPath, prune, enrich }),
   });
   if (!r || !r.ok) {
     if (st) st.textContent = "";
@@ -2537,8 +2543,9 @@ function renderRefreshPlan() {
   const freeOnly = $("#diagFreeOnly") ? $("#diagFreeOnly").checked : false;
   const totalAdd = rows.reduce((n, p) => n + asArray(p.added).length, 0);
   const totalDel = prune ? rows.reduce((n, p) => n + (p.removedCount || asArray(p.removed).length), 0) : 0;
+  const totalEnriched = rows.reduce((n, p) => n + (p.enrichedCount || asArray(p.enrichments).length), 0);
   const willApply = refreshSelectedIds().length;
-  if (st) st.textContent = `Новых моделей: ${totalAdd}${freeOnly ? " (показаны к записи только бесплатные)" : ""}${prune ? `, пропавших: ${totalDel}` : ""}`;
+  if (st) st.textContent = `Новых моделей: ${totalAdd}${freeOnly ? " (показаны к записи только бесплатные)" : ""}${prune ? `, пропавших: ${totalDel}` : ""}${totalEnriched ? `, дозаполнить: ${totalEnriched}` : ""}`;
   if (!out) return;
   const fmtAdded = (added) => {
     const list = asArray(added);
@@ -2550,11 +2557,22 @@ function renderRefreshPlan() {
       return `<span${dim}>${esc(id)}${free ? ` <span class="tag free">free</span>` : ""}</span>`;
     }).join(", ") + (list.length > 8 ? `\u2026 (+${list.length - 8})` : "");
   };
+  const fmtEnriched = (list) => {
+    const arr = asArray(list);
+    if (!arr.length) return "";
+    const names = arr.slice(0, 8).map((e) => {
+      const id = typeof e === "string" ? e : e.id;
+      const patch = (typeof e === "object" && e.patch) ? Object.keys(e.patch).join(",") : "";
+      return `${esc(id)}${patch ? ` (${esc(patch)})` : ""}`;
+    }).join(", ");
+    return `<br>~ ${names}${arr.length > 8 ? `\u2026 (+${arr.length - 8})` : ""}`;
+  };
   out.innerHTML = rows.map((p) => {
     const removed = prune ? asArray(p.removed) : [];
     const detail = p.ok
       ? `${fmtAdded(p.added)}`
         + `${removed.length ? `<br>− ${esc(removed.slice(0, 8).join(", "))}${removed.length > 8 ? `\u2026` : ""}` : ""}`
+        + fmtEnriched(p.enrichments)
       : esc(p.message || "ошибка");
     return `<div class="diag-row"><span class="diag-name">${esc(p.key)}</span>`
       + `<span class="diag-meta">${p.ok ? `всего на сервере: ${p.total ?? "?"}` : "не опрошен"}</span></div>`
@@ -2577,6 +2595,7 @@ function renderRefreshPlan() {
           body: JSON.stringify({
             configPath: state.configPath, hash: state.configHash,
             prune: $("#diagPrune") ? $("#diagPrune").checked : false,
+            enrich: $("#diagEnrich") ? $("#diagEnrich").checked : false,
             apply: true, models: refreshSelectedByProvider(),
           }),
         });
@@ -2642,8 +2661,10 @@ async function renderDigest(force) {
   const news = asArray(r.news);
   const when = r.as_of ? `данные борда на ${esc(r.as_of)}` : "дата неизвестна";
   const stale = r.stale ? ` \u00b7 <span class="warn-line">кэш (сеть недоступна)</span>` : "";
+  // Один фид висит, второй свеж: показываем что есть, а не красный экран.
+  const partial = r.partial ? ` \u00b7 <span class="warn-line">часть не загрузилась (${esc(r.error || "")})</span>` : "";
   let html = `<div class="result-card"><h3>Халява</h3>`
-    + `<div class="ok-line" style="color:var(--muted)">${when}${stale}</div>`
+    + `<div class="ok-line" style="color:var(--muted)">${when}${stale}${partial}</div>`
     + `<div class="diag-fix"><button class="btn btn-mini" id="digestRefresh" type="button">Обновить</button></div>`
     + `<div class="diag-sect">Раздают (${perks.length})</div>`;
   if (!perks.length) html += `<div class="ok-line" style="color:var(--muted)">\u2014 пусто \u2014</div>`;

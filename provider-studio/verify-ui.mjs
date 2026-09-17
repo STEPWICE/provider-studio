@@ -579,6 +579,20 @@ const smartGaps = [];
 }
 console.log(smartGaps.length ? `SMART AUDIT GAPS: ${smartGaps.join("; ")}` : "the smart audit renders with its fix");
 
+// Enrich backfill: the preview flag, the checkbox, and the server plumbing.
+const enrichGaps = [];
+{
+  // The checkbox is rendered by diagnose() into the panel, not static markup.
+  if (!/id="diagEnrich"/.test(js)) enrichGaps.push("no enrich checkbox in diagnostics");
+  const body = js.slice(js.indexOf("async function doRefreshModels"), js.indexOf("async function doRefreshModels") + 1500);
+  if (!/enrich/.test(body)) enrichGaps.push("the refresh preview ignores the enrich flag");
+  if (!/body\.enrich/.test(serverJs)) enrichGaps.push("the server never reads the enrich flag");
+  if (!/buildRefreshChanges\(plan, \{[^}]*enrich/.test(serverJs)) {
+    enrichGaps.push("the server never applies enrichments on write");
+  }
+}
+console.log(enrichGaps.length ? `ENRICH GAPS: ${enrichGaps.join("; ")}` : "enrich backfill is wired end to end");
+
 // Frontend polish: the live key preview, the preset filter, dialog roles,
 // and no leftover styles for removed controls.
 const polishGaps = [];
@@ -605,6 +619,6 @@ const failed = missingIds.length + missingClasses.length + badClick.length + lea
   typeGaps.length + fieldGaps.length + unstyled.length + wizGaps.length +
   (ruleGap ? 1 : 0) + presetGaps.length + rankGaps.length + layoutGaps.length + costGaps.length +
   freeGaps.length + probeGaps.length + singleGaps.length + maskGaps.length + undoGaps.length + deleteGaps.length +
-  smartGaps.length + polishGaps.length;
+  smartGaps.length + polishGaps.length + enrichGaps.length;
 console.log(`\n${failed ? "FAIL" : "OK"} — ${failed} issue(s)`);
 if (failed) process.exitCode = 1;

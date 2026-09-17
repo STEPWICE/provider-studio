@@ -144,6 +144,36 @@ function stubFetch(map) {
   check("битый фид при живом кэше — кэш", d2.ok === true && d2.stale === false, JSON.stringify(d2).slice(0, 160));
 }
 
+// ------------------------------------------------------- висящий фид не убивает второй
+{
+  // news падает (в реальности — висит до AbortSignal.timeout, что даёт тот же
+  // rejected-промис), perks цел, кэша нет: отдать perks, а не красный экран.
+  const perksOnly = stubFetch((u) => (u.includes("perks") ? PERKS : null));
+  D.clearDigestCache();
+  const d = await D.loadDigest({ fetchImpl: perksOnly });
+  check("упавший news не роняет perks", d.ok === true && d.perks.length === 1 && d.news.length === 0,
+    JSON.stringify({ ok: d.ok, perks: d.perks.length, news: d.news.length }));
+  check("частичность помечена", d.partial === true && /news/.test(d.error || ""), d.error);
+  check("протухшим не притворяется", d.stale === false);
+
+  // Теперь чиним news: свежие perks + свежие news → partial снят.
+  const good = stubFetch((u) => (u.includes("perks") ? PERKS : NEWS));
+  D.clearDigestCache();
+  const d2 = await D.loadDigest({ fetchImpl: good });
+  check("оба свежих — partial нет", d2.ok === true && d2.partial === false && d2.stale === false,
+    JSON.stringify({ partial: d2.partial, stale: d2.stale }));
+
+  // Кэш seeded полным грузеом; затем perks обновились, news снова лёг:
+  // свежие perks + кэшированные news, кэш самозалечен.
+  const PERKS2 = { as_of: "2026-09-18", items: [{ id: "p9", title_en: "New", status: "active" }] };
+  const perksNew = stubFetch((u) => (u.includes("perks") ? PERKS2 : null));
+  const d3 = await D.loadDigest({ fetchImpl: perksNew, refresh: true });
+  check("свежие perks + кэшированные news склеились",
+    d3.ok === true && d3.perks.some((p) => p.title === "New") && d3.news.length === 1,
+    JSON.stringify({ perks: d3.perks.map((p) => p.title), news: d3.news.length }));
+  check("склейка помечена partial", d3.partial === true && d3.stale === false);
+}
+
 // ------------------------------------------------------- источник только http(s)
 {
   const evil = D.normalisePerk({ id: "x", title_en: "t", source: "javascript:alert(1)" });

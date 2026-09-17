@@ -731,7 +731,8 @@ const server = http.createServer(async (req, res) => {
       }
       const keys = Array.isArray(body.providers) && body.providers.length ? body.providers : null;
       const prune = body.prune === true;
-      const plan = await planRefresh(cfg.config, { providerKeys: keys, prune });
+      const enrich = body.enrich === true;
+      const plan = await planRefresh(cfg.config, { providerKeys: keys, prune, enrich });
       // В превью pending раскрывается с free-меткой, чтобы интерфейс мог
       // предложить «только бесплатные» без повторного опроса серверов.
       const withFree = plan.map((p) => ({
@@ -753,7 +754,7 @@ const server = http.createServer(async (req, res) => {
       }
       // Белый список моделей из превью: так «только бесплатные» применяется
       // ровно к тому, что пользователь видел, а не к свежему опросу.
-      const changes = buildRefreshChanges(plan, { only: body.models ?? null, prune });
+      const changes = buildRefreshChanges(plan, { only: body.models ?? null, prune, enrich });
       if (!changes.length) {
         return json(res, 200, {
           ok: true, noop: true, path: cfg.path, hash: cfg.hash || "",

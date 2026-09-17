@@ -979,7 +979,12 @@ try {
       rs.writeHead(200, { "Content-Type": "application/json" });
       rs.end(JSON.stringify({ data: [
         { id: "stub-free", pricing: { prompt: "0", completion: "0" } },
-        { id: "stub-paid", pricing: { prompt: "0.0000025", completion: "0.00001" } },
+        // stub-paid заявляет лимит и вижн: нужно для проверки enrich.
+        {
+          id: "stub-paid", pricing: { prompt: "0.0000025", completion: "0.00001" },
+          context_window: 200000, max_output_tokens: 100000,
+          architecture: { modality: "text+image->text" },
+        },
       ] }));
     });
     await new Promise((r) => modelStub.listen(0, "127.0.0.1", r));
@@ -1029,6 +1034,35 @@ try {
       const keys = Object.keys(readConfigFile().provider?.refreshable?.models || {}).sort();
       check("prune adds the rest and drops the ghost",
         JSON.stringify(keys) === JSON.stringify(["stub-free", "stub-paid"]), keys);
+
+      // ---- enrich: дозаполнение существующих без перезаписи ручного ----
+      const mk2 = await (await post("/api/apply", {
+        provider: { name: "Enrichable", baseURL: modelsURL, apiFormat: "openai-chat", setAsDefault: false, models: [{ id: "stub-paid", name: "My Paid" }] },
+        targets: ["opencode"],
+      })).json();
+      check("enrich fixture applies",
+        mk2.results?.opencode?.ok === true, JSON.stringify(mk2).slice(0, 200));
+      const eprev = await (await post("/api/refresh-models", { providers: ["enrichable"], enrich: true })).json();
+      const erow = (eprev.providers || []).find((p) => p.key === "enrichable");
+      check("enrich proposes limit/cost/vision",
+        (erow?.enrichments || []).some((e) => e.id === "stub-paid" && e.patch?.limit && e.patch?.cost && e.patch?.inputTypes),
+        JSON.stringify(erow?.enrichments));
+      // Пустая карта = только enrich, без добавлений.
+      const eapply = await (await post("/api/refresh-models", {
+        providers: ["enrichable"], apply: true, enrich: true, models: { enrichable: [] }, hash: eprev.hash,
+      })).json();
+      check("enrich apply succeeds", eapply.ok === true, JSON.stringify(eapply).slice(0, 200));
+      const eentry = readConfigFile().provider?.enrichable?.models?.["stub-paid"];
+      check("limit backfilled",
+        eentry?.limit?.context === 200000 && eentry?.limit?.output === 100000,
+        JSON.stringify(eentry?.limit));
+      check("cost backfilled",
+        eentry?.cost?.input === 2.5 && eentry?.cost?.output === 10,
+        JSON.stringify(eentry?.cost));
+      check("vision input backfilled with attachment",
+        (eentry?.modalities?.input || []).includes("image") && eentry?.attachment === true,
+        JSON.stringify([eentry?.modalities, eentry?.attachment]));
+      check("hand-written name preserved", eentry?.name === "My Paid", eentry?.name);
     } finally {
       await new Promise((r) => modelStub.close(r));
     }

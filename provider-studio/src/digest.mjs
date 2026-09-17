@@ -135,6 +135,11 @@ function shape(raw, kind) {
 /**
  * Грузит дайджест: свежий кэш — сразу, иначе сеть, при её недоступности —
  * протухший кэш с stale:true. Без кэша и без сети — честная ошибка.
+ *
+ * Фиды независимы: висящий news.json не убивает свежий perks.json (и
+ * наоборот) — раньше Promise.all ронял всё целиком, и вместо половины халявы
+ * был красный экран. Каждая половина добирается из протухшего кэша, если он
+ * есть; чего нет ни в сети, ни в кэше — отдаётся пустым с partial:true.
  */
 export async function loadDigest({ timeoutMs = 15000, refresh = false, fetchImpl } = {}) {
   const cached = readCache();
@@ -142,37 +147,65 @@ export async function loadDigest({ timeoutMs = 15000, refresh = false, fetchImpl
   if (cached && fresh && !refresh) {
     return present(cached, { stale: false, cachedAt: cached.at });
   }
-  try {
-    const [perksRaw, newsRaw] = await Promise.all([
-      fetchJson(PERKS_URL, { timeoutMs, fetchImpl }),
-      fetchJson(NEWS_URL, { timeoutMs, fetchImpl }),
-    ]);
-    const perks = shape(perksRaw, "perks");
-    const news = shape(newsRaw, "news");
+  const [perksR, newsR] = await Promise.allSettled([
+    fetchJson(PERKS_URL, { timeoutMs, fetchImpl }).then((raw) => shape(raw, "perks")),
+    fetchJson(NEWS_URL, { timeoutMs, fetchImpl }).then((raw) => shape(raw, "news")),
+  ]);
+  const errors = [];
+  if (perksR.status === "rejected") errors.push("perks: " + errText(perksR.reason));
+  if (newsR.status === "rejected") errors.push("news: " + errText(newsR.reason));
+
+  const freshPerks = perksR.status === "fulfilled" ? perksR.value : null;
+  const freshNews = newsR.status === "fulfilled" ? newsR.value : null;
+  const perks = freshPerks || cached?.perks || null;
+  const news = freshNews || cached?.news || null;
+
+  if (perks && news) {
+    // Кэш самозалечивается по половинам: что свежо — перезаписано, что нет —
+    // доживает из прошлого. Пишется только целое (readCache неполное отвергнет)
+    // и только когда есть хоть что-то свежее: перезапись полностью протухшего
+    // кэша «освежила» бы его метку, и дальше протухшее отдавалось бы как свежее.
     const payload = { at: Date.now(), as_of: perks.as_of || news.as_of, perks, news };
-    writeCache(payload);
-    return present(payload, { stale: false, cachedAt: payload.at });
-  } catch (e) {
-    // Сеть легла, а вчерашний кэш цел: отдать его с пометкой — полезнее ошибки.
-    if (cached) {
-      return present(cached, { stale: true, cachedAt: cached.at, error: String(e?.message || e) });
-    }
-    return {
-      ok: false, as_of: "", perks: [], news: [], ended: 0,
-      stale: false, cachedAt: 0, error: `Дайджест недоступен: ${e?.message || e}`,
-    };
+    const anythingFresh = !!(freshPerks || freshNews);
+    if (anythingFresh) writeCache(payload);
+    return present(payload, {
+      stale: !anythingFresh,
+      cachedAt: payload.at,
+      partial: !freshPerks || !freshNews,
+      error: errors.join("; "),
+    });
   }
+  // Хотя бы одна половина есть, второй нет нигде: показать что есть, а не ноль.
+  if (perks || news) {
+    return present({ at: Date.now(), as_of: "", perks, news }, {
+      stale: false, cachedAt: Date.now(), partial: true, error: errors.join("; "),
+    });
+  }
+  // Сюда попадаем, только когда нет ни свежего, ни кэшированного: полный
+  // провал сети без подстраховки — честная ошибка. (Ветка «протухший кэш»
+  // выше: целый кэш всегда даёт обе половины и уходит через неё.)
+  return {
+    ok: false, as_of: "", perks: [], news: [], ended: 0,
+    stale: false, partial: false, cachedAt: 0, error: `Дайджест недоступен: ${errors.join("; ") || "нет сети"}`,
+  };
 }
 
-function present(payload, { stale, cachedAt, error = "" }) {
-  const { live, ended } = splitPerks(payload.perks.items);
+function errText(e) {
+  return String(e?.message || e || "неизвестная ошибка");
+}
+
+function present(payload, { stale, cachedAt, error = "", partial = false }) {
+  const perks = payload?.perks && Array.isArray(payload.perks.items) ? payload.perks : { as_of: "", items: [] };
+  const news = payload?.news && Array.isArray(payload.news.items) ? payload.news : { items: [] };
+  const { live, ended } = splitPerks(perks.items);
   return {
     ok: true,
-    as_of: payload.as_of || payload.perks.as_of || "",
+    as_of: payload?.as_of || perks.as_of || "",
     perks: live,
-    news: (Array.isArray(payload.news.items) ? payload.news.items : []).map(normaliseNews),
+    news: news.items.map(normaliseNews),
     ended,
     stale: !!stale,
+    partial: !!partial,
     cachedAt,
     error,
   };

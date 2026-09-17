@@ -472,7 +472,7 @@ export function planModelSync(existingModels, discovered, { prune = false } = {}
  *   - { [providerKey]: string[] } — id действуют только внутри своего
  *     провайдера. Без этого одинаковый id у двух шлюзов записывался в оба.
  */
-export function buildRefreshChanges(plan, { only = null, prune = false } = {}) {
+export function buildRefreshChanges(plan, { only = null, prune = false, enrich = false } = {}) {
   const asSet = (v) => new Set((Array.isArray(v) ? v : []).map((x) => String(x)));
   const NOTHING = new Set();
   let global = null;
@@ -496,8 +496,57 @@ export function buildRefreshChanges(plan, { only = null, prune = false } = {}) {
         changes.push({ op: "delete", path: ["provider", p.key, "models", id] });
       }
     }
+    // Обогащение пишется merge-листьями: существующие значения не затираются,
+    // дописывается только то, чего не было.
+    if (enrich) {
+      for (const e of p.enrichments || []) {
+        const v = {};
+        if (e.patch?.limit) v.limit = e.patch.limit;
+        if (e.patch?.cost) v.cost = e.patch.cost;
+        if (e.patch?.inputTypes) v.modalities = { input: e.patch.inputTypes };
+        if (e.patch?.attachment) v.attachment = true;
+        if (Object.keys(v).length) {
+          changes.push({ op: "merge", path: ["provider", p.key, "models", e.id], value: v });
+        }
+      }
+    }
   }
   return changes;
+}
+
+/**
+ * Дозаполнение существующей записи тем, что заявил живой эндпоинт.
+ *
+ * Правило то же, что везде: заполняется только отсутствующее, заявленное
+ * побеждает угаданное. Пустой limit/cost дописывается целиком (по половине
+ * схема не принимает), модальности расширяются только заявленными
+ * (declaredFields) — догадка по имени для автозаписи слишком слаба.
+ * Возвращает null, когда дописать нечего.
+ */
+export function enrichExisting(existing, discovered) {
+  if (!isPlainObject(existing) || !discovered || typeof discovered !== "object") return null;
+  const out = {};
+  const hasLimit = isPlainObject(existing.limit)
+    && typeof existing.limit.context === "number" && typeof existing.limit.output === "number";
+  if (!hasLimit && discovered.contextWindow > 0 && discovered.maxOutput > 0) {
+    out.limit = { context: discovered.contextWindow, output: discovered.maxOutput };
+  }
+  const hasCost = isPlainObject(existing.cost)
+    && typeof existing.cost.input === "number" && typeof existing.cost.output === "number";
+  if (!hasCost && discovered.costInput != null && discovered.costOutput != null) {
+    out.cost = { input: discovered.costInput, output: discovered.costOutput };
+  }
+  const existingInput = Array.isArray(existing.modalities?.input) ? existing.modalities.input : ["text"];
+  const declared = Array.isArray(discovered.declaredFields) && discovered.declaredFields.includes("inputTypes");
+  const dInput = Array.isArray(discovered.inputTypes) ? discovered.inputTypes : ["text"];
+  if (declared && existingInput.length === 1 && existingInput[0] === "text" && dInput.length > 1) {
+    out.inputTypes = dInput;
+  }
+  const finalInput = out.inputTypes || existingInput;
+  if (finalInput.some((t) => t !== "text") && existing.attachment !== true) {
+    out.attachment = true;
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 /**
@@ -505,7 +554,7 @@ export function buildRefreshChanges(plan, { only = null, prune = false } = {}) {
  *
  * fetchFn подменяется в тестах стабом, чтобы не ходить в сеть.
  */
-export async function planRefresh(config, { providerKeys = null, prune = false, fetchFn = null, concurrency = 3 } = {}) {
+export async function planRefresh(config, { providerKeys = null, prune = false, enrich = false, fetchFn = null, concurrency = 3 } = {}) {
   // Ленивый импорт: rescue.mjs тяжёлый (прокси, DNS), а для юнит-плана он не нужен.
   const { fetchModels } = fetchFn ? { fetchModels: fetchFn } : await import("./rescue.mjs");
   const entries = Object.entries((config && isPlainObject(config.provider) ? config.provider : {}) || {});
@@ -533,12 +582,30 @@ export async function planRefresh(config, { providerKeys = null, prune = false, 
       return { key, ok: false, message: res?.message || "Не удалось получить список моделей", fault: res?.fault || null };
     }
     const sync = planModelSync(p.models, res.models, { prune });
+    // Обогащение: дозаполнить отсутствующие характеристики у моделей, которые
+    // уже есть в конфиге. Только при явном запросе — это меняет существующие
+    // записи, а не добавляет новые.
+    const enrichments = [];
+    if (enrich && isPlainObject(p.models)) {
+      const live = new Map();
+      for (const d of res.models || []) {
+        const id = String(d?.id || "").trim();
+        if (id && !live.has(id)) live.set(id, d);
+      }
+      for (const [id, entry] of Object.entries(p.models)) {
+        if (!live.has(id)) continue;
+        const patch = enrichExisting(entry, live.get(id));
+        if (patch) enrichments.push({ id, patch });
+      }
+    }
     return {
       key, ok: true, message: res.message || `Найдено моделей: ${res.models.length}`,
       total: res.models.length,
       added: sync.added, removed: sync.removed, kept: sync.kept,
       pending: sync.changes,
-      prune,
+      prune, enrich,
+      enrichments,
+      enrichedCount: enrichments.length,
     };
   }
 
