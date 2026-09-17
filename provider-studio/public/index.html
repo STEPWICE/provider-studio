@@ -44,6 +44,13 @@
         </div>
       </header>
 
+      <!-- Shown when the config file changed on disk after this page read it.
+           Without it the next write fails with a 409 that looks like a bug. -->
+      <div class="ext-change" id="extChange" hidden>
+        <span>Конфиг изменился извне — запись со старым хешем будет отклонена.</span>
+        <button class="btn btn-mini" id="extChangeBtn" type="button">Обновить</button>
+      </div>
+
       <!-- Two columns on a wide window. Everything used to be one 760px stack,
            so the diagnostics output appeared far below the fold while the right
            half of the screen stayed empty. -->
@@ -133,6 +140,7 @@
           <button class="btn btn-soft" id="btnDiag" title="Проверить всё: конфиг + соединение">Диагностика</button>
           <button class="btn btn-soft" id="btnValidate">Проверить конфиг</button>
           <button class="btn btn-soft" id="btnBackupNow">Бэкап</button>
+          <button class="btn btn-soft" id="btnUndo" title="Откатывать нечего" disabled>Отменить</button>
           <span class="muted" id="backupInfo"></span>
         </div>
         <!-- Placeholder rather than an empty column: an unexplained blank area

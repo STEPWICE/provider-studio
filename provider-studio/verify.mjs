@@ -908,6 +908,29 @@ try {
     check("diagnostics separates reachability from auth",
       (diag.providers || []).every((p) => "reach" in p && "fault" in p),
       JSON.stringify((diag.providers || []).map((p) => [p.key, p.reach, p.fault])));
+
+    // ---- undo reverts the last write, then has nothing left ----
+    // The fixture at this point: dead/alive/packaged providers, default on
+    // alive/alive-model, and a last-write record from the repoint above.
+    const undoState = await (await get("/api/state")).json();
+    check("state advertises the last write for undo",
+      !!undoState.undo && typeof undoState.undo.label === "string",
+      JSON.stringify(undoState.undo || null));
+    const moveBack = await (await post("/api/set-default-model", { model: "dead/dead-model" })).json();
+    check("repoint for the undo test succeeds",
+      moveBack.ok === true && readConfigFile().model === "dead/dead-model",
+      `${JSON.stringify(moveBack).slice(0, 140)} model=${readConfigFile().model}`);
+    const undone = await (await post("/api/undo", {})).json();
+    check("undo succeeds", undone.ok === true, JSON.stringify(undone).slice(0, 200));
+    check("undo restores the previous default",
+      readConfigFile().model === "alive/alive-model", readConfigFile().model);
+    check("undo snapshots before reverting",
+      !!undone.preFile, JSON.stringify(undone).slice(0, 200));
+    check("undo hands back the new hash", typeof undone.hash === "string" && undone.hash.length === 64, undone.hash);
+    const undoneAgain = await (await post("/api/undo", {})).json();
+    check("a second undo reports nothing to revert", undoneAgain.ok === false, JSON.stringify(undoneAgain).slice(0, 160));
+    const undoEmpty = await (await get("/api/state")).json();
+    check("state stops advertising undo once spent", !undoEmpty.undo, JSON.stringify(undoEmpty.undo || null));
   }
 } finally {
   child.kill();

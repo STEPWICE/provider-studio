@@ -376,6 +376,18 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
 .toolbar { max-width: 720px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 #backupInfo { font-size: 11px; color: var(--muted); }
 
+/* Banner for "the config file changed on disk after this page read it".
+   Warning styling, not error: nothing is broken yet, but the next write
+   would be refused as a conflict. */
+.ext-change {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  border: 1px solid var(--warn); border-radius: var(--radius);
+  padding: 10px 14px; margin-bottom: 16px;
+  font-size: 12px; color: var(--warn);
+  background: rgba(251,191,36,.06);
+}
+.ext-change[hidden] { display: none !important; }
+
 /* No max-width or top margin any more: these live in the side column, which
    sets its own width and spacing. Keeping the 720px cap would have left a gap
    inside a column that is often narrower than that anyway. */

@@ -36,6 +36,12 @@ const state = {
   // Probe results by provider key, filled in by a diagnostics run. Empty means
   // "not checked yet", which is rendered as a neutral dot rather than green.
   health: {},
+  // The last diagnostics payload, kept so the "copy report" action can render
+  // it without re-probing every provider.
+  lastDiag: null,
+  // Hash of the on-disk change the external-edit banner was already shown for,
+  // so the poll does not re-raise a dismissed banner every 5 seconds.
+  extNotifiedHash: "",
 };
 
 const INPUT_TYPES = ["text", "image", "video", "audio", "pdf"];
@@ -207,6 +213,18 @@ async function init() {
   });
   $("#btnValidate").addEventListener("click", validate);
   $("#btnBackupNow").addEventListener("click", backupNow);
+  $("#btnUndo").addEventListener("click", doUndo);
+  $("#extChangeBtn").addEventListener("click", async () => {
+    $("#extChange").hidden = true;
+    state.extNotifiedHash = "";
+    await refreshConfigState();
+    toast("Хеш обновлён — можно записывать", "ok");
+  });
+  // The poll is deliberately dumb (one cheap hash compare per 5s, paused in a
+  // hidden tab): file watching across atomic renames is unreliable, while a
+  // missed external edit turns the next write into a confusing 409.
+  setInterval(pollExternalChanges, 5000);
+  refreshUndo();
   $("#btnImport").addEventListener("click", importFromOpenCode);
   $("#btnDiscover").addEventListener("click", async () => {
     setBtnLoading($("#btnDiscover"), true);
@@ -575,8 +593,95 @@ async function refreshConfigState() {
     state.configHash = d.opencode.hash || "";
     state.configHasComments = !!d.opencode.comments;
     updateConfigChip(d.opencode);
+    // A fresh read settles the external-edit question either way.
+    state.extNotifiedHash = "";
+    const banner = $("#extChange");
+    if (banner) banner.hidden = true;
   }
+  syncUndoButton(d && d.undo);
   return d;
+}
+
+// The undo button mirrors the server's last-write record. Updated from every
+// /api/state answer (explicit refreshes and the background poll alike), so no
+// mutation site has to remember it — though the important ones still refresh
+// eagerly rather than waiting up to 5 seconds for the poll.
+function syncUndoButton(u) {
+  const b = $("#btnUndo");
+  if (!b) return;
+  b.disabled = !u;
+  b.title = u && u.label ? `Откатить: ${u.label}` : "Откатывать нечего";
+}
+
+async function refreshUndo() {
+  let d = null;
+  try { d = await api("/api/state"); } catch { return; }
+  syncUndoButton(d && d.undo);
+}
+
+// Reverts the last config write. The server snapshots the current file first,
+// so even a mistaken undo stays recoverable from the backup list.
+async function doUndo() {
+  const b = $("#btnUndo");
+  if (b) setBtnLoading(b, true);
+  try {
+    const r = await api("/api/undo", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ configPath: state.configPath }),
+    });
+    if (!r || !r.ok) return toast((r && r.error) || "Откатывать нечего", "err");
+    if (typeof r.hash === "string") state.configHash = r.hash;
+    // Undoing a creation removes the file; the chip has to say so.
+    await refreshConfigState();
+    refreshBackups();
+    toast(r.removed ? `Файл удалён (откат: ${r.label || ""})` : `Откачено: ${r.label || ""}. Перезапусти opencode.`, "ok");
+    await diagnose();
+  } finally {
+    if (b) setBtnLoading(b, false);
+  }
+}
+
+/**
+ * Watches the config file for edits made outside this page (a text editor,
+ * another harness, a second tab). The server is the source of truth; this
+ * only compares hashes and never rewrites anything on its own.
+ *
+ * Two outcomes: when the form is clean the new hash is adopted silently (there
+ * is nothing to lose), and when the user has unsaid things in the form a
+ * banner offers to re-read instead of letting the next write die with a 409.
+ */
+async function pollExternalChanges() {
+  if (document.hidden) return;
+  let d = null;
+  try { d = await api("/api/state"); } catch { return; }
+  if (!d || !d.opencode) return;
+  syncUndoButton(d.undo);
+  // The hash belongs to the server's active file; comparing it against the
+  // hash of a different file the user picked would cry wolf on every poll.
+  if (state.configPath && d.opencode.path !== state.configPath) return;
+  const live = d.opencode.hash || "";
+  if (!live || live === state.configHash) {
+    state.extNotifiedHash = "";
+    const e = $("#extChange");
+    if (e) e.hidden = true;
+    return;
+  }
+  if (live === state.extNotifiedHash) return;
+  if (isFormDirty()) {
+    state.extNotifiedHash = live;
+    const e = $("#extChange");
+    if (e) e.hidden = false;
+  } else {
+    state.configHash = live;
+  }
+}
+
+function isFormDirty() {
+  if (state.dirty) return true;
+  if ((state.models || []).length) return true;
+  const name = $("#f-name");
+  const url = $("#f-baseurl");
+  return !!((name && name.value.trim()) || (url && url.value.trim()));
 }
 
 // The path is the only thing worth showing here, truncated from the left by CSS
@@ -657,6 +762,7 @@ async function renameInConfig(name) {
   state.providers = asArray(d.providers);
   renderProviderList();
   refreshBackups();
+  refreshUndo();
   toast(`Переименовано: ${from} → ${to}. Перезапусти opencode.`, "ok");
 }
 
@@ -694,6 +800,7 @@ async function removeFromConfig(name) {
       renderProviderList();
       renderBackups(asArray(res.backups));
       await refreshConfigState();
+      refreshUndo();
       toast(`Провайдер «${key}» удалён. Перезапусти opencode.`, "ok");
     },
   });
@@ -798,6 +905,33 @@ async function testAllModels() {
   renderModelList();
 }
 
+/**
+ * One live request to one model, straight from its row. Unlike "check all"
+ * this runs immediately (no batch queue) and reports through the same
+ * probeMark/probeNote marks, so a single-model check and a bulk run can never
+ * paint different pictures of the same model.
+ */
+async function testSingleModel(index, btn) {
+  const m = state.models[index];
+  if (!m || !m.id) return;
+  const provider = collectProvider();
+  if (!provider.baseURL) return toast("Укажи Base URL для теста", "err");
+  if (btn) setBtnLoading(btn, true);
+  try {
+    const r = await api("/api/testchat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, modelId: m.id }),
+    });
+    state.probeResults = state.probeResults || {};
+    state.probeResults[m.id] = { id: m.id, ...(r.result || { ok: false, message: (r && r.error) || "не удалось проверить" }) };
+    const p = state.probeResults[m.id];
+    toast(`${p.ok ? "\u2713" : "\u2715"} ${m.id}: ${p.message || ""}`, p.ok ? "ok" : "err");
+  } finally {
+    if (btn) setBtnLoading(btn, false);
+    renderModelList();
+  }
+}
+
 function plural(n, one, few, many) {
   const a = Math.abs(n) % 100, b = a % 10;
   if (a > 10 && a < 20) return many;
@@ -832,14 +966,20 @@ function renderModelList() {
         ${m.toolUse !== false ? `<span class="tag">tools</span>` : ""}
       </div>
       <div class="row-actions">
+        <button class="rm" data-test="${i}" title="Отправить пробный запрос к этой модели (потратит ~16 токенов)">&#x26a1;</button>
         <button class="rm ed" data-edit="${i}" title="Редактировать">\u270e</button>
         <button class="rm" data-i="${i}" title="Удалить">&times;</button>
       </div>
     </div>`;
   }).join("");
-  list.querySelectorAll(".rm:not(.ed)").forEach((btn) => btn.addEventListener("click", () => {
+  // The delete selector names data-i explicitly: matching "every .rm that is
+  // not .ed" would also catch the per-model probe button added above.
+  list.querySelectorAll(".rm[data-i]").forEach((btn) => btn.addEventListener("click", () => {
     state.models.splice(Number(btn.dataset.i), 1);
     renderModelList();
+  }));
+  list.querySelectorAll(".rm[data-test]").forEach((btn) => btn.addEventListener("click", () => {
+    testSingleModel(Number(btn.dataset.test), btn);
   }));
   list.querySelectorAll(".rm.ed").forEach((btn) => btn.addEventListener("click", () => {
     openModelModal(Number(btn.dataset.edit));
@@ -1134,6 +1274,7 @@ async function applyNow(provider) {
     if (oc.ok) state.editingKey = slugifyName(provider.name);
   }
   refreshBackups();
+  refreshUndo();
 
   const resultsEl = $("#results");
   resultsEl.hidden = false;
@@ -1266,7 +1407,11 @@ function renderBackups(backups) {
       body: JSON.stringify({ file: btn.dataset.file }),
     });
     toast(r.ok ? "Конфиг восстановлен. Перезапусти opencode." : ("Ошибка: " + (r.error || "")), r.ok ? "ok" : "err");
+    // A restore rewrites the file, so the hash this page holds is stale and the
+    // next write would be refused as a false conflict.
+    await refreshConfigState();
     await refreshBackups();
+    refreshUndo();
     $("#results").hidden = true;
     syncSidePlaceholder();
   }));
@@ -1870,6 +2015,9 @@ if (typeof window !== "undefined") window.rankDefaultCandidates = rankDefaultCan
 async function diagnose() {
   setStatus("Проверяю\u2026", "");
   const r = await api("/api/diagnostics");
+  // Kept for the copyable report: re-probing on every copy would burn quota
+  // and take a minute on a dozen providers.
+  state.lastDiag = r;
   const issues = asArray(r.issues);
   const providers = asArray(r.providers);
   // Feed the sidebar dots from the same probe results, so the list and the
@@ -1925,12 +2073,37 @@ async function diagnose() {
       <div class="diag-sub muted">Провайдер «${esc(brokenDefault.key)}» недоступен, но и живого провайдера с моделями в конфиге нет \u2014 замену выбрать не из чего.</div>`;
   }
 
+  // Три действия, о которых просили: починить конфиг, сверить модели с живым
+  // сервером и проверить сам инструмент. Автофикс и обновление моделей идут
+  // через diff-подтверждение — как и любая другая запись в этом инструменте.
+  html += `<div class="diag-sect">Действия</div>
+    <div class="diag-fix">
+      <button class="btn btn-mini" id="diagAutoFix" type="button">Исправить автоматически</button>
+      <button class="btn btn-mini" id="diagRefreshModels" type="button">Обновить модели</button>
+      <button class="btn btn-mini" id="diagSelfCheck" type="button">Самопроверка</button>
+      <button class="btn btn-mini" id="diagCopyReport" type="button" title="Скопировать сводку в буфер — без ключей">Скопировать отчёт</button>
+    </div>
+    <div class="diag-fix">
+      <label class="check-line"><input type="checkbox" id="diagPrune" /> удалять модели, которых больше нет на сервере</label>
+    </div>
+    <div class="diag-sub" id="diagActionStatus"></div>
+    <div id="diagActionOut"></div>`;
+
   html += `<div class="diag-sect">Конфиг (${issues.length})</div>`;
   if (!issues.length) html += `<div class="ok-line">\u2713 Проблем не найдено</div>`;
   else html += issues.map((i) => `<div class="${i.severity === "error" ? "err-line" : "ok-line"}" style="color:var(--text)">${i.severity === "error" ? "\u2715" : "\u26a0"} ${esc(i.message)}</div>`).join("");
 
   html += `</div>`;
   el.innerHTML = html;
+
+  const autoBtn = $("#diagAutoFix");
+  if (autoBtn) autoBtn.onclick = () => doAutoFix();
+  const refreshBtn = $("#diagRefreshModels");
+  if (refreshBtn) refreshBtn.onclick = () => doRefreshModels();
+  const selfBtn = $("#diagSelfCheck");
+  if (selfBtn) selfBtn.onclick = () => doSelfCheck();
+  const reportBtn = $("#diagCopyReport");
+  if (reportBtn) reportBtn.onclick = () => copyDiagReport();
 
   const pick = $("#diagModelPick");
   const fixBtn = $("#diagSetDefault");
@@ -1949,6 +2122,7 @@ async function diagnose() {
       if (resp && resp.ok) {
         toast(`Модель по умолчанию: ${model}`, "ok");
         await refreshConfigState();
+        refreshUndo();
         await diagnose(); // re-render so the badge and the tag move
       } else {
         toast((resp && resp.error) || "Не удалось сменить модель", "err");
@@ -1964,6 +2138,215 @@ async function diagnose() {
     p.reach === "down" || p.fault === "key" || p.fault === "nokey" || (p.reach == null && !p.ok));
   const hasErr = issues.some((i) => i.severity === "error") || badProvider;
   toast(hasErr ? "Диагностика: есть проблемы" : "Диагностика: всё в порядке", hasErr ? "err" : "ok");
+}
+
+/**
+ * Автоисправление конфига: preview -> diff -> подтверждение -> запись.
+ * Чинит только однозначное (мусорные поля, ключ не в том месте, $VAR,
+ * неполные limit/cost, висячий default). Переменная окружения и пустой список
+ * моделей остаются ручными шагами — о них пишет remaining.
+ */
+async function doAutoFix() {
+  const st = $("#diagActionStatus");
+  const out = $("#diagActionOut");
+  if (st) st.textContent = "Считаю исправления…";
+  if (out) out.innerHTML = "";
+  const r = await api("/api/autofix-preview", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ configPath: state.configPath }),
+  });
+  if (!r || !r.ok) {
+    if (st) st.textContent = "";
+    return toast((r && r.error) || "Не удалось построить план исправлений", "err");
+  }
+  const fixes = asArray(r.fixes);
+  const skipped = asArray(r.skipped);
+  state.configHash = r.hash || state.configHash;
+  if (!fixes.length) {
+    if (st) st.textContent = "Исправлять нечего — конфиг уже в порядке.";
+    if (out && skipped.length) {
+      out.innerHTML = `<div class="diag-sub">Вручную: ${esc(skipped.map((s) => s.message).join("; "))}</div>`;
+    }
+    return;
+  }
+  if (st) st.textContent = `Найдено исправлений: ${fixes.length}${skipped.length ? `, вручную: ${skipped.length}` : ""}`;
+  openDiff({
+    title: "Автоисправление конфига",
+    meta: `<div class="diff-path">${esc(r.path || "")}</div>
+      <div class="diff-stat"><span class="plus">+${r.diff ? r.diff.added : 0}</span>
+      <span class="minus">-${r.diff ? r.diff.removed : 0}</span></div>`,
+    diff: r.diff,
+    hint: fixes.slice(0, 6).map((f) => f.message).join("; ") + (fixes.length > 6 ? `… (+${fixes.length - 6})` : ""),
+    confirmLabel: `Исправить (${fixes.length})`,
+    onConfirm: async () => {
+      closeDiff();
+      const res = await api("/api/autofix-apply", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ configPath: state.configPath, hash: state.configHash }),
+      });
+      if (res && res.conflict) await refreshConfigState();
+      if (!res || !res.ok) return toast((res && res.error) || "Не удалось применить исправления", "err");
+      if (res.hash) state.configHash = res.hash;
+      if (res.backupFile) setBackupInfo(`\u21bb Автобэкап: ${res.backupFile}`);
+      refreshBackups();
+      refreshUndo();
+      toast(`Исправлено: ${(res.fixed || []).length}`, "ok");
+      await diagnose();
+    },
+  });
+}
+
+/**
+ * Обновление моделей: сверяет конфиг с живым /models каждого провайдера.
+ * Сначала показывает план (что добавится/пропадёт), пишет только после
+ * подтверждения. Существующие записи не перезаписываются.
+ */
+async function doRefreshModels() {
+  const st = $("#diagActionStatus");
+  const out = $("#diagActionOut");
+  const prune = $("#diagPrune") ? $("#diagPrune").checked : false;
+  if (st) st.textContent = "Опрашиваю серверы…";
+  if (out) out.innerHTML = "";
+  const r = await api("/api/refresh-models", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ configPath: state.configPath, prune }),
+  });
+  if (!r || !r.ok) {
+    if (st) st.textContent = "";
+    return toast((r && r.error) || "Не удалось обновить модели", "err");
+  }
+  state.configHash = r.hash || state.configHash;
+  const rows = asArray(r.providers);
+  if (!rows.length) {
+    if (st) st.textContent = "В конфиге нет провайдеров для обновления.";
+    return;
+  }
+  const totalAdd = rows.reduce((n, p) => n + (p.addedCount || (p.added || []).length), 0);
+  const totalDel = prune ? rows.reduce((n, p) => n + (p.removedCount || (p.removed || []).length), 0) : 0;
+  if (st) st.textContent = `Новых моделей: ${totalAdd}${prune ? `, пропавших: ${totalDel}` : ""}`;
+  if (out) {
+    out.innerHTML = rows.map((p) => {
+      const added = asArray(p.added || (p.pending || []));
+      const removed = prune ? asArray(p.removed) : [];
+      const detail = p.ok
+        ? `${added.length ? `+ ${esc(added.slice(0, 8).join(", "))}${added.length > 8 ? `\u2026 (+${added.length - 8})` : ""}` : "нового нет"}`
+          + `${removed.length ? `<br>− ${esc(removed.slice(0, 8).join(", "))}${removed.length > 8 ? `\u2026` : ""}` : ""}`
+        : esc(p.message || "ошибка");
+      return `<div class="diag-row"><span class="diag-name">${esc(p.key)}</span>`
+        + `<span class="diag-meta">${p.ok ? `всего на сервере: ${p.total ?? "?"}` : "не опрошен"}</span></div>`
+        + `<div class="diag-sub">${detail}</div>`;
+    }).join("")
+      + (totalAdd || totalDel ? `<div class="diag-fix"><button class="btn btn-mini" id="diagRefreshApply" type="button">Применить (${totalAdd + totalDel})</button></div>` : "");
+    const applyBtn = $("#diagRefreshApply");
+    if (applyBtn) {
+      applyBtn.onclick = async () => {
+        setBtnLoading(applyBtn, true);
+        try {
+          const res = await api("/api/refresh-models", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ configPath: state.configPath, hash: state.configHash, prune, apply: true }),
+          });
+          if (res && res.conflict) await refreshConfigState();
+          if (!res || !res.ok) return toast((res && res.error) || "Не удалось записать модели", "err");
+          if (res.hash) state.configHash = res.hash;
+          if (res.backupFile) setBackupInfo(`\u21bb Автобэкап: ${res.backupFile}`);
+          refreshBackups();
+          refreshUndo();
+          toast(res.noop ? "Модели уже актуальны" : "Список моделей обновлён. Перезапусти opencode.", "ok");
+          await diagnose();
+        } finally {
+          setBtnLoading(applyBtn, false);
+        }
+      };
+    }
+  }
+}
+
+/**
+ * Самопроверка инструмента: Node, каталоги, конфиг, прокси, справочник.
+ * Сеть здесь не приговор: недоступный models.dev — предупреждение, а не ошибка.
+ */
+async function doSelfCheck() {
+  const st = $("#diagActionStatus");
+  const out = $("#diagActionOut");
+  if (st) st.textContent = "Проверяю сам инструмент…";
+  if (out) out.innerHTML = "";
+  const r = await api("/api/selfcheck" + "?configPath=" + encodeURIComponent(state.configPath || ""));
+  if (!r || !r.ok) {
+    if (st) st.textContent = "";
+    return toast((r && r.error) || "Самопроверка не удалась", "err");
+  }
+  const list = asArray(r.checks);
+  const bad = list.filter((c) => !c.ok && c.critical).length;
+  if (st) st.textContent = bad ? `Самопроверка: проблем ${bad}` : "Самопроверка: всё в порядке";
+  if (out) {
+    out.innerHTML = `<div class="diag-sect">Самопроверка</div>` + list.map((c) =>
+      `<div class="diag-row"><span class="diag-name">${esc(c.label)}</span>`
+      + `${c.ok ? `<span class="ok-line">\u2713</span>` : `<span class="err-line">\u2715</span>`}</div>`
+      + `<div class="diag-sub">${esc(c.message || "")}</div>`
+    ).join("");
+  }
+  toast(bad ? "Самопроверка: есть проблемы" : "Самопроверка: всё в порядке", bad ? "err" : "ok");
+}
+
+/**
+ * Strips anything that looks like a credential from a diagnostics report.
+ *
+ * The report is meant to be pasted into chats and issues, so this errs on the
+ * side of masking: `sk-…` tokens, Bearer values and key-shaped fields. Env
+ * references (`{env:FOO}`) are names, not secrets, and are kept — without them
+ * the report cannot explain an env-missing fault.
+ *
+ * Exported on `window` so verify-ui can exercise the real function instead of
+ * pattern-matching the source.
+ */
+function maskSecretsForReport(text) {
+  const stash = [];
+  const safe = String(text ?? "").replace(/\{env:[A-Za-z_][A-Za-z0-9_]*\}/g, (m) => {
+    stash.push(m);
+    return `\u0000${stash.length - 1}\u0000`;
+  });
+  // \u0000 is excluded from the value class: it marks the stashed {env:…}
+  // placeholders above, and matching it would mask the stash itself.
+  const masked = safe
+    .replace(/sk-[A-Za-z0-9\-_]{8,}/g, "sk-****")
+    .replace(/Bearer\s+[A-Za-z0-9\-._~+/=]+/gi, "Bearer ****")
+    .replace(/((?:api[_-]?key|token|secret|password)["']?\s*[:=]\s*["']?)([^"'\s,}\u0000]+)/gi, "$1****");
+  return masked.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)]);
+}
+if (typeof window !== "undefined") window.maskSecretsForReport = maskSecretsForReport;
+
+/**
+ * Copies the last diagnostics run as markdown. No new probe, no secrets: the
+ * payload on screen never held a key, and provider error texts are masked on
+ * top of that because a server may echo a credential back inside its message.
+ */
+async function copyDiagReport() {
+  const d = state.lastDiag;
+  if (!d) return toast("Сначала запусти диагностику", "err");
+  const lines = [
+    "# Provider Studio — отчёт диагностики",
+    "",
+    `Дата: ${new Date().toISOString()}`,
+    `Конфиг: ${(d.path || "")}`,
+    `Модель по умолчанию: ${(d.model || "—")}`,
+  ];
+  if (d.proxy) lines.push(`Прокси: ${d.proxy}`);
+  lines.push("", "## Провайдеры");
+  const providers = asArray(d.providers);
+  if (!providers.length) lines.push("- нет провайдеров");
+  for (const p of providers) {
+    const state_ = p.reach === "unknown" ? "не проверяется"
+      : p.reach === "up" && !p.fault ? "доступен"
+      : `${p.reach || "?"}${p.fault ? ` (ошибка: ${p.fault})` : ""}`;
+    lines.push(`- ${p.key}: моделей ${p.nModels ?? "?"} — ${state_} — ${p.conn || ""} [${p.baseURL || "—"}]`);
+  }
+  lines.push("", "## Конфиг");
+  const issues = asArray(d.issues);
+  if (!issues.length) lines.push("- проблем не найдено");
+  for (const i of issues) lines.push(`- [${i.severity}] ${i.message}`);
+  await navigator.clipboard.writeText(maskSecretsForReport(lines.join("\n")));
+  toast("Отчёт скопирован (без секретов)", "ok");
 }
 
 init();

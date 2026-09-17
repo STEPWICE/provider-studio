@@ -464,10 +464,86 @@ const probeGaps = [];
 }
 console.log(probeGaps.length ? `PROBE REPORT GAPS: ${probeGaps.join("; ")}` : "probe results keep working, unpaid, blocked and dead apart");
 
+// The per-model probe button must not be swallowed by the delete handler, and
+// the diagnostics report must never carry a credential into the clipboard.
+const singleGaps = [];
+{
+  // The delete handler used to match "every .rm that is not .ed" — the day a
+  // probe button with class .rm landed in the same row, every single-model
+  // check would have deleted the model instead.
+  if (/\.rm:not\(\.ed\)/.test(js)) {
+    singleGaps.push('the delete handler still matches .rm:not(.ed) — it would catch the probe button');
+  }
+  if (!/\.rm\[data-i\]/.test(js)) singleGaps.push("no .rm[data-i] delete selector");
+  if (!/data-test=/.test(js)) singleGaps.push("no per-model probe button in the model rows");
+  if (!/function testSingleModel/.test(js)) singleGaps.push("no testSingleModel — the button would do nothing");
+  if (!/"\/api\/testchat"[\s\S]{0,400}?modelId/.test(js)) {
+    singleGaps.push("testSingleModel does not post a modelId to /api/testchat");
+  }
+  // The single check must report through the same marks as the bulk run, or
+  // the two paths paint different pictures of the same model.
+  const single = js.slice(js.indexOf("function testSingleModel"), js.indexOf("function plural"));
+  if (!/state\.probeResults/.test(single)) singleGaps.push("a single-model check does not feed probeResults");
+  if (!/renderModelList\(\)/.test(single)) singleGaps.push("a single-model check does not re-render the list");
+}
+console.log(singleGaps.length ? `SINGLE-MODEL PROBE GAPS: ${singleGaps.join("; ")}` : "each model row can probe itself without deleting itself");
+
+// The report is built for pasting into chats and issues: one leaked key in a
+// provider error text and the convenience becomes an incident. Run the real
+// masking function rather than grepping for its shape.
+const maskGaps = [];
+{
+  const start = js.indexOf("function maskSecretsForReport");
+  if (start < 0) maskGaps.push("no maskSecretsForReport — the report goes out unmasked");
+  else {
+    const src = js.slice(start, js.indexOf("\n}", start) + 2);
+    const mask = new Function(`${src}; return maskSecretsForReport;`)();
+    const key = "sk-live-abcdef1234567890";
+    if (mask(`key ${key} rest`).includes(key)) maskGaps.push("an sk-… key survives masking");
+    if (!/sk-\*\*\*\*/.test(mask(`key ${key}`))) maskGaps.push("a masked key is not recognisable as masked");
+    if (!mask("apiKey: {env:FOO}").includes("{env:FOO}")) {
+      maskGaps.push("an {env:FOO} reference is masked — the report can no longer explain an env-missing fault");
+    }
+    if (/abc\.def-ghi/.test(mask("Authorization: Bearer abc.def-ghi"))) {
+      maskGaps.push("a Bearer value survives masking");
+    }
+    if (mask("nothing secret here") !== "nothing secret here") maskGaps.push("plain text is mangled");
+    if (!/window\.maskSecretsForReport/.test(js)) maskGaps.push("the mask function is not exposed for testing");
+  }
+  if (!/function copyDiagReport/.test(js)) maskGaps.push("no copyDiagReport");
+  else {
+    const body = js.slice(js.indexOf("function copyDiagReport"), js.indexOf("function copyDiagReport") + 2000);
+    if (!/state\.lastDiag/.test(body)) maskGaps.push("the report does not come from the last diagnostics run");
+    if (!/maskSecretsForReport/.test(body)) maskGaps.push("the report is copied without masking");
+  }
+  if (!/id="diagCopyReport"/.test(js)) maskGaps.push("no copy-report button in the diagnostics panel");
+}
+console.log(maskGaps.length ? `REPORT MASK GAPS: ${maskGaps.join("; ")}` : "the diagnostics report is copyable and carries no secret");
+
+// Undo and the external-edit watcher: the button must exist and be wired, the
+// poll must compare hashes rather than rewrite anything on its own.
+const undoGaps = [];
+{
+  if (!/id="btnUndo"/.test(html)) undoGaps.push("no #btnUndo in the markup");
+  if (!/function doUndo/.test(js)) undoGaps.push("no doUndo — the button does nothing");
+  if (!/syncUndoButton/.test(js)) undoGaps.push("nothing syncs the undo button state");
+  if (!/"\/api\/undo"/.test(js)) undoGaps.push('the ui never calls "/api/undo"');
+  if (!/pollExternalChanges/.test(js)) undoGaps.push("no external-change poll");
+  if (!/setInterval\(pollExternalChanges/.test(js)) undoGaps.push("the poll is never scheduled");
+  if (!/id="extChange"/.test(html)) undoGaps.push("no #extChange banner in the markup");
+  // The poll must never write: its job is to compare hashes and warn.
+  const poll = js.slice(js.indexOf("function pollExternalChanges"), js.indexOf("function isFormDirty"));
+  if (/\/api\/(apply|autofix-apply|refresh-models|set-default-model|remove-provider|rename-provider|restore|undo)/.test(poll)) {
+    undoGaps.push("the poll calls a mutating route — it must only read");
+  }
+  if (!/document\.hidden/.test(poll)) undoGaps.push("the poll runs in hidden tabs too");
+}
+console.log(undoGaps.length ? `UNDO/WATCHER GAPS: ${undoGaps.join("; ")}` : "undo and the external-edit watcher are wired");
+
 const failed = missingIds.length + missingClasses.length + badClick.length + leaks.length +
   unreachable.length + phantom.length + guards.length + lies.length +
   typeGaps.length + fieldGaps.length + unstyled.length + wizGaps.length +
   (ruleGap ? 1 : 0) + presetGaps.length + rankGaps.length + layoutGaps.length + costGaps.length +
-  freeGaps.length + probeGaps.length;
+  freeGaps.length + probeGaps.length + singleGaps.length + maskGaps.length + undoGaps.length;
 console.log(`\n${failed ? "FAIL" : "OK"} — ${failed} issue(s)`);
 if (failed) process.exitCode = 1;

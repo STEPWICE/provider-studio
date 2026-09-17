@@ -1,13 +1,15 @@
 import http from "node:http";
 import path from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { exec } from "node:child_process";
 import {
   readConfig, upsertProviderAsDefault, opencodeSummary, setDefaultModel,
   planProviderChange, planProviderRemoval, removeProvider, renameProvider,
-  listOpencodeConfigs, writeConfigText,
+  listOpencodeConfigs, writeConfigText, commitPlan,
 } from "./src/opencode.mjs";
 import { buildPreview } from "./src/diff.mjs";
+import { applyChangesVerified } from "./src/jsonc-edit.mjs";
+import { buildAutoFixChanges, planRefresh, runSelfCheck } from "./src/doctor.mjs";
 import { buildManifest, buildGuide, TARGETS } from "./src/targets.mjs";
 import { FORMATS, slugify, decodeApiKey, detectApiFormat, isCustomProviderBlock, looksLikePackage } from "./src/formats.mjs";
 import { PRESETS } from "./src/presets.mjs";
@@ -77,6 +79,53 @@ function saveStore(list) {
 // Import doesn't create a near-duplicate entry for the same provider.
 function providerKeyOf(p) {
   return slugify(p && p.name);
+}
+
+// ---------- undo (single-level rollback of the last write) ----------
+// Every successful config mutation records how to revert itself: the snapshot
+// taken immediately before the write. The record survives restarts (it lives
+// in the data dir next to backups), but it is deliberately single-level — a
+// history UI would suggest safety this file-level rollback cannot promise
+// once external edits land in between.
+const LAST_WRITE_FILE = () => path.join(dataDir(), "last-write.json");
+
+function readUndo() {
+  try {
+    const v = JSON.parse(readFileSync(LAST_WRITE_FILE(), "utf8"));
+    if (!v || typeof v !== "object") return null;
+    if (typeof v.configPath !== "string" || !v.configPath) return null;
+    if (typeof v.label !== "string") return null;
+    return v;
+  } catch { return null; }
+}
+
+function clearUndo() {
+  try { unlinkSync(LAST_WRITE_FILE()); } catch { /* already gone */ }
+}
+
+// What the UI may offer to revert. Scoped to the file currently being viewed:
+// an undo entry for another config would revert the wrong file.
+function currentUndo(configPath) {
+  const u = readUndo();
+  if (!u || u.configPath !== configPath) return null;
+  return { label: u.label, time: u.time || 0 };
+}
+
+// Remembers how to revert the write that just landed. preFile is the snapshot
+// taken immediately before the write (null when the file was created from
+// scratch); afterHash lets an undo-of-creation refuse when the file has since
+// moved on. Never throws: undo is a convenience, and a write must not fail
+// because the convenience bookkeeping did.
+function recordUndo(configPath, preFile, label, afterHash = "") {
+  try {
+    ensureDir(dataDir());
+    writeFileAtomic(LAST_WRITE_FILE(), JSON.stringify({
+      configPath,
+      file: preFile ? path.basename(String(preFile)) : null,
+      label, afterHash: afterHash || "",
+      created: !preFile, time: Date.now(),
+    }));
+  } catch { /* ignore */ }
 }
 
 /**
@@ -214,6 +263,7 @@ const server = http.createServer(async (req, res) => {
         presets: PRESETS,
         port: PORT_ACTIVE,
         backups: listBackups(),
+        undo: currentUndo(cfg.path),
         opencode: {
           path: cfg.path,
           exists: !!cfg.config,
@@ -285,6 +335,10 @@ const server = http.createServer(async (req, res) => {
           };
         }
       }
+      const oc = results.opencode;
+      if (oc && oc.ok) {
+        recordUndo(oc.path || "", backupFile, `Применение провайдера «${provider.name || ""}»`, oc.hash || "");
+      }
       return json(res, 200, {
         ok: true,
         results,
@@ -344,6 +398,7 @@ const server = http.createServer(async (req, res) => {
         backup: (p) => backupConfig(p, "before-remove"),
       });
       if (!r.ok) return json(res, r.conflict ? 409 : 400, r);
+      recordUndo(r.configPath || "", r.backupFile, `Удаление провайдера «${r.providerKey || ""}»`, r.hash || "");
       // Keep our store in step so the UI does not show a provider that is gone.
       const store = loadStore().filter((p) => providerKeyOf(p) !== r.providerKey);
       saveStore(store);
@@ -361,6 +416,7 @@ const server = http.createServer(async (req, res) => {
         backup: (p) => backupConfig(p, "before-default-model"),
       });
       if (!r.ok) return json(res, r.conflict ? 409 : 400, r);
+      recordUndo(r.configPath || "", r.backupFile, `Модель по умолчанию: ${r.modelId || ""}`, r.hash || "");
       return json(res, 200, { ...r, backups: listBackups() });
     }
 
@@ -372,6 +428,7 @@ const server = http.createServer(async (req, res) => {
         backup: (p) => backupConfig(p, "before-rename"),
       });
       if (!r.ok) return json(res, r.conflict ? 409 : 400, r);
+      recordUndo(r.configPath || "", r.backupFile, `Переименование: ${r.previousKey || ""} → ${r.providerKey || ""}`, r.hash || "");
       return json(res, 200, { ...r, backups: listBackups() });
     }
 
@@ -585,6 +642,159 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // Автоисправление: что именно будет поправлено — сначала diff, потом запись.
+    // Ничего не пишется без подтверждения: preview только считает, apply пишет.
+    if (url.pathname === "/api/autofix-preview" && req.method === "POST") {
+      const body = await readBody(req);
+      const cfg = readConfig(body.configPath);
+      if (!cfg.config) {
+        return json(res, 400, { ok: false, error: "opencode config не разобран: " + (cfg.error || "неизвестная ошибка"), path: cfg.path });
+      }
+      const { changes, fixes, skipped } = buildAutoFixChanges(cfg.config);
+      if (!changes.length) {
+        return json(res, 200, {
+          ok: true, path: cfg.path, fixes, skipped, hash: cfg.hash || "",
+          diff: buildPreview(cfg.raw, cfg.raw), remaining: validateConfig(cfg.config),
+        });
+      }
+      const applied = applyChangesVerified(cfg.raw, changes);
+      if (!applied.ok) return json(res, 400, { ok: false, error: applied.error, path: cfg.path });
+      return json(res, 200, {
+        ok: true, path: cfg.path, fixes, skipped, hash: cfg.hash || "",
+        diff: buildPreview(cfg.raw, applied.text), remaining: validateConfig(applied.value),
+      });
+    }
+
+    if (url.pathname === "/api/autofix-apply" && req.method === "POST") {
+      const body = await readBody(req);
+      const cfg = readConfig(body.configPath);
+      if (!cfg.config) {
+        return json(res, 400, { ok: false, error: "opencode config не разобран: " + (cfg.error || "неизвестная ошибка"), path: cfg.path });
+      }
+      const { changes, fixes, skipped } = buildAutoFixChanges(cfg.config);
+      if (!changes.length) {
+        return json(res, 200, { ok: true, noop: true, path: cfg.path, fixed: fixes, skipped, hash: cfg.hash || "", backups: listBackups() });
+      }
+      const applied = applyChangesVerified(cfg.raw, changes);
+      if (!applied.ok) return json(res, 400, { ok: false, error: applied.error, path: cfg.path });
+      const remaining = validateConfig(applied.value);
+      const committed = commitPlan(
+        { ok: true, configPath: cfg.path, before: cfg.raw, after: applied.text, changes, hash: cfg.hash || "" },
+        { expectedHash: body.hash, backup: (p) => backupConfig(p, "before-autofix") },
+      );
+      if (!committed.ok) return json(res, committed.conflict ? 409 : 400, committed);
+      recordUndo(committed.configPath || "", committed.backupFile, "Автоисправление конфига", committed.hash || "");
+      return json(res, 200, {
+        ok: true, path: committed.configPath, fixed: fixes, skipped, remaining,
+        hash: committed.hash || "", backupFile: committed.backupFile || null,
+        backups: listBackups(), diff: buildPreview(cfg.raw, applied.text),
+      });
+    }
+
+    // Обновление моделей: сверяет конфиг с живым /models каждого провайдера.
+    // По умолчанию только план (apply:false). С apply:true добавляет недостающие
+    // модели, а с prune:true ещё и удаляет те, что сервер больше не отдаёт.
+    // Существующие записи не перезаписываются — ручные правки сохраняются.
+    if (url.pathname === "/api/refresh-models" && req.method === "POST") {
+      const body = await readBody(req);
+      const cfg = readConfig(body.configPath);
+      if (!cfg.config) {
+        return json(res, 400, { ok: false, error: "opencode config не разобран: " + (cfg.error || "неизвестная ошибка"), path: cfg.path });
+      }
+      const keys = Array.isArray(body.providers) && body.providers.length ? body.providers : null;
+      const prune = body.prune === true;
+      const plan = await planRefresh(cfg.config, { providerKeys: keys, prune });
+      if (!body.apply) {
+        return json(res, 200, {
+          ok: true, path: cfg.path, hash: cfg.hash || "",
+          providers: plan.map(({ pending, ...rest }) => ({
+            ...rest, addedCount: (rest.added || []).length,
+            removedCount: (rest.removed || []).length,
+            pending: (pending || []).map((x) => x.id),
+          })),
+        });
+      }
+      const changes = [];
+      for (const p of plan) {
+        if (!p.ok) continue;
+        for (const item of p.pending || []) {
+          changes.push({ op: "merge", path: ["provider", p.key, "models", item.id], value: item.entry });
+        }
+        if (prune) {
+          for (const id of p.removed || []) {
+            changes.push({ op: "delete", path: ["provider", p.key, "models", id] });
+          }
+        }
+      }
+      if (!changes.length) {
+        return json(res, 200, {
+          ok: true, noop: true, path: cfg.path, hash: cfg.hash || "",
+          providers: plan, backups: listBackups(),
+        });
+      }
+      const applied = applyChangesVerified(cfg.raw, changes);
+      if (!applied.ok) return json(res, 400, { ok: false, error: applied.error, path: cfg.path });
+      const committed = commitPlan(
+        { ok: true, configPath: cfg.path, before: cfg.raw, after: applied.text, changes, hash: cfg.hash || "" },
+        { expectedHash: body.hash, backup: (p) => backupConfig(p, "before-refresh-models") },
+      );
+      if (!committed.ok) return json(res, committed.conflict ? 409 : 400, committed);
+      recordUndo(committed.configPath || "", committed.backupFile, "Обновление моделей", committed.hash || "");
+      return json(res, 200, {
+        ok: true, path: committed.configPath, providers: plan,
+        hash: committed.hash || "", backupFile: committed.backupFile || null,
+        backups: listBackups(), diff: buildPreview(cfg.raw, applied.text),
+      });
+    }
+
+    // Самодиагностика инструмента: Node, каталоги, конфиг, прокси, каталог.
+    if (url.pathname === "/api/selfcheck" && req.method === "GET") {
+      const result = await runSelfCheck({ configPath: url.searchParams.get("configPath") || "" });
+      return json(res, 200, { ok: true, ...result, backups: listBackups() });
+    }
+
+    // Reverts the last write recorded by recordUndo. The current file is
+    // snapshotted first ("before-undo"), so even a mistaken undo is recoverable
+    // from the backup list. Single-level by design: after reverting there is
+    // nothing left to revert to.
+    if (url.pathname === "/api/undo" && req.method === "POST") {
+      const body = await readBody(req);
+      const cfg = readConfig(body.configPath);
+      const entry = readUndo();
+      if (!entry || entry.configPath !== cfg.path) {
+        return json(res, 200, { ok: false, error: "Откатывать нечего" });
+      }
+      if (entry.created) {
+        // Undoing a creation removes the file — but only if it is still exactly
+        // what the write produced. Otherwise the file holds someone else's
+        // edits and deleting it would destroy them.
+        if (!cfg.config || (cfg.hash || "") !== (entry.afterHash || "")) {
+          clearUndo();
+          return json(res, 200, { ok: false, error: "Файл изменился после записи — откат небезопасен, восстанови из бэкапа вручную" });
+        }
+        backupConfig(cfg.path, "before-undo");
+        try { unlinkSync(cfg.path); } catch (e) {
+          return json(res, 200, { ok: false, error: "Не удалось удалить файл: " + (e?.message || e) });
+        }
+        clearUndo();
+        return json(res, 200, { ok: true, label: entry.label, removed: true, hash: "", backups: listBackups(), undo: null });
+      }
+      const snap = restoreBackup(entry.file);
+      if (!snap.ok) {
+        clearUndo();
+        return json(res, 200, { ok: false, error: "Снапшот потерян (" + snap.error + ") — откат невозможен" });
+      }
+      let preFile = null;
+      if (cfg.config) preFile = backupConfig(cfg.path, "before-undo");
+      writeConfigText(snap.raw, cfg.path);
+      clearUndo();
+      const after = readConfig(cfg.path);
+      return json(res, 200, {
+        ok: true, label: entry.label, file: snap.file, preFile,
+        hash: after.hash || "", backups: listBackups(), undo: null,
+      });
+    }
+
     if (url.pathname === "/api/backup" && req.method === "POST") {
       const cfg = readConfig();
       const file = cfg.config ? backupConfig(cfg.path, "manual") : null;
@@ -601,8 +811,9 @@ const server = http.createServer(async (req, res) => {
       if (cfg.config) preFile = backupConfig(cfg.path, "before-restore");
       // Restores the exact bytes of the snapshot. Re-serialising the parsed
       // object instead would silently strip the comments the backup preserved.
-      writeConfigText(r.raw, cfg.path);
-      return json(res, 200, { ok: true, file: r.file, preFile, backups: listBackups() });
+      const written = writeConfigText(r.raw, cfg.path);
+      recordUndo(cfg.path, preFile, "Восстановление из бэкапа", (written && written.hash) || "");
+      return json(res, 200, { ok: true, file: r.file, preFile, hash: (written && written.hash) || "", backups: listBackups() });
     }
 
     if (url.pathname === "/api/import" && req.method === "POST") {
