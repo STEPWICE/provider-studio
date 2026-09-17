@@ -250,13 +250,9 @@ export async function proxyFetch(target, { headers = {}, timeoutMs = 10000, prox
 
     const mod = isHttps ? https : http;
     let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      req.destroy();
-      if (socket) socket.destroy();
-      reject(Object.assign(new Error("таймаут"), { name: "TimeoutError" }));
-    }, timeoutMs);
+    // `timer` is declared here but armed only after `req` exists: the callback
+    // destroys the request, and firing it earlier hit the TDZ on `req`.
+    let timer = null;
 
     const req = mod.request(options, (res) => {
       let body = "";
@@ -298,6 +294,15 @@ export async function proxyFetch(target, { headers = {}, timeoutMs = 10000, prox
       if (socket) socket.destroy();
       reject(e);
     });
+
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      req.destroy();
+      if (socket) socket.destroy();
+      reject(Object.assign(new Error("таймаут"), { name: "TimeoutError" }));
+    }, timeoutMs);
+
     if (body != null) req.write(body);
     req.end();
   });
