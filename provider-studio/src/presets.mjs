@@ -202,7 +202,6 @@ export const PRESETS = [
   },
   {
     // Base URL — из живого рабочего конфига (проверен в деле, а не из доков).
-    // Списка :free-моделей не шипуем: он меняется, а обнаружение их покажет.
     id: "xkiro",
     label: "Xkiro",
     hint: "Шлюз с моделями Qwen/DeepSeek/Mistral, есть бесплатные с суффиксом :free.",
@@ -211,6 +210,38 @@ export const PRESETS = [
     envVarName: "XKIRO_API_KEY",
     needsKey: true,
     discover: true,
+    // Seed — запасной список на случай, если обнаружение не сработает.
+    // Снят с живого /v1/models 2026-09-17 (109 моделей, :free — 26 штук):
+    // только id, без характеристик — их подтянет обнаружение или каталог.
+    // Протухает: сверяй с живым списком, суффикс :free — маркер бесплатности.
+    models: [
+      { id: "qwen/qwen3.7-flash:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.6-max-preview:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.5-plus:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3-max:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.5-flash:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.8-max:free", free: true, freeSource: "name" },
+      { id: "minimax/minimax-m3:free", free: true, freeSource: "name" },
+      { id: "minimax/minimax-m2.7:free", free: true, freeSource: "name" },
+      { id: "minimax/minimax-m2.5-highspeed:free", free: true, freeSource: "name" },
+      { id: "minimax/minimax-m2:free", free: true, freeSource: "name" },
+      { id: "minimax/minimax-m2.7-highspeed:free", free: true, freeSource: "name" },
+      { id: "minimax/minimax-m2.5:free", free: true, freeSource: "name" },
+      { id: "minimax/minimax-m2.1:free", free: true, freeSource: "name" },
+      { id: "minimax/minimax-m2.1-highspeed:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.7-plus:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.6-plus:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.5-omni-plus:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.7-max:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.5-397b-a17b:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.5-omni-flash:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.6-27b:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen-plus-2025-07-28:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3-vl-plus:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3-omni-flash:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3.6-35b-a3b:free", free: true, freeSource: "name" },
+      { id: "qwen/qwen3-coder-plus:free", free: true, freeSource: "name" },
+    ],
   },
   {
     // Локальный роутер: адрес и поведение — из живого конфига. Ключ не нужен,

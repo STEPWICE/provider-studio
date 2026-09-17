@@ -10,6 +10,7 @@ import {
 import { buildPreview } from "./src/diff.mjs";
 import { applyChangesVerified } from "./src/jsonc-edit.mjs";
 import { buildAutoFixChanges, planRefresh, runSelfCheck, isFreeEntry, buildRefreshChanges } from "./src/doctor.mjs";
+import { smartAudit } from "./src/smart-audit.mjs";
 import { loadDigest } from "./src/digest.mjs";
 import { buildManifest, buildGuide, TARGETS } from "./src/targets.mjs";
 import { FORMATS, slugify, decodeApiKey, detectApiFormat, isCustomProviderBlock, looksLikePackage } from "./src/formats.mjs";
@@ -644,10 +645,13 @@ const server = http.createServer(async (req, res) => {
       // Naming the proxy once, at the top level, saves the user from guessing
       // whether the probes went out directly or through a tunnel.
       const proxyUsed = describeProxy(proxyForUrl("https://example.com"));
+      // Умный аудит — чистая статика, считается миллисекунды, поэтому едет
+      // в том же ответе: свеж при каждой диагностике без отдельного запроса.
       return json(res, 200, {
         ok: true, path: cfg.path, issues, providers,
         model: cfg.config?.model || null, backups: listBackups(),
         proxy: proxyUsed || null,
+        smart: smartAudit(cfg.config),
       });
     }
 

@@ -565,10 +565,25 @@ const deleteGaps = [];
 }
 console.log(deleteGaps.length ? `DELETE GAPS: ${deleteGaps.join("; ")}` : "delete removes the provider everywhere");
 
+// The smart audit rides along inside /api/diagnostics: a score, cross-provider
+// findings, and a one-click fix where the fix is unambiguous.
+const smartGaps = [];
+{
+  if (!/r\.smart/.test(js)) smartGaps.push("the ui never reads the smart audit");
+  if (!/data-smart-model/.test(js)) smartGaps.push("no one-click fix for the smart audit findings");
+  const wireAt = js.indexOf('querySelectorAll("[data-smart-model]")');
+  const wire = wireAt < 0 ? "" : js.slice(wireAt, wireAt + 2000);
+  if (!/set-default-model/.test(wire) || !/refreshConfigState/.test(wire)) {
+    smartGaps.push("the smart fix does not repoint the default model through the guarded write");
+  }
+}
+console.log(smartGaps.length ? `SMART AUDIT GAPS: ${smartGaps.join("; ")}` : "the smart audit renders with its fix");
+
 const failed = missingIds.length + missingClasses.length + badClick.length + leaks.length +
   unreachable.length + phantom.length + guards.length + lies.length +
   typeGaps.length + fieldGaps.length + unstyled.length + wizGaps.length +
   (ruleGap ? 1 : 0) + presetGaps.length + rankGaps.length + layoutGaps.length + costGaps.length +
-  freeGaps.length + probeGaps.length + singleGaps.length + maskGaps.length + undoGaps.length + deleteGaps.length;
+  freeGaps.length + probeGaps.length + singleGaps.length + maskGaps.length + undoGaps.length + deleteGaps.length +
+  smartGaps.length;
 console.log(`\n${failed ? "FAIL" : "OK"} — ${failed} issue(s)`);
 if (failed) process.exitCode = 1;

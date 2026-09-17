@@ -935,6 +935,9 @@ try {
     check("diagnostics separates reachability from auth",
       (diag.providers || []).every((p) => "reach" in p && "fault" in p),
       JSON.stringify((diag.providers || []).map((p) => [p.key, p.reach, p.fault])));
+    check("diagnostics carries the smart audit",
+      diag.smart && typeof diag.smart.score === "number" && Array.isArray(diag.smart.findings),
+      JSON.stringify(diag.smart || null).slice(0, 160));
 
     // ---- undo reverts the last write, then has nothing left ----
     // The fixture at this point: dead/alive/packaged providers, default on

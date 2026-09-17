@@ -2212,6 +2212,22 @@ async function diagnose() {
 
   if (r.proxy) html += `<div class="ok-line" style="color:var(--muted)">прокси: ${esc(r.proxy)}</div>`;
 
+  // Умный аудит приехал в том же ответе: сквозные выводы по конфигу целиком
+  // (дубли id, где дешевле дефолт, неполные характеристики), а не по блокам.
+  const smart = r.smart && typeof r.smart === "object" ? r.smart : null;
+  if (smart) {
+    const sfind = asArray(smart.findings);
+    html += `<div class="diag-sect">Умный аудит · ${smart.score ?? "—"}/100</div>`;
+    if (!sfind.length) html += `<div class="ok-line">\u2713 Пересечений и переплат не видно</div>`;
+    for (const f of sfind) {
+      html += `<div class="diag-row"><span class="diag-name">${f.severity === "warn" ? "\u26a0" : "\u2139"}</span>`
+        + `<span class="diag-meta">${esc(f.message || "")}</span></div>`;
+      if (f.fix && f.fix.kind === "set-default" && f.fix.model) {
+        html += `<div class="diag-fix"><button class="btn btn-mini" data-smart-model="${esc(f.fix.model)}" type="button">Сделать основным: ${esc(f.fix.model)}</button></div>`;
+      }
+    }
+  }
+
   html += `<div class="diag-sect">Провайдеры</div>`;
   if (!providers.length) html += `<div class="ok-line" style="color:var(--muted)">\u2014 нет провайдеров \u2014</div>`;
   for (const p of providers) {
@@ -2285,6 +2301,31 @@ async function diagnose() {
   // the list does not show.
   const pruneBox = $("#diagPrune");
   if (pruneBox) pruneBox.onchange = () => { if (state.refreshPlan) renderRefreshPlan(); };
+
+  el.querySelectorAll("[data-smart-model]").forEach((b) => {
+    b.onclick = async () => {
+      const model = b.dataset.smartModel;
+      if (!model) return;
+      setBtnLoading(b, true);
+      try {
+        const resp = await apiSafe("/api/set-default-model", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model, configPath: state.configPath, hash: state.configHash }),
+        });
+        if (resp && resp.conflict) await refreshConfigState();
+        if (resp && resp.ok) {
+          toast(`Модель по умолчанию: ${model}`, "ok");
+          await refreshConfigState();
+          refreshUndo();
+          await diagnose();
+        } else {
+          toast((resp && resp.error) || "Не удалось сменить модель", "err");
+        }
+      } finally {
+        setBtnLoading(b, false);
+      }
+    };
+  });
 
   const pick = $("#diagModelPick");
   const fixBtn = $("#diagSetDefault");
