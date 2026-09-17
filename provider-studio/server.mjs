@@ -9,7 +9,7 @@ import {
 } from "./src/opencode.mjs";
 import { buildPreview } from "./src/diff.mjs";
 import { applyChangesVerified } from "./src/jsonc-edit.mjs";
-import { buildAutoFixChanges, planRefresh, runSelfCheck, isFreeEntry } from "./src/doctor.mjs";
+import { buildAutoFixChanges, planRefresh, runSelfCheck, isFreeEntry, buildRefreshChanges } from "./src/doctor.mjs";
 import { loadDigest } from "./src/digest.mjs";
 import { buildManifest, buildGuide, TARGETS } from "./src/targets.mjs";
 import { FORMATS, slugify, decodeApiKey, detectApiFormat, isCustomProviderBlock, looksLikePackage } from "./src/formats.mjs";
@@ -382,7 +382,12 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/preview-remove" && req.method === "POST") {
       const body = await readBody(req);
       const plan = planProviderRemoval(body.key || body.name, { configPath: body.configPath });
-      if (!plan.ok) return json(res, 400, { ok: false, error: plan.error, path: plan.configPath });
+      if (!plan.ok) {
+        return json(res, 400, {
+          ok: false, error: plan.error, path: plan.configPath,
+          notFound: plan.notFound === true,
+        });
+      }
       return json(res, 200, {
         ok: true,
         path: plan.configPath,
@@ -729,20 +734,7 @@ const server = http.createServer(async (req, res) => {
       }
       // Белый список моделей из превью: так «только бесплатные» применяется
       // ровно к тому, что пользователь видел, а не к свежему опросу.
-      const only = Array.isArray(body.models) ? new Set(body.models.map((x) => String(x))) : null;
-      const changes = [];
-      for (const p of plan) {
-        if (!p.ok) continue;
-        for (const item of p.pending || []) {
-          if (only && !only.has(item.id)) continue;
-          changes.push({ op: "merge", path: ["provider", p.key, "models", item.id], value: item.entry });
-        }
-        if (prune) {
-          for (const id of p.removed || []) {
-            changes.push({ op: "delete", path: ["provider", p.key, "models", id] });
-          }
-        }
-      }
+      const changes = buildRefreshChanges(plan, { only: body.models ?? null, prune });
       if (!changes.length) {
         return json(res, 200, {
           ok: true, noop: true, path: cfg.path, hash: cfg.hash || "",

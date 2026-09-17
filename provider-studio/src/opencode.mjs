@@ -170,7 +170,9 @@ export function planProviderRemoval(key, opts = {}) {
   if (loaded.created) return { ok: false, error: "Конфиг не найден", configPath: loaded.path };
 
   const built = buildRemovalChanges(key, loaded.config);
-  if (!built.ok) return { ok: false, error: built.error, configPath: loaded.path };
+  if (!built.ok) {
+    return { ok: false, error: built.error, configPath: loaded.path, notFound: built.notFound === true };
+  }
 
   const applied = applyChangesVerified(loaded.text, built.changes);
   if (!applied.ok) return { ok: false, error: applied.error, configPath: loaded.path };

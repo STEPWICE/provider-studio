@@ -549,10 +549,26 @@ const undoGaps = [];
 }
 console.log(undoGaps.length ? `UNDO/WATCHER GAPS: ${undoGaps.join("; ")}` : "undo and the external-edit watcher are wired");
 
+// Deleting a provider must delete it for real: from the opencode config and
+// from the list. A list-only delete left the provider alive in opencode,
+// which is the exact confusion this check pins down.
+const deleteGaps = [];
+{
+  if (/class="wipe"/.test(js)) deleteGaps.push("a split list-only/config-only delete still exists");
+  if (!/function deleteEverywhere/.test(js)) deleteGaps.push("no deleteEverywhere - rows cannot fully delete");
+  const start = js.indexOf("async function deleteEverywhere");
+  const del = start < 0 ? "" : js.slice(start, start + 3000);
+  if (!/preview-remove/.test(del)) deleteGaps.push("full delete skips the diff preview");
+  if (!/remove-provider/.test(del)) deleteGaps.push("full delete never removes from the config");
+  if (!/"\/api\/delete"/.test(del)) deleteGaps.push("store-only rows have no delete path");
+  if (!/notFound/.test(del)) deleteGaps.push("the config/store split is not distinguished");
+}
+console.log(deleteGaps.length ? `DELETE GAPS: ${deleteGaps.join("; ")}` : "delete removes the provider everywhere");
+
 const failed = missingIds.length + missingClasses.length + badClick.length + leaks.length +
   unreachable.length + phantom.length + guards.length + lies.length +
   typeGaps.length + fieldGaps.length + unstyled.length + wizGaps.length +
   (ruleGap ? 1 : 0) + presetGaps.length + rankGaps.length + layoutGaps.length + costGaps.length +
-  freeGaps.length + probeGaps.length + singleGaps.length + maskGaps.length + undoGaps.length;
+  freeGaps.length + probeGaps.length + singleGaps.length + maskGaps.length + undoGaps.length + deleteGaps.length;
 console.log(`\n${failed ? "FAIL" : "OK"} — ${failed} issue(s)`);
 if (failed) process.exitCode = 1;

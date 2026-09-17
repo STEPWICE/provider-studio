@@ -261,6 +261,11 @@ try {
   check("removal keeps comments", readConfigText().includes("must survive every edit"));
   const rmGhost = await post("/api/remove-provider", { key: "does-not-exist" });
   check("removing a missing provider is refused", rmGhost.status === 400, rmGhost.status);
+  const rmGhostBody = await rmGhost.json();
+  check("the refusal is flagged notFound", rmGhostBody.notFound === true, JSON.stringify(rmGhostBody).slice(0, 160));
+  const rmPrevGhost = await (await post("/api/preview-remove", { key: "does-not-exist" })).json();
+  check("the removal preview flags notFound too",
+    rmPrevGhost.ok === false && rmPrevGhost.notFound === true, JSON.stringify(rmPrevGhost).slice(0, 160));
 
   // ---- non-ASCII bodies must survive the request decode ----
   const uni = await (await post("/api/preview", {
@@ -984,8 +989,9 @@ try {
       check("the seed model shows up as removed",
         (rp?.removed || []).includes("seed-model"), JSON.stringify(rp?.removed));
 
+      // Object form: ids apply inside their own provider only.
       const onlyFree = await (await post("/api/refresh-models", {
-        providers: ["refreshable"], apply: true, models: ["stub-free"], hash: prev.hash,
+        providers: ["refreshable"], apply: true, models: { refreshable: ["stub-free"] }, hash: prev.hash,
       })).json();
       check("whitelisted apply succeeds", onlyFree.ok === true, JSON.stringify(onlyFree).slice(0, 200));
       const cfgAfterFree = readConfigFile();

@@ -464,6 +464,43 @@ export function planModelSync(existingModels, discovered, { prune = false } = {}
 }
 
 /**
+ * Строит правки записи по плану обновления.
+ *
+ * only — белый список из превью («только бесплатные» пишется ровно тем, что
+ * пользователь видел, а не свежим опросом). Две формы:
+ *   - string[] — legacy: id действуют для любого провайдера;
+ *   - { [providerKey]: string[] } — id действуют только внутри своего
+ *     провайдера. Без этого одинаковый id у двух шлюзов записывался в оба.
+ */
+export function buildRefreshChanges(plan, { only = null, prune = false } = {}) {
+  const asSet = (v) => new Set((Array.isArray(v) ? v : []).map((x) => String(x)));
+  const NOTHING = new Set();
+  let global = null;
+  const per = new Map();
+  if (Array.isArray(only)) global = asSet(only);
+  else if (only && typeof only === "object") {
+    for (const [k, v] of Object.entries(only)) per.set(k, asSet(v));
+  }
+  const changes = [];
+  for (const p of Array.isArray(plan) ? plan : []) {
+    if (!p || !p.ok) continue;
+    // A map constrains everything it does not mention: a provider absent from
+    // it gets nothing, otherwise a partial map would over-apply elsewhere.
+    const allow = global || (per.size ? per.get(p.key) || NOTHING : null);
+    for (const item of p.pending || []) {
+      if (allow && !allow.has(item.id)) continue;
+      changes.push({ op: "merge", path: ["provider", p.key, "models", item.id], value: item.entry });
+    }
+    if (prune) {
+      for (const id of p.removed || []) {
+        changes.push({ op: "delete", path: ["provider", p.key, "models", id] });
+      }
+    }
+  }
+  return changes;
+}
+
+/**
  * Опрашивает живые эндпоинты и строит план обновления.
  *
  * fetchFn подменяется в тестах стабом, чтобы не ходить в сеть.

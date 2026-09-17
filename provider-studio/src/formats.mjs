@@ -397,7 +397,9 @@ export function buildRemovalChanges(key, existingConfig) {
   const providerKey = slugify(key || "");
   if (!providerKey) return { ok: false, error: "Не указан провайдер" };
   if (!existingConfig?.provider?.[providerKey]) {
-    return { ok: false, error: `Провайдер «${providerKey}» не найден` };
+    // notFound travels to the UI so "delete everywhere" can fall back to
+    // removing a store-only row instead of string-matching the message.
+    return { ok: false, notFound: true, error: `Провайдер «${providerKey}» не найден` };
   }
   const changes = [{ op: "delete", path: ["provider", providerKey] }];
   const orphaned = [];

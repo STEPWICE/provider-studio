@@ -324,6 +324,30 @@ function applyOk(configObj, label) {
   check("параллельно, а не последовательно", dt < 130, `${dt}ms`);
 }
 
+// ------------------------------------------------------- whitelist по провайдерам
+{
+  const plan = [
+    { key: "a", ok: true, pending: [{ id: "x", entry: { name: "x" } }, { id: "y", entry: { name: "y" } }], removed: ["old-a"] },
+    { key: "b", ok: true, pending: [{ id: "x", entry: { name: "x" } }], removed: [] },
+    { key: "dead", ok: false, message: "down" },
+  ];
+  const per = D.buildRefreshChanges(plan, { only: { a: ["x"] }, prune: true });
+  const paths = per.map((c) => c.path.join("."));
+  check("map пишет свой id только своему провайдеру",
+    paths.includes("provider.a.models.x")
+    && !paths.includes("provider.a.models.y")
+    && !paths.includes("provider.b.models.x"),
+    JSON.stringify(paths));
+  check("prune идёт следом", paths.includes("provider.a.models.old-a"), JSON.stringify(paths));
+  const legacy = D.buildRefreshChanges(plan, { only: ["x"], prune: false });
+  const lpaths = legacy.map((c) => c.path.join("."));
+  check("legacy-список действует глобально",
+    lpaths.includes("provider.a.models.x") && lpaths.includes("provider.b.models.x"),
+    JSON.stringify(lpaths));
+  const all = D.buildRefreshChanges(plan, { only: null, prune: false });
+  check("без whitelist пишется всё", all.length === 3, String(all.length));
+}
+
 // ------------------------------------------------------- битый конфиг
 {
   const broken = D.buildAutoFixChanges(null);

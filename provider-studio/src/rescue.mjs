@@ -18,7 +18,7 @@ import {
   backupDir, dataDir, ensureDir, writeFileAtomic, isInside, IS_WINDOWS,
 } from "./paths.mjs";
 import { parseJsonc } from "./jsonc-edit.mjs";
-import { proxyForUrl, proxyFetch, describeProxy } from "./proxy.mjs";
+import { proxyForUrl, proxyFetch, describeProxy, isLocalTarget } from "./proxy.mjs";
 import {
   looksLikePackage, isCustomProviderBlock, decodeApiKey, isPlaintextKey,
   suggestEnvVarName, MODALITIES, MODEL_STATUSES, PROVIDER_FIELDS, MODEL_FIELDS,
@@ -259,6 +259,7 @@ export function validateConfig(config) {
     validateApiKey(key, p, issues);
     validateHeaders(key, p, issues);
     validateOptions(key, p, issues);
+    warnMissingCredentials(key, p, isCustom, issues);
 
     const models = p.models && typeof p.models === "object" && !Array.isArray(p.models)
       ? Object.entries(p.models) : [];
@@ -384,6 +385,26 @@ function validateApiKey(key, p, issues) {
       `Провайдер «${key}»: «${apiKey}» — некорректная ссылка на переменную окружения`,
       { provider: key }));
   }
+}
+
+// A custom block with its own address but no credential of any kind: opencode
+// sends an empty bearer token and the provider answers 401. Only a warning —
+// some gateways serve free models anonymously, so "no key" is not always
+// broken. Local targets are exempt entirely: a LAN gateway routinely needs no
+// key, and warning about ollama-style setups would be pure noise.
+function warnMissingCredentials(key, p, isCustom, issues) {
+  if (!isCustom) return;
+  const base = typeof p.options?.baseURL === "string" ? p.options.baseURL.trim() : "";
+  if (!base) return;
+  const apiKey = typeof p.options?.apiKey === "string" ? p.options.apiKey.trim() : "";
+  if (apiKey) return;
+  if (Array.isArray(p.env) && p.env.length) return;
+  let host = "";
+  try { host = new URL(base).hostname; } catch { return; }
+  if (isLocalTarget(host)) return;
+  issues.push(issue("warn", "no-credentials",
+    `Провайдер «${key}»: не задан ни ключ, ни env — если сервер требует авторизацию, все запросы получат 401`,
+    { provider: key }));
 }
 
 // Anthropic-compatible endpoints authenticate with `x-api-key` plus a version

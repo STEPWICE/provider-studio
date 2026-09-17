@@ -201,6 +201,31 @@ export const PRESETS = [
     },
   },
   {
+    // Base URL — из живого рабочего конфига (проверен в деле, а не из доков).
+    // Списка :free-моделей не шипуем: он меняется, а обнаружение их покажет.
+    id: "xkiro",
+    label: "Xkiro",
+    hint: "Шлюз с моделями Qwen/DeepSeek/Mistral, есть бесплатные с суффиксом :free.",
+    baseURL: "https://api.xkiro.com/v1",
+    apiFormat: "openai-chat",
+    envVarName: "XKIRO_API_KEY",
+    needsKey: true,
+    discover: true,
+  },
+  {
+    // Локальный роутер: адрес и поведение — из живого конфига. Ключ не нужен,
+    // но сам GoRouter должен быть запущен, иначе пробы честно скажут «отклонено».
+    id: "gorouter",
+    label: "GoRouter (локально)",
+    hint: "Локальный роутер. Ключ не нужен, но GoRouter должен быть запущен.",
+    baseURL: "http://localhost:14747/v1",
+    apiFormat: "openai-chat",
+    envVarName: "",
+    needsKey: false,
+    local: true,
+    discover: true,
+  },
+  {
     id: "zai",
     label: "Z.ai (GLM)",
     hint: "Модели GLM, OpenAI-совместимый эндпоинт.",

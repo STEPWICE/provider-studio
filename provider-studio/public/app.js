@@ -479,9 +479,10 @@ function renderProviderList() {
     list.innerHTML = `<div class="empty-models">Ничего не найдено по «${esc(q)}».</div>`;
     return;
   }
-  // Two distinct destructive actions, spelled out: dropping the row from this
-  // tool is not the same as deleting the provider from the opencode config, and
-  // one button labelled "×" gave no way to tell them apart.
+  // One delete button, and it deletes for real: from the opencode config and
+  // from this list. Two buttons ("from config" vs "from the list") confused
+  // the only question that matters — "is the provider gone?" — and the
+  // list-only variant left the provider alive in opencode.
   // The "opencode" badge only tells the user something when some rows lack it.
   // Measured: with every provider imported it took 53px from a 227px row and
   // clipped "GenSparkOSNOVA" to "GenSpar…" while saying nothing at all.
@@ -492,8 +493,7 @@ function renderProviderList() {
       <span class="nm" title="${esc(p.name)}">${esc(p.name)}</span>
       ${p.fromOpenCode && mixed ? `<span class="badge">opencode</span>` : ""}
       <button class="ren" title="Переименовать ключ провайдера в конфиге" aria-label="Переименовать ${esc(p.name)}">\u270e</button>
-      <button class="wipe" title="Удалить провайдера из opencode-конфига" aria-label="Удалить ${esc(p.name)} из конфига">\u2327</button>
-      <button class="del" title="Убрать из списка Provider Studio (конфиг не тронут)" aria-label="Убрать ${esc(p.name)} из списка">\u00d7</button>
+      <button class="del" title="Удалить провайдера полностью: из opencode-конфига и из списка" aria-label="Удалить ${esc(p.name)} полностью">\u00d7</button>
     </div>`).join("");
   list.querySelectorAll(".provider-row").forEach((row) => {
     const open = () => {
@@ -503,15 +503,7 @@ function renderProviderList() {
     row.addEventListener("click", (e) => {
       if (e.target.classList.contains("del")) {
         e.stopPropagation();
-        if (!confirm(`Убрать «${row.dataset.name}» из списка Provider Studio? В opencode-конфиге провайдер останется.`)) return;
-        api("/api/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: row.dataset.name }) })
-          .then((r) => { state.providers = asArray(r.providers); renderProviderList(); })
-          .catch((e) => toast(`Не удалось убрать из списка: ${(e && e.message) || e}`, "err"));
-        return;
-      }
-      if (e.target.classList.contains("wipe")) {
-        e.stopPropagation();
-        removeFromConfig(row.dataset.name);
+        deleteEverywhere(row.dataset.name);
         return;
       }
       if (e.target.classList.contains("ren")) {
@@ -846,26 +838,40 @@ async function renameInConfig(name) {
   toast(`Переименовано: ${from} → ${to}. Перезапусти opencode.`, "ok");
 }
 
-// Removes the provider from the opencode config itself, not just from our list.
-async function removeFromConfig(name) {
+// Deletes the provider for real: from the opencode config and from this list.
+// When the provider is not in the config (a store-only row), it just drops the
+// row — there is nothing else to delete.
+async function deleteEverywhere(name) {
   const key = slugifyName(name);
   const r = await apiSafe("/api/preview-remove", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ key, configPath: state.configPath }),
   });
-  if (!r.ok) return toast(r.error || "Не удалось построить diff удаления", "err");
+  if (!r.ok && !r.notFound) return toast(r.error || "Не удалось построить diff удаления", "err");
+  if (!r.ok && r.notFound) {
+    if (!confirm(`«${name}» нет в opencode-конфиге. Убрать из списка Provider Studio?`)) return;
+    const d = await apiSafe("/api/delete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!d || !d.ok) return toast((d && d.error) || "Не удалось убрать из списка", "err");
+    state.providers = asArray(d.providers);
+    renderProviderList();
+    return;
+  }
   state.configHash = r.hash || "";
 
   const orphaned = asArray(r.orphaned);
   openDiff({
-    title: `Удалить «${key}» из конфига`,
+    title: `Удалить «${key}» полностью`,
     meta: `<div class="diff-path">${esc(r.path || "")}</div>
       <div class="diff-stat"><span class="plus">+${r.diff ? r.diff.added : 0}</span>
       <span class="minus">-${r.diff ? r.diff.removed : 0}</span></div>`,
     diff: r.diff,
     // A dangling default model stops opencode from starting, so say so up front.
-    hint: orphaned.length ? `Будет переназначено: ${orphaned.join(", ")}` : "",
-    confirmLabel: "Удалить из конфига",
+    hint: (orphaned.length ? `Будет переназначено: ${orphaned.join(", ")}. ` : "")
+      + "Уберёт из opencode-конфига и из списка (с бэкапом и откатом).",
+    confirmLabel: "Удалить полностью",
     onConfirm: async () => {
       closeDiff();
       const res = await apiSafe("/api/remove-provider", {
@@ -881,7 +887,7 @@ async function removeFromConfig(name) {
       renderBackups(asArray(res.backups));
       await refreshConfigState();
       refreshUndo();
-      toast(`Провайдер «${key}» удалён. Перезапусти opencode.`, "ok");
+      toast(`Провайдер «${key}» удалён полностью. Перезапусти opencode.`, "ok");
     },
   });
 }
@@ -1409,7 +1415,32 @@ async function applyNow(provider) {
         <h3>${esc(name)}</h3>
         <div class="ok-line">\u2713 Сгенерирован конфиг (формат: ${esc(r.formatLabel || "")})</div>
         <div class="ok-line" style="color:var(--muted)">${esc(r.guide || "").replace(/\n/g, "<br>")}</div>
-        <pre>${esc(JSON.stringify(r.manifest, null, 2))}</pre>`;
+        <pre>${esc(JSON.stringify(r.manifest, null, 2))}</pre>
+        <div class="diag-fix">
+          <button class="btn btn-mini" data-copy-manifest type="button">Копировать manifest</button>
+          <button class="btn btn-mini" data-save-manifest type="button">Скачать manifest.json</button>
+        </div>`;
+      const manifestText = JSON.stringify(r.manifest, null, 2);
+      const copyBtn = card.querySelector("[data-copy-manifest]");
+      if (copyBtn) copyBtn.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(manifestText);
+          toast("Manifest скопирован (без ключа)", "ok");
+        } catch (e) {
+          toast(`Не удалось скопировать: ${(e && e.message) || e}`, "err");
+        }
+      };
+      const saveBtn = card.querySelector("[data-save-manifest]");
+      if (saveBtn) saveBtn.onclick = () => {
+        // A file beats a chat paste for tools that import a JSON manifest.
+        const blob = new Blob([manifestText], { type: "application/json" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `${slugifyName(provider.name) || "provider"}-${target}-manifest.json`;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+      };
     }
     resultsEl.appendChild(card);
   }
@@ -2383,18 +2414,26 @@ async function doRefreshModels() {
   renderRefreshPlan();
 }
 
-function refreshSelectedIds() {
+// Whitelist by provider, not a flat id list: the same model id can be served
+// by two gateways, and a flat list would write it into both.
+function refreshSelectedByProvider() {
   const freeOnly = $("#diagFreeOnly") ? $("#diagFreeOnly").checked : false;
-  const ids = [];
+  const out = {};
   for (const p of asArray(state.refreshPlan)) {
-    if (!p.ok) continue;
+    if (!p.ok || !p.key) continue;
+    const ids = [];
     for (const a of asArray(p.added)) {
       const id = typeof a === "string" ? a : a.id;
       const free = typeof a === "object" && !!a.free;
       if (id && (!freeOnly || free)) ids.push(id);
     }
+    out[p.key] = ids;
   }
-  return ids;
+  return out;
+}
+
+function refreshSelectedIds() {
+  return Object.values(refreshSelectedByProvider()).flat();
 }
 
 function renderRefreshPlan() {
@@ -2445,7 +2484,7 @@ function renderRefreshPlan() {
           body: JSON.stringify({
             configPath: state.configPath, hash: state.configHash,
             prune: $("#diagPrune") ? $("#diagPrune").checked : false,
-            apply: true, models: refreshSelectedIds(),
+            apply: true, models: refreshSelectedByProvider(),
           }),
         });
         if (res && res.conflict) await refreshConfigState();

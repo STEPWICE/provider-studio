@@ -151,6 +151,16 @@ eq("a misplaced apiKey is reported exactly once",
 check("a genuine typo is still caught generically",
   has({ provider: { a: { npm: "x", baseUrl: "https://a.dev", models: {} } } }, "unknown-provider-field"));
 
+// A custom block with an address but no credential authenticates as "".
+check("a keyless public provider warns about credentials",
+  has({ provider: { a: { npm: "x", options: { baseURL: "https://a.dev/v1" }, models: { m: {} } } } }, "no-credentials"));
+check("no-credentials stays quiet when a key exists",
+  !has({ provider: { a: { npm: "x", options: { baseURL: "https://a.dev/v1", apiKey: "{env:A_KEY}" }, models: { m: {} } } } }, "no-credentials"));
+check("no-credentials stays quiet for localhost gateways",
+  !has({ provider: { a: { npm: "x", options: { baseURL: "http://127.0.0.1:11434/v1" }, models: { m: {} } } } }, "no-credentials"));
+check("no-credentials stays quiet for package providers without a baseURL",
+  !has({ provider: { a: { npm: "@ai-sdk/anthropic", models: { m: {} } } } }, "no-credentials"));
+
 // A bare $VAR is sent verbatim as the credential.
 check("$VAR is reported as a bad env reference",
   has({ provider: { a: { npm: "x", options: { apiKey: "$MY_KEY" }, models: {} } } }, "bad-env-ref"));
