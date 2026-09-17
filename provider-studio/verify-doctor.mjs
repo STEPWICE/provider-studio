@@ -283,6 +283,47 @@ function applyOk(configObj, label) {
   check("общий ok согласуется с критичными", self.ok === (critBad.length === 0));
 }
 
+// ------------------------------------------------------- env без options чинится тоже
+// Регрессия: fixOptions выходил раньше, чем доходил до env, когда у провайдера
+// не было options. Валидатор ошибку видел, автофикс — нет.
+{
+  const { applied, fixes } = applyOk({
+    $schema: "https://opencode.ai/config.json",
+    provider: {
+      a: { npm: "x", env: "NOT-AN-ARRAY", models: { m: {} } },
+    },
+    model: "a/m",
+  }, "env-без-options");
+  eq("env не-массив без options удалён", applied.value?.provider?.a?.env, undefined);
+  check("фикс bad-env есть", fixes.some((f) => f.id === "bad-env"), JSON.stringify(fixes));
+  const errs = validateConfig(applied.value).filter((i) => i.severity === "error");
+  check("после чистки ошибок нет", errs.length === 0, JSON.stringify(errs.map((i) => i.id)));
+}
+
+// ------------------------------------------------------- refresh идёт параллельно
+{
+  const seen = [];
+  const stub = async ({ baseURL }) => {
+    seen.push(baseURL);
+    await new Promise((r) => setTimeout(r, 50));
+    return { ok: true, models: [{ id: "m1" }], message: "ok" };
+  };
+  const cfg = {
+    provider: {
+      one: { npm: "x", options: { baseURL: "https://one.dev" }, models: {} },
+      two: { npm: "x", options: { baseURL: "https://two.dev" }, models: {} },
+      three: { npm: "x", options: { baseURL: "https://three.dev" }, models: {} },
+    },
+  };
+  const t0 = Date.now();
+  const plan = await D.planRefresh(cfg, { fetchFn: stub, concurrency: 3 });
+  const dt = Date.now() - t0;
+  check("порядок — как в конфиге", plan.map((p) => p.key).join(",") === "one,two,three",
+    plan.map((p) => p.key).join(","));
+  check("все опрошены", seen.length === 3, String(seen.length));
+  check("параллельно, а не последовательно", dt < 130, `${dt}ms`);
+}
+
 // ------------------------------------------------------- битый конфиг
 {
   const broken = D.buildAutoFixChanges(null);

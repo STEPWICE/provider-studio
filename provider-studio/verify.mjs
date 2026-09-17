@@ -1015,6 +1015,59 @@ try {
       await new Promise((r) => modelStub.close(r));
     }
   }
+
+  // ---- configPath scoping: a foreign path is ignored, never honoured ----
+  {
+    const FOREIGN = join(work, "foreign.json");
+    writeFileSync(FOREIGN, '{"provider":{}}', "utf8");
+    const enc = encodeURIComponent(FOREIGN);
+    const scoped = await (await get("/api/state?configPath=" + enc)).json();
+    check("a foreign configPath falls back to the active config",
+      scoped.opencode?.path === CONFIG, scoped.opencode?.path);
+    const vscoped = await (await get("/api/validate?configPath=" + enc)).json();
+    check("validate ignores a foreign configPath too",
+      vscoped.ok === true && vscoped.path === CONFIG, vscoped.path);
+    const bk = await (await post("/api/backup", { configPath: FOREIGN })).json();
+    check("backup ignores a foreign configPath", bk.ok === true && !!bk.file,
+      JSON.stringify(bk).slice(0, 160));
+    const blist = await (await get("/api/validate")).json();
+    const latest = (blist.backups || [])[0] || {};
+    check("backups record their origin config",
+      latest.origin === CONFIG, JSON.stringify(latest).slice(0, 200));
+    // The backup belongs to CONFIG even though the request names FOREIGN:
+    // restoring must follow the origin, not the request.
+    const re = await (await post("/api/restore", { file: latest.file, configPath: FOREIGN })).json();
+    check("restore follows the backup origin, not the requested file",
+      re.ok === true && re.path === CONFIG, JSON.stringify(re).slice(0, 200));
+  }
+
+  // ---- undo refuses when the file moved on since the reverted write ----
+  {
+    const st2 = await (await get("/api/state")).json();
+    const ap = await (await post("/api/apply", {
+      provider: { name: "Undo Guard", baseURL: "https://guard.example/v1", apiFormat: "openai-chat", setAsDefault: false, models: [{ id: "g" }] },
+      targets: ["opencode"], hash: st2.opencode?.hash,
+    })).json();
+    check("undo-guard fixture applies", ap.results?.opencode?.ok === true,
+      JSON.stringify(ap).slice(0, 200));
+    writeFileSync(CONFIG, readConfigText().replace("undo-guard", "undo-guard-external"), "utf8");
+    const refused = await (await post("/api/undo", {})).json();
+    check("undo refuses after an external edit", refused.ok === false,
+      JSON.stringify(refused).slice(0, 200));
+    check("the external edit survives the refused undo",
+      readConfigText().includes("undo-guard-external"), readConfigText().slice(-300));
+  }
+
+  // ---- a cyrillic name gets a transliterated key, not a "provider" pile-up ----
+  {
+    const cy = await (await post("/api/apply", {
+      provider: { name: "БайТест", baseURL: "https://cyr.example/v1", apiFormat: "openai-chat", setAsDefault: false, models: [{ id: "m" }] },
+      targets: ["opencode"],
+    })).json();
+    check("a cyrillic name applies under a transliterated key",
+      cy.results?.opencode?.ok === true && readConfigFile().provider?.["baytest"]?.name === "БайТест",
+      Object.keys(readConfigFile().provider || {}));
+  }
 } finally {
   child.kill();
   rmSync(work, { recursive: true, force: true });

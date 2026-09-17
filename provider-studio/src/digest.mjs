@@ -32,6 +32,16 @@ function clean(v) {
   return typeof v === "string" ? v.trim() : "";
 }
 
+/**
+ * Ссылка уходит в href в интерфейсе, а текст приехал из внешней сети.
+ * Экранирование режет кавычки, но `javascript:…` ему не помеха — поэтому
+ * протокол проверяется здесь, а не в шаблоне. Не http(s) — значит, не ссылка.
+ */
+function cleanSource(v) {
+  const s = clean(v);
+  return /^https?:\/\//i.test(s) ? s : "";
+}
+
 /** Английский текст первым: аудитория инструмента русскоязычная, а фид ведётся на zh/en. */
 function enFirst(en, zh) {
   return clean(en) || clean(zh);
@@ -55,7 +65,7 @@ export function normalisePerk(p) {
     starts: clean(p?.starts),
     ends: clean(p?.ends),
     status: clean(p?.status) || "unknown",
-    source: clean(p?.source),
+    source: cleanSource(p?.source),
   };
 }
 
@@ -70,7 +80,7 @@ export function normaliseNews(n) {
     starts: clean(n?.starts),
     ends: clean(n?.ends),
     status: clean(n?.status) || "unknown",
-    source: clean(n?.source),
+    source: cleanSource(n?.source),
   };
 }
 

@@ -83,10 +83,23 @@ export function managedModelKeys(formModel) {
   return keys;
 }
 
+// Cyrillic has nowhere to go in an opencode key, and dropping it turned every
+// Russian-named provider into the same key "provider" — so the second one
+// silently overwrote the first. Transliterate first, then apply the usual rule.
+// Kept in sync with slugifyName() in public/app.js (verify-formats pins this).
+const CYRILLIC_MAP = {
+  а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "yo", ж: "zh",
+  з: "z", и: "i", й: "y", к: "k", л: "l", м: "m", н: "n", о: "o",
+  п: "p", р: "r", с: "s", т: "t", у: "u", ф: "f", х: "h", ц: "ts",
+  ч: "ch", ш: "sh", щ: "shch", ъ: "", ы: "y", ь: "", э: "e", ю: "yu",
+  я: "ya", ґ: "g", є: "ye", і: "i", ї: "yi",
+};
+
 export function slugify(name) {
   const s = String(name || "provider")
     .trim()
     .toLowerCase()
+    .replace(/[а-яёґєії]/g, (c) => CYRILLIC_MAP[c] ?? "")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
   return s || "provider";
@@ -306,6 +319,15 @@ export function buildProviderChanges(provider, opts = {}) {
   }
   if (!options.apiKey && prior?.options?.apiKey !== undefined) {
     changes.push({ op: "delete", path: [...base, "options", "apiKey"] });
+  }
+  // A merge only sets the leaves it carries, so a field the user cleared would
+  // otherwise linger with its stale value and the form would lie about what a
+  // save does. Mirror the apiKey rule above for the other scalar options.
+  if (!options.baseURL && prior?.options?.baseURL !== undefined) {
+    changes.push({ op: "delete", path: [...base, "options", "baseURL"] });
+  }
+  if (!(timeout > 0) && prior?.options?.timeout !== undefined) {
+    changes.push({ op: "delete", path: [...base, "options", "timeout"] });
   }
   if (headersSubmitted && !options.headers && prior?.options?.headers !== undefined) {
     changes.push({ op: "delete", path: [...base, "options", "headers"] });

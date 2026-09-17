@@ -144,6 +144,16 @@ function stubFetch(map) {
   check("битый фид при живом кэше — кэш", d2.ok === true && d2.stale === false, JSON.stringify(d2).slice(0, 160));
 }
 
+// ------------------------------------------------------- источник только http(s)
+{
+  const evil = D.normalisePerk({ id: "x", title_en: "t", source: "javascript:alert(1)" });
+  check("javascript:-источник вырезается из perks", evil.source === "", evil.source);
+  const evil2 = D.normaliseNews({ id: "y", title_en: "t", source: "data:text/html,hi" });
+  check("data:-источник вырезается из news", evil2.source === "", evil2.source);
+  const ok = D.normalisePerk({ id: "z", title_en: "t", source: "https://board.ailyre.com/x" });
+  check("https-источник живёт", ok.source === "https://board.ailyre.com/x", ok.source);
+}
+
 rmSync(root, { recursive: true, force: true });
 console.log(`\n${pass}/${pass + fails.length} passed`);
 if (fails.length) {

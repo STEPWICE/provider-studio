@@ -13,8 +13,8 @@
 // только список правок (ops для jsonc-edit.mjs) и никогда не пишет на диск.
 // Пишет server.mjs через applyChangesVerified + commitPlan, показав diff.
 
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, accessSync, constants } from "node:fs";
+import { join, dirname } from "node:path";
 import {
   MODALITIES, MODEL_STATUSES, PROVIDER_FIELDS,
   MODEL_FIELDS, looksLikePackage, isCustomProviderBlock,
@@ -238,11 +238,14 @@ function fixHeaders(key, p, changes, fixes) {
 
 function fixOptions(key, p, changes, fixes) {
   const opts = p.options;
-  if (opts === undefined || !opts || typeof opts !== "object" || Array.isArray(opts)) return;
-  const t = opts.timeout;
-  if (t !== undefined && !(typeof t === "number" && Number.isFinite(t) && t > 0)) {
-    changes.push({ op: "delete", path: ["provider", key, "options", "timeout"] });
-    fixes.push({ id: "bad-timeout", provider: key, message: `Провайдер «${key}»: убран некорректный options.timeout` });
+  // timeout живёт в options, а env — на верхнем уровне: выходить при отсутствии
+  // options — значит оставить битой env, о которой валидатор уже доложил.
+  if (opts !== undefined && opts && typeof opts === "object" && !Array.isArray(opts)) {
+    const t = opts.timeout;
+    if (t !== undefined && !(typeof t === "number" && Number.isFinite(t) && t > 0)) {
+      changes.push({ op: "delete", path: ["provider", key, "options", "timeout"] });
+      fixes.push({ id: "bad-timeout", provider: key, message: `Провайдер «${key}»: убран некорректный options.timeout` });
+    }
   }
   const env = p.env;
   if (env === undefined) return;
@@ -465,23 +468,21 @@ export function planModelSync(existingModels, discovered, { prune = false } = {}
  *
  * fetchFn подменяется в тестах стабом, чтобы не ходить в сеть.
  */
-export async function planRefresh(config, { providerKeys = null, prune = false, fetchFn = null } = {}) {
+export async function planRefresh(config, { providerKeys = null, prune = false, fetchFn = null, concurrency = 3 } = {}) {
   // Ленивый импорт: rescue.mjs тяжёлый (прокси, DNS), а для юнит-плана он не нужен.
   const { fetchModels } = fetchFn ? { fetchModels: fetchFn } : await import("./rescue.mjs");
-  const out = [];
   const entries = Object.entries((config && isPlainObject(config.provider) ? config.provider : {}) || {});
   const wanted = Array.isArray(providerKeys) && providerKeys.length
     ? entries.filter(([k]) => providerKeys.includes(k))
     : entries;
-  for (const [key, p] of wanted) {
+
+  async function refreshOne(key, p) {
     if (!isPlainObject(p) || p.type === "local") {
-      out.push({ key, ok: false, skipped: true, message: `Провайдер «${key}»: локальный или некорректный — пропускаю` });
-      continue;
+      return { key, ok: false, skipped: true, message: `Провайдер «${key}»: локальный или некорректный — пропускаю` };
     }
     const base = p.options?.baseURL || p.baseURL || "";
     if (!base) {
-      out.push({ key, ok: false, skipped: true, message: `Провайдер «${key}»: нет своего Base URL — адрес берётся из npm-пакета, обновлять нечего` });
-      continue;
+      return { key, ok: false, skipped: true, message: `Провайдер «${key}»: нет своего Base URL — адрес берётся из npm-пакета, обновлять нечего` };
     }
     const decoded = decodeApiKey(p.options?.apiKey);
     const apiKey = decoded.useEnvVar ? (lookupEnv(decoded.envVarName)?.value || "") : decoded.apiKey;
@@ -492,19 +493,33 @@ export async function planRefresh(config, { providerKeys = null, prune = false, 
       res = { ok: false, models: [], message: String(e?.message || e) };
     }
     if (!res?.ok) {
-      out.push({ key, ok: false, message: res?.message || "Не удалось получить список моделей", fault: res?.fault || null });
-      continue;
+      return { key, ok: false, message: res?.message || "Не удалось получить список моделей", fault: res?.fault || null };
     }
     const sync = planModelSync(p.models, res.models, { prune });
-    out.push({
+    return {
       key, ok: true, message: res.message || `Найдено моделей: ${res.models.length}`,
       total: res.models.length,
       added: sync.added, removed: sync.removed, kept: sync.kept,
       pending: sync.changes,
       prune,
-    });
+    };
   }
-  return out;
+
+  // /models каждого провайдера — независимые запросы, а каждый висит до 12
+  // секунд: последовательный опрос десятка провайдеров превращался в минуты
+  // ожидания. Небольшой пул воркеров, порядок результата — как в конфиге.
+  const queue = wanted.slice();
+  const workers = Math.max(1, Math.min(Math.max(1, concurrency | 0), 8, Math.max(queue.length, 1)));
+  const byKey = new Map();
+  await Promise.all(Array.from({ length: workers }, async () => {
+    for (;;) {
+      const next = queue.shift();
+      if (!next) return;
+      const [key, p] = next;
+      byKey.set(key, await refreshOne(key, p));
+    }
+  }));
+  return wanted.map(([key]) => byKey.get(key));
 }
 
 // ------------------------------------------------------------ самопроверка
@@ -573,11 +588,21 @@ export async function runSelfCheck({ configPath = "", catalogTimeoutMs = 8000 } 
             : `Ошибок: ${errs}, предупреждений: ${issues.length - errs} — запусти «Исправить автоматически»`,
           false);
       }
+      // Проверяется именно запись, а не чтение: раньше здесь был fileStamp,
+      // который только читал файл, а проверка называлась «Запись конфига».
       try {
-        const st = (await import("./paths.mjs")).fileStamp(resolved);
-        push("config-writable", "Запись конфига", true, `Файл на месте (hash ${String(st.hash || "").slice(0, 8)}…)`, false);
+        if (existsSync(resolved)) {
+          accessSync(resolved, constants.W_OK);
+          const st = (await import("./paths.mjs")).fileStamp(resolved);
+          push("config-writable", "Запись конфига", true, `Файл перезаписываемый (hash ${String(st.hash || "").slice(0, 8)}…)`, false);
+        } else {
+          // Файла нет (его создадут при записи) — тогда важна
+          // перезаписываемость каталога.
+          accessSync(dirname(resolved), constants.W_OK);
+          push("config-writable", "Запись конфига", true, "Файла нет, но каталог перезаписываемый — создастся при записи", false);
+        }
       } catch (e) {
-        push("config-writable", "Запись конфига", false, String(e?.message || e), false);
+        push("config-writable", "Запись конфига", false, `Нет записи: ${e?.message || e}`, false);
       }
     }
   }

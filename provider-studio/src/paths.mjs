@@ -90,8 +90,24 @@ export function defaultOpencodeConfigPath() {
  */
 export function resolveOpencodeConfigPath(explicit, cwd = process.cwd()) {
   const pick = (p) => (p && String(p).trim() ? resolve(String(p).trim()) : "");
-  const chosen = pick(explicit) || pick(process.env.OPENCODE_CONFIG);
-  if (chosen) return chosen;
+  const fromEnv = pick(process.env.OPENCODE_CONFIG);
+  const chosen = pick(explicit);
+  if (chosen) {
+    // An explicit path arrives over HTTP, so it is only honoured when it names
+    // a real config location: a candidate or the OPENCODE_CONFIG override.
+    // A foreign path is ignored entirely — the fallthrough below can only ever
+    // yield a known config, never the arbitrary file that was asked for.
+    // Otherwise every read/write endpoint doubles as a file accessor for any
+    // local process able to reach loopback.
+    const known = new Set([
+      ...opencodeConfigCandidates(cwd).map((p) => resolve(p)),
+      ...(fromEnv ? [fromEnv] : []),
+    ]);
+    const hit = [...known].some((k) =>
+      IS_WINDOWS ? k.toLowerCase() === chosen.toLowerCase() : k === chosen);
+    if (hit) return chosen;
+  }
+  if (fromEnv) return fromEnv;
   for (const p of opencodeConfigCandidates(cwd)) {
     if (existsSync(p)) return p;
   }
@@ -124,6 +140,17 @@ export function listOpencodeConfigs(cwd = process.cwd()) {
     });
   }
   return out;
+}
+
+/**
+ * True when two config paths name the same file. Used to match a backup to
+ * the config it was taken from: a backup restored into the wrong file is a
+ * silent cross-file overwrite, not a restore.
+ */
+export function sameConfigPath(a, b) {
+  const x = resolve(String(a || ""));
+  const y = resolve(String(b || ""));
+  return IS_WINDOWS ? x.toLowerCase() === y.toLowerCase() : x === y;
 }
 
 /** True when `child` is `parent` or sits underneath it. Blocks `..` traversal. */

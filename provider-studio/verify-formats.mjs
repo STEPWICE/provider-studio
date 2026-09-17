@@ -65,8 +65,36 @@ eq("slugify lowercases and dashes", slugify("My Provider"), "my-provider");
 eq("slugify strips punctuation", slugify("BAI! (v2)"), "bai-v2");
 eq("slugify trims dashes", slugify("--x--"), "x");
 eq("slugify falls back", slugify(""), "provider");
-eq("slugify handles cyrillic-only input", slugify("Провайдер"), "provider");
+eq("slugify transliterates cyrillic", slugify("БайТест"), "baytest");
+eq("two cyrillic names stay distinct", slugify("Бай") !== slugify("Тест"), true);
+eq("slugify still falls back on depletion", slugify("上海"), "provider");
 eq("slugify keeps digits", slugify("gpt 4o"), "gpt-4o");
+
+// ------------------------------------------------------- clearing scalar options
+// A merge only sets the leaves it carries, so without explicit deletes a
+// cleared Base URL / timeout would linger with its stale value.
+{
+  const prior = {
+    provider: {
+      claire: {
+        npm: "@ai-sdk/openai-compatible", name: "Claire",
+        options: { baseURL: "https://old.dev/v1", apiKey: "{env:CLAIRE_API_KEY}", timeout: 5000 },
+        models: { m: { name: "m" } },
+      },
+    },
+  };
+  const built = buildProviderChanges({
+    key: "claire", name: "Claire", apiFormat: "openai-chat",
+    useEnvVar: true, envVarName: "CLAIRE_API_KEY",
+    models: [{ id: "m", name: "m" }],
+  }, { existingConfig: prior, previousKey: "claire", setAsDefault: false });
+  check("re-save without baseURL/timeout plans cleanly", built.ok === true, built.error || "");
+  const applied = applyChangesVerified(JSON.stringify(prior, null, 2), built.changes);
+  check("the clearing edit applies", applied.ok === true, applied.error || "");
+  eq("a cleared baseURL is deleted, not kept", applied.value?.provider?.claire?.options?.baseURL, undefined);
+  eq("a cleared timeout is deleted, not kept", applied.value?.provider?.claire?.options?.timeout, undefined);
+  eq("the key survives the clearing", applied.value?.provider?.claire?.options?.apiKey, "{env:CLAIRE_API_KEY}");
+}
 
 // ----------------------------------------------------------------- headers
 

@@ -69,6 +69,25 @@ async function api(path, opts) {
   }
 }
 
+/**
+ * Same as api(), but a transport failure becomes a reportable answer instead
+ * of an unhandled rejection. Without this every action that awaited api()
+ * without its own try/catch left a stuck "Загружаю…" and a console error on a
+ * dropped connection: the button handlers restore the button in `finally` but
+ * never show what happened.
+ */
+async function apiSafe(path, opts) {
+  try {
+    return await api(path, opts);
+  } catch (e) {
+    return { ok: false, error: `Нет связи с сервером: ${(e && e.message) || e}` };
+  }
+}
+
+// Sequence guard for preview: a slow earlier response must not overwrite the
+// hash a later one already adopted, or the next write dies with a false 409.
+let previewSeq = 0;
+
 function toast(msg, kind) {
   setStatus(msg, kind);
   const el = $("#status");
@@ -89,7 +108,11 @@ function setBtnLoading(btn, loading) {
 }
 
 async function init() {
-  const d = await api("/api/state");
+  const d = await apiSafe("/api/state");
+  if (!d || (!asArray(d.formats).length && !d.opencode)) {
+    setStatus(`Сервер недоступен: ${(d && d.error) || "неизвестная ошибка"}`, "err");
+    return;
+  }
   state.formats = asArray(d.formats);
   state.targets = asArray(d.targets);
   state.presets = asArray(d.presets);
@@ -121,6 +144,10 @@ async function init() {
     state.configHash = d.opencode.hash || "";
   }
   await loadConfigList();
+  // loadConfigList may have restored a remembered non-default file; adopt its
+  // hash before any write, or the first save goes out unguarded.
+  await refreshConfigState();
+  state.savedSnapshot = formSnapshot();
 
   renderModelList();
 
@@ -188,11 +215,13 @@ async function init() {
   $("#configPicker").addEventListener("change", async () => {
     state.configPath = $("#configPicker").value;
     // Switching files invalidates the hash: it belongs to the previous file.
+    // A scoped refresh adopts the new file's hash, chip and undo entry — the
+    // old code read the unscoped state and left every write unguarded (hash "")
+    // until the next background refresh.
     state.configHash = "";
     rememberConfigPath(state.configPath);
-    const d = await api("/api/state");
-    if (d.opencode) { updateConfigChip(d.opencode); }
-    toast("Правки пойдут в: " + state.configPath, "");
+    await refreshConfigState();
+    toast("Правки пойдут в: " + (state.configPath || "конфиг по умолчанию"), "");
   });
   $("#btnNew").addEventListener("click", () => {
     if (confirm("Сбросить форму? Несохранённые изменения будут потеряны.")) {
@@ -204,6 +233,8 @@ async function init() {
       $("#f-format").value = "openai-chat";
       updateFormatNote();
       restoreDefaults();
+      state.dirty = false;
+      state.savedSnapshot = formSnapshot();
       toast("Форма очищена", "");
     }
   });
@@ -336,8 +367,7 @@ async function init() {
 
   // Unsaved models are easy to lose by reloading; warn while the form is dirty.
   window.addEventListener("beforeunload", (e) => {
-    if (!state.models.length && !$("#f-name").value.trim()) return;
-    if (!state.dirty) return;
+    if (!isFormDirty()) return;
     e.preventDefault();
     e.returnValue = "";
   });
@@ -475,7 +505,8 @@ function renderProviderList() {
         e.stopPropagation();
         if (!confirm(`Убрать «${row.dataset.name}» из списка Provider Studio? В opencode-конфиге провайдер останется.`)) return;
         api("/api/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: row.dataset.name }) })
-          .then((r) => { state.providers = asArray(r.providers); renderProviderList(); });
+          .then((r) => { state.providers = asArray(r.providers); renderProviderList(); })
+          .catch((e) => toast(`Не удалось убрать из списка: ${(e && e.message) || e}`, "err"));
         return;
       }
       if (e.target.classList.contains("wipe")) {
@@ -510,8 +541,19 @@ function suggestEnvName(name) {
 }
 
 // Mirrors slugify() on the server so the UI can predict the opencode key.
+// The transliteration table is duplicated on purpose: keep both copies
+// identical when touching either (Cyrillic names must map to the same key).
+const CYRILLIC_MAP = {
+  а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "yo", ж: "zh",
+  з: "z", и: "i", й: "y", к: "k", л: "l", м: "m", н: "n", о: "o",
+  п: "p", р: "r", с: "s", т: "t", у: "u", ф: "f", х: "h", ц: "ts",
+  ч: "ch", ш: "sh", щ: "shch", ъ: "", ы: "y", ь: "", э: "e", ю: "yu",
+  я: "ya", ґ: "g", є: "ye", і: "i", ї: "yi",
+};
 function slugifyName(name) {
-  return String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return String(name || "").toLowerCase()
+    .replace(/[а-яёґєії]/g, (c) => CYRILLIC_MAP[c] ?? "")
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
 // Mirrors detectFormatFromURL() in src/presets.mjs. Kept in sync by verify-ui.
@@ -531,7 +573,7 @@ async function checkEnvVar() {
   if (!el) return;
   const name = $("#f-envname").value.trim();
   if (!$("#f-env").checked || !name) { el.hidden = true; return; }
-  const r = await api("/api/envcheck", {
+  const r = await apiSafe("/api/envcheck", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
   });
@@ -569,7 +611,7 @@ async function checkEnvVar() {
 async function envVarStatus(name) {
   const clean = String(name || "").trim();
   if (!clean) return null;
-  const r = await api("/api/envcheck", {
+  const r = await apiSafe("/api/envcheck", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: clean }),
   });
@@ -592,8 +634,14 @@ function renderDefaultModelPicker() {
 }
 
 async function refreshConfigState() {
-  const d = await api("/api/state");
-  if (d.opencode) {
+  // Scoped to the viewed file, and never throws: this is awaited from a dozen
+  // click handlers without their own try/catch, and a dropped connection must
+  // not turn into an unhandled rejection in all of them.
+  let d = null;
+  try {
+    d = await api("/api/state" + "?configPath=" + encodeURIComponent(state.configPath || ""));
+  } catch { return null; }
+  if (d && d.opencode) {
     state.configHash = d.opencode.hash || "";
     state.configHasComments = !!d.opencode.comments;
     updateConfigChip(d.opencode);
@@ -604,6 +652,19 @@ async function refreshConfigState() {
   }
   syncUndoButton(d && d.undo);
   return d;
+}
+
+// The sidebar list mirrors the server's provider store. Scoped and silent, for
+// the mutation sites that change the store as a side effect (rename, remove).
+async function refreshProviders() {
+  let d = null;
+  try {
+    d = await api("/api/state" + "?configPath=" + encodeURIComponent(state.configPath || ""));
+  } catch { return; }
+  if (d) {
+    state.providers = asArray(d.providers);
+    renderProviderList();
+  }
 }
 
 // The undo button mirrors the server's last-write record. Updated from every
@@ -619,7 +680,7 @@ function syncUndoButton(u) {
 
 async function refreshUndo() {
   let d = null;
-  try { d = await api("/api/state"); } catch { return; }
+  try { d = await api("/api/state" + "?configPath=" + encodeURIComponent(state.configPath || "")); } catch { return; }
   syncUndoButton(d && d.undo);
 }
 
@@ -629,7 +690,7 @@ async function doUndo() {
   const b = $("#btnUndo");
   if (b) setBtnLoading(b, true);
   try {
-    const r = await api("/api/undo", {
+    const r = await apiSafe("/api/undo", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ configPath: state.configPath }),
     });
@@ -657,11 +718,11 @@ async function doUndo() {
 async function pollExternalChanges() {
   if (document.hidden) return;
   let d = null;
-  try { d = await api("/api/state"); } catch { return; }
+  try { d = await api("/api/state" + "?configPath=" + encodeURIComponent(state.configPath || "")); } catch { return; }
   if (!d || !d.opencode) return;
   syncUndoButton(d.undo);
-  // The hash belongs to the server's active file; comparing it against the
-  // hash of a different file the user picked would cry wolf on every poll.
+  // Belt and braces: the server already scopes by configPath, but comparing
+  // against a different file's hash would cry wolf on every poll.
   if (state.configPath && d.opencode.path !== state.configPath) return;
   const live = d.opencode.hash || "";
   if (!live || live === state.configHash) {
@@ -680,12 +741,28 @@ async function pollExternalChanges() {
   }
 }
 
+// What the form holds right now, as a comparable string. Compared against the
+// snapshot taken at the last clean point (load, reset, successful apply), so
+// the watcher and beforeunload warn about actual unsaved content — not forever
+// after a save, and not never just because the models array is empty.
+function formSnapshot() {
+  const v = (sel) => { const el = $(sel); return el ? el.value : ""; };
+  return JSON.stringify({ n: v("#f-name"), u: v("#f-baseurl"), m: state.models || [] });
+}
+
 function isFormDirty() {
   if (state.dirty) return true;
-  if ((state.models || []).length) return true;
-  const name = $("#f-name");
-  const url = $("#f-baseurl");
-  return !!((name && name.value.trim()) || (url && url.value.trim()));
+  // Before the first snapshot (init still running) fall back to "anything
+  // typed", so an early poll cannot mistake a clean form for a dirty one.
+  if (state.savedSnapshot == null) {
+    if ((state.models || []).length) return true;
+    const name = $("#f-name");
+    const url = $("#f-baseurl");
+    return !!((name && name.value.trim()) || (url && url.value.trim()));
+  }
+  try {
+    return formSnapshot() !== state.savedSnapshot;
+  } catch { return true; }
 }
 
 // The path is the only thing worth showing here, truncated from the left by CSS
@@ -704,7 +781,7 @@ function updateConfigChip(oc) {
 }
 
 async function loadConfigList() {
-  const r = await api("/api/configs");
+  const r = await apiSafe("/api/configs");
   const configs = asArray(r.configs);
   state.configs = configs;
   const sel = $("#configPicker");
@@ -752,7 +829,7 @@ async function renameInConfig(name) {
   if (!to) return toast("Ключ не может быть пустым", "err");
   if (to === from) return toast("Ключ не изменился", "");
 
-  const r = await api("/api/rename-provider", {
+  const r = await apiSafe("/api/rename-provider", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ from, to, configPath: state.configPath, hash: state.configHash }),
   });
@@ -762,9 +839,8 @@ async function renameInConfig(name) {
   }
   if (r.hash) state.configHash = r.hash;
   if (state.editingKey === from) state.editingKey = to;
-  const d = await api("/api/state");
-  state.providers = asArray(d.providers);
-  renderProviderList();
+  await refreshConfigState();
+  await refreshProviders();
   refreshBackups();
   refreshUndo();
   toast(`Переименовано: ${from} → ${to}. Перезапусти opencode.`, "ok");
@@ -773,7 +849,7 @@ async function renameInConfig(name) {
 // Removes the provider from the opencode config itself, not just from our list.
 async function removeFromConfig(name) {
   const key = slugifyName(name);
-  const r = await api("/api/preview-remove", {
+  const r = await apiSafe("/api/preview-remove", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ key, configPath: state.configPath }),
   });
@@ -792,7 +868,7 @@ async function removeFromConfig(name) {
     confirmLabel: "Удалить из конфига",
     onConfirm: async () => {
       closeDiff();
-      const res = await api("/api/remove-provider", {
+      const res = await apiSafe("/api/remove-provider", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ key, configPath: state.configPath, hash: state.configHash }),
       });
@@ -832,6 +908,8 @@ function loadProviderIntoForm(name) {
     setEnvMode(false);
   }
   renderModelList();
+  // Snapshot after the fields are filled: this is the new clean point.
+  state.savedSnapshot = formSnapshot();
 }
 
 /**
@@ -877,10 +955,15 @@ async function testAllModels() {
   box.className = "batch-status";
   box.textContent = `Проверяю ${ids.length} моделей\u2026`;
 
-  const r = await api("/api/testchat-batch", {
+  const r = await apiSafe("/api/testchat-batch", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ provider: collectProvider(), modelIds: ids }),
   });
+  if (!r || (!r.result && !r.ok)) {
+    box.className = "batch-status err";
+    box.textContent = `\u2715 ${(r && r.error) || "не удалось проверить"}`;
+    return;
+  }
   const res = r.result || {};
   const done = new Set();
   state.probeResults = {};
@@ -922,7 +1005,7 @@ async function testSingleModel(index, btn) {
   if (!provider.baseURL) return toast("Укажи Base URL для теста", "err");
   if (btn) setBtnLoading(btn, true);
   try {
-    const r = await api("/api/testchat", {
+    const r = await apiSafe("/api/testchat", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider, modelId: m.id }),
     });
@@ -979,7 +1062,11 @@ function renderModelList() {
   // The delete selector names data-i explicitly: matching "every .rm that is
   // not .ed" would also catch the per-model probe button added above.
   list.querySelectorAll(".rm[data-i]").forEach((btn) => btn.addEventListener("click", () => {
+    const gone = state.models[Number(btn.dataset.i)];
     state.models.splice(Number(btn.dataset.i), 1);
+    // A re-added model with the same id must be probed again: the old verdict
+    // described the deleted row, not the new one.
+    if (gone && state.probeResults) delete state.probeResults[gone.id];
     renderModelList();
   }));
   list.querySelectorAll(".rm[data-test]").forEach((btn) => btn.addEventListener("click", () => {
@@ -1088,7 +1175,10 @@ function collectProvider() {
 // change that the subsequent write would reject.
 function validateForm(provider) {
   if (!provider.name) return "Укажи Name";
-  if (!provider.baseURL) return "Укажи Base URL";
+  // A package-based provider (no own Base URL) imported from the config must
+  // stay re-saveable; a brand-new one still needs an address. The validator
+  // warns about a missing baseURL on custom blocks either way.
+  if (!provider.baseURL && !state.editingKey) return "Укажи Base URL";
   if (state.selectedTargets.has("opencode") && !provider.models.length)
     return "Добавь хотя бы одну модель";
   if (provider.useEnvVar && !provider.envVarName)
@@ -1159,10 +1249,14 @@ async function preview() {
   if (err) return toast(err, "err");
 
   setStatus("Считаю изменения\u2026", "");
-  const r = await api("/api/preview", {
+  const seq = ++previewSeq;
+  const r = await apiSafe("/api/preview", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(requestBody(provider)),
   });
+  // A newer preview already moved on: this answer's hash is stale, and showing
+  // its diff would offer a write against the wrong base.
+  if (seq !== previewSeq) return;
   if (!r.ok) return toast(r.error || "Не удалось построить diff", "err");
 
   // The hash travels with the write so a file that changed underneath us is
@@ -1253,7 +1347,7 @@ async function applyNow(provider) {
   if (provider.useEnvVar) $("#f-envname").value = provider.envVarName;
 
   setStatus("Применяю\u2026", "");
-  const res = await api("/api/apply", {
+  const res = await apiSafe("/api/apply", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(requestBody(provider)),
@@ -1275,7 +1369,13 @@ async function applyNow(provider) {
   const oc = res.results && res.results.opencode;
   if (oc) {
     if (oc.hash) state.configHash = oc.hash;
-    if (oc.ok) state.editingKey = slugifyName(provider.name);
+    if (oc.ok) {
+      state.editingKey = slugifyName(provider.name);
+      // What is on screen now matches what is on disk: the next external-edit
+      // poll must not cry wolf, and leaving must not warn.
+      state.dirty = false;
+      state.savedSnapshot = formSnapshot();
+    }
   }
   refreshBackups();
   refreshUndo();
@@ -1333,7 +1433,11 @@ async function copyJson() {
         : (provider.apiKey ? "<вставь свой API-ключ>" : ""),
     },
   };
-  await navigator.clipboard.writeText(JSON.stringify(manifest, null, 2));
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(manifest, null, 2));
+  } catch (e) {
+    return toast(`Не удалось скопировать: ${(e && e.message) || e}`, "err");
+  }
   toast("JSON скопирован (без ключа)", "ok");
 }
 
@@ -1341,18 +1445,21 @@ async function testConnection() {
   const provider = collectProvider();
   if (!provider.baseURL) return toast("Укажи Base URL для теста", "err");
   setStatus("Проверяю\u2026", "");
-  const r = await api("/api/test", {
+  const r = await apiSafe("/api/test", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ provider }),
   });
   const t = r.result || {};
-  const msg = `${t.ok ? "\u2713" : "\u2715"} ${t.message || ""}`;
+  const msg = `${t.ok ? "\u2713" : "\u2715"} ${t.message || r.error || ""}`;
   toast(msg, t.ok ? "ok" : "err");
   if (t.url) $("#status").title = `Ответ ${t.status || ""} от ${t.url}`;
 }
 
 async function validate() {
-  const r = await api("/api/validate");
+  const r = await apiSafe("/api/validate" + "?configPath=" + encodeURIComponent(state.configPath || ""));
+  if (!r || (!r.ok && !asArray(r.issues).length)) {
+    return toast((r && r.error) || "Не удалось проверить конфиг", "err");
+  }
   const el = $("#issues");
   const issues = asArray(r.issues);
   el.hidden = false;
@@ -1378,7 +1485,14 @@ function setBackupInfo(msg) {
 
 async function backupNow() {
   setBackupInfo("Создаю бэкап\u2026");
-  const r = await api("/api/backup", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  const r = await apiSafe("/api/backup", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ configPath: state.configPath }),
+  });
+  if (!r || (!r.ok && !r.file)) {
+    setBackupInfo("");
+    return toast((r && r.error) || "Не удалось создать бэкап", "err");
+  }
   if (r.file) {
     setBackupInfo(`\u21bb Бэкап создан: ${r.file}`);
     await refreshBackups();
@@ -1386,8 +1500,13 @@ async function backupNow() {
 }
 
 async function refreshBackups() {
-  const r = await api("/api/validate");
-  renderBackups(asArray(r.backups));
+  // Never throws: called fire-and-forget after every write, and a dropped
+  // connection must not surface as an unhandled rejection from all of them.
+  let r = null;
+  try {
+    r = await api("/api/validate" + "?configPath=" + encodeURIComponent(state.configPath || ""));
+  } catch { return; }
+  renderBackups(asArray(r && r.backups));
 }
 
 function renderBackups(backups) {
@@ -1398,19 +1517,22 @@ function renderBackups(backups) {
   syncSidePlaceholder();
   el.innerHTML = `<div class="result-card"><h3>Бэкапы</h3>` +
     backups.map((b) => {
+      // A backup remembers which file it came from; restoring blindly wrote it
+      // into whatever file was being viewed. The origin tag keeps that visible.
+      const origin = b.origin ? String(b.origin).split(/[\\/]/).pop() : "?";
       return `<div class="backup-row">
-        <span class="bname">${esc(b.file)}</span>
-        <span class="bsize">${(b.size / 1024).toFixed(1)} KB</span>
+        <span class="bname" title="${esc(b.origin || "файл-источник неизвестен")}">${esc(b.file)}</span>
+        <span class="bsize">${(b.size / 1024).toFixed(1)} KB · ${esc(origin)}</span>
         <button class="btn btn-ghost bs" data-file="${esc(b.file)}">Восстановить</button>
       </div>`;
     }).join("") + `</div>`;
   el.querySelectorAll(".backup-row .bs").forEach((btn) => btn.addEventListener("click", async () => {
     if (!confirm("Восстановить конфиг из этого бэкапа? Текущий будет заменён (перед этим его снимут в бэкап).")) return;
-    const r = await api("/api/restore", {
+    const r = await apiSafe("/api/restore", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ file: btn.dataset.file }),
+      body: JSON.stringify({ file: btn.dataset.file, configPath: state.configPath }),
     });
-    toast(r.ok ? "Конфиг восстановлен. Перезапусти opencode." : ("Ошибка: " + (r.error || "")), r.ok ? "ok" : "err");
+    toast(r.ok ? `Конфиг восстановлен (${r.path || ""}). Перезапусти opencode.` : ("Ошибка: " + (r.error || "")), r.ok ? "ok" : "err");
     // A restore rewrites the file, so the hash this page holds is stale and the
     // next write would be refused as a false conflict.
     await refreshConfigState();
@@ -1422,7 +1544,10 @@ function renderBackups(backups) {
 }
 
 async function importFromOpenCode() {
-  const r = await api("/api/import", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  const r = await apiSafe("/api/import", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ configPath: state.configPath }),
+  });
   if (!r.ok) return toast(r.error || "Импорт не удался", "err");
   const imported = asArray(r.imported);
   toast(imported.length ? `Импортировано: ${imported.join(", ")}` : "Новых провайдеров из opencode конфига нет", "ok");
@@ -1438,7 +1563,7 @@ async function openDiscover() {
   $("#discoverStatus").textContent = "Загружаю /models\u2026";
   $("#discoverList").innerHTML = `<div class="discover-empty">Поиск моделей\u2026</div>`;
   $("#discoverAdd").textContent = "Добавить выбранные (0)";
-  const r = await api("/api/discover", {
+  const r = await apiSafe("/api/discover", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ provider }),
   });
@@ -1446,7 +1571,7 @@ async function openDiscover() {
   const st = $("#discoverStatus");
   if (!res.ok) {
     st.className = "discover-status err";
-    st.textContent = "\u2715 " + (res.message || "Не удалось получить модели");
+    st.textContent = "\u2715 " + (res.message || (r && r.error) || "Не удалось получить модели");
     $("#discoverList").innerHTML = `<div class="discover-empty">Не удалось загрузить модели.</div>`;
     return;
   }
@@ -1799,11 +1924,17 @@ async function setEnvFromField(name, value, el, btnSel = "#wizSetEnvBtn") {
   }
   const btn = $(btnSel);
   if (btn) setBtnLoading(btn, true);
-  const r = await api("/api/setenv", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, value: key }),
-  });
-  if (btn) setBtnLoading(btn, false);
+  // try/finally: without it a dropped connection left the button as "..."
+  // forever and the page needed a reload.
+  let r = null;
+  try {
+    r = await apiSafe("/api/setenv", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, value: key }),
+    });
+  } finally {
+    if (btn) setBtnLoading(btn, false);
+  }
   if (r && r.ok) {
     el.className = "env-state is-set";
     el.textContent = `\u2713 ${name} задана (${r.length} симв.)`;
@@ -1843,14 +1974,14 @@ async function loadWizardModels() {
   st.textContent = "Запрашиваю список моделей\u2026";
   list.innerHTML = `<div class="discover-empty">Загрузка\u2026</div>`;
 
-  const r = await api("/api/discover", {
+  const r = await apiSafe("/api/discover", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ provider: wizardProvider() }),
   });
   const res = r.result || {};
   if (!res.ok) {
     st.className = "discover-status err";
-    st.textContent = `\u2715 ${res.message || "не удалось получить список"}`;
+    st.textContent = `\u2715 ${res.message || (r && r.error) || "не удалось получить список"}`;
     // A failed listing is not a dead end: a preset may ship a catalogue, and
     // otherwise the user can still add models by hand in the main form.
     const seeded = asArray(state.wizardPreset && state.wizardPreset.models);
@@ -1932,14 +2063,20 @@ function renderWizardSummary() {
       setBtnLoading(btn, true);
       out.className = "chat-probe";
       out.textContent = "проверяю\u2026";
-      const r = await api("/api/testchat", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: p, modelId: firstModel }),
-      });
-      setBtnLoading(btn, false);
-      const res = (r && r.result) || {};
-      out.className = "chat-probe " + (res.ok ? "is-ok" : "is-bad");
-      out.textContent = res.message || (r && r.error) || "не удалось проверить";
+      try {
+        const r = await apiSafe("/api/testchat", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider: p, modelId: firstModel }),
+        });
+        const res = (r && r.result) || {};
+        out.className = "chat-probe " + (res.ok ? "is-ok" : "is-bad");
+        out.textContent = res.message || (r && r.error) || "не удалось проверить";
+      } catch (e) {
+        out.className = "chat-probe is-bad";
+        out.textContent = `Нет связи с сервером: ${(e && e.message) || e}`;
+      } finally {
+        setBtnLoading(btn, false);
+      }
     };
   }
 }
@@ -2018,7 +2155,11 @@ if (typeof window !== "undefined") window.rankDefaultCandidates = rankDefaultCan
 
 async function diagnose() {
   setStatus("Проверяю\u2026", "");
-  const r = await api("/api/diagnostics");
+  const r = await apiSafe("/api/diagnostics" + "?configPath=" + encodeURIComponent(state.configPath || ""));
+  if (!r || (!r.ok && !asArray(r.providers).length && !asArray(r.issues).length)) {
+    setStatus("", "");
+    return toast((r && r.error) || "Диагностика не удалась", "err");
+  }
   // Kept for the copyable report: re-probing on every copy would burn quota
   // and take a minute on a dozen providers.
   state.lastDiag = r;
@@ -2108,6 +2249,11 @@ async function diagnose() {
   if (selfBtn) selfBtn.onclick = () => doSelfCheck();
   const reportBtn = $("#diagCopyReport");
   if (reportBtn) reportBtn.onclick = () => copyDiagReport();
+  // The plan below was computed with the prune flag as it was; flipping it
+  // afterwards must re-render the counts, or the Apply button offers deletions
+  // the list does not show.
+  const pruneBox = $("#diagPrune");
+  if (pruneBox) pruneBox.onchange = () => { if (state.refreshPlan) renderRefreshPlan(); };
 
   const pick = $("#diagModelPick");
   const fixBtn = $("#diagSetDefault");
@@ -2116,20 +2262,26 @@ async function diagnose() {
       const model = pick.value;
       if (!model) return;
       setBtnLoading(fixBtn, true);
-      // The hash guards against overwriting a file edited elsewhere since we
-      // read it, same as every other write path.
-      const resp = await api("/api/set-default-model", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, configPath: state.configPath, hash: state.configHash }),
-      });
-      setBtnLoading(fixBtn, false);
-      if (resp && resp.ok) {
-        toast(`Модель по умолчанию: ${model}`, "ok");
-        await refreshConfigState();
-        refreshUndo();
-        await diagnose(); // re-render so the badge and the tag move
-      } else {
-        toast((resp && resp.error) || "Не удалось сменить модель", "err");
+      try {
+        // The hash guards against overwriting a file edited elsewhere since we
+        // read it, same as every other write path.
+        const resp = await apiSafe("/api/set-default-model", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model, configPath: state.configPath, hash: state.configHash }),
+        });
+        // A 409 leaves the held hash stale; without a refresh every write after
+        // it would be refused too, one confusing error at a time.
+        if (resp && resp.conflict) await refreshConfigState();
+        if (resp && resp.ok) {
+          toast(`Модель по умолчанию: ${model}`, "ok");
+          await refreshConfigState();
+          refreshUndo();
+          await diagnose(); // re-render so the badge and the tag move
+        } else {
+          toast((resp && resp.error) || "Не удалось сменить модель", "err");
+        }
+      } finally {
+        setBtnLoading(fixBtn, false);
       }
     };
   }
@@ -2155,7 +2307,7 @@ async function doAutoFix() {
   const out = $("#diagActionOut");
   if (st) st.textContent = "Считаю исправления…";
   if (out) out.innerHTML = "";
-  const r = await api("/api/autofix-preview", {
+  const r = await apiSafe("/api/autofix-preview", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ configPath: state.configPath }),
   });
@@ -2184,7 +2336,7 @@ async function doAutoFix() {
     confirmLabel: `Исправить (${fixes.length})`,
     onConfirm: async () => {
       closeDiff();
-      const res = await api("/api/autofix-apply", {
+      const res = await apiSafe("/api/autofix-apply", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ configPath: state.configPath, hash: state.configHash }),
       });
@@ -2211,7 +2363,7 @@ async function doRefreshModels() {
   const prune = $("#diagPrune") ? $("#diagPrune").checked : false;
   if (st) st.textContent = "Опрашиваю серверы…";
   if (out) out.innerHTML = "";
-  const r = await api("/api/refresh-models", {
+  const r = await apiSafe("/api/refresh-models", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ configPath: state.configPath, prune }),
   });
@@ -2288,7 +2440,7 @@ function renderRefreshPlan() {
     applyBtn.onclick = async () => {
       setBtnLoading(applyBtn, true);
       try {
-        const res = await api("/api/refresh-models", {
+        const res = await apiSafe("/api/refresh-models", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             configPath: state.configPath, hash: state.configHash,
@@ -2320,7 +2472,7 @@ async function doSelfCheck() {
   const out = $("#diagActionOut");
   if (st) st.textContent = "Проверяю сам инструмент…";
   if (out) out.innerHTML = "";
-  const r = await api("/api/selfcheck" + "?configPath=" + encodeURIComponent(state.configPath || ""));
+  const r = await apiSafe("/api/selfcheck" + "?configPath=" + encodeURIComponent(state.configPath || ""));
   if (!r || !r.ok) {
     if (st) st.textContent = "";
     return toast((r && r.error) || "Самопроверка не удалась", "err");
@@ -2348,7 +2500,7 @@ async function renderDigest(force) {
   el.hidden = false;
   el.innerHTML = `<div class="result-card"><h3>Халява</h3><div class="ok-line" style="color:var(--muted)">Загружаю…</div></div>`;
   syncSidePlaceholder();
-  const r = await api("/api/digest" + (force ? "?refresh=1" : ""));
+  const r = await apiSafe("/api/digest" + (force ? "?refresh=1" : ""));
   if (!r || (!r.ok && !asArray(r.perks).length && !asArray(r.news).length)) {
     el.innerHTML = `<div class="result-card"><h3>Халява</h3>`
       + `<div class="err-line">\u2715 ${esc((r && r.error) || "не удалось загрузить")}</div></div>`;
@@ -2375,7 +2527,9 @@ async function renderDigest(force) {
   }
   html += `<div class="diag-sect">Новости (${news.length})</div>`;
   if (!news.length) html += `<div class="ok-line" style="color:var(--muted)">\u2014 пусто \u2014</div>`;
-  for (const n of news.slice(0, 12)) {
+  // Rendered whole: the header promises news.length, and the feed holds
+  // a dozen items at most — slicing would make the counter lie.
+  for (const n of news) {
     html += `<div class="diag-row"><span class="diag-name">${esc(n.title || n.id || "?")}</span></div>`
       + `<div class="diag-sub">${esc([n.provider, n.product].filter(Boolean).join(" · "))}`
       + (n.source ? ` \u00b7 <a class="digest-link" href="${esc(n.source)}" target="_blank" rel="noopener">источник \u2197</a>` : "")
@@ -2411,6 +2565,14 @@ function maskSecretsForReport(text) {
   // placeholders above, and matching it would mask the stash itself.
   const masked = safe
     .replace(/sk-[A-Za-z0-9\-_]{8,}/g, "sk-****")
+    // Other credential shapes a provider may echo back inside its error text:
+    // Google (AIza…), AWS (AKIA…), GitHub (ghp_/github_pat_), Slack (xox-).
+    // Lengths stay conservative so hashes and ids in the report survive.
+    .replace(/\bAIza[0-9A-Za-z\-_]{10,}/g, "AIza****")
+    .replace(/\bAKIA[0-9A-Z]{8,}/g, "AKIA****")
+    .replace(/\bgh[pousr]_[A-Za-z0-9]{8,}/g, "ghp_****")
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{8,}/g, "github_pat_****")
+    .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}/g, "xox-****")
     .replace(/Bearer\s+[A-Za-z0-9\-._~+/=]+/gi, "Bearer ****")
     .replace(/((?:api[_-]?key|token|secret|password)["']?\s*[:=]\s*["']?)([^"'\s,}\u0000]+)/gi, "$1****");
   return masked.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)]);
@@ -2446,8 +2608,16 @@ async function copyDiagReport() {
   const issues = asArray(d.issues);
   if (!issues.length) lines.push("- проблем не найдено");
   for (const i of issues) lines.push(`- [${i.severity}] ${i.message}`);
-  await navigator.clipboard.writeText(maskSecretsForReport(lines.join("\n")));
+  try {
+    await navigator.clipboard.writeText(maskSecretsForReport(lines.join("\n")));
+  } catch (e) {
+    return toast(`Не удалось скопировать: ${(e && e.message) || e}`, "err");
+  }
   toast("Отчёт скопирован (без секретов)", "ok");
 }
 
-init();
+// init() guards its own network failures, but a last net keeps a DOM-level bug
+// from becoming a blank page with no explanation.
+init().catch((e) => {
+  try { setStatus(`Не удалось запустить: ${(e && e.message) || e}`, "err"); } catch { /* ignore */ }
+});

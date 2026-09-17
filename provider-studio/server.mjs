@@ -3,7 +3,7 @@ import path from "node:path";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { exec } from "node:child_process";
 import {
-  readConfig, upsertProviderAsDefault, opencodeSummary, setDefaultModel,
+  readConfig, readConfigAtPath, upsertProviderAsDefault, opencodeSummary, setDefaultModel,
   planProviderChange, planProviderRemoval, removeProvider, renameProvider,
   listOpencodeConfigs, writeConfigText, commitPlan,
 } from "./src/opencode.mjs";
@@ -254,7 +254,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/api/state" && req.method === "GET") {
-      const cfg = readConfig();
+      // Scoped to the file the UI is viewing: hash, undo entry and provider
+      // list all belong to it. Without this every read showed the default file
+      // while writes went to the picked one.
+      const cfg = readConfig(url.searchParams.get("configPath") || "");
       return json(res, 200, {
         providers: loadStore(),
         targets: TARGETS,
@@ -539,7 +542,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/api/validate" && req.method === "GET") {
-      const cfg = readConfig();
+      const cfg = readConfig(url.searchParams.get("configPath") || "");
       const issues = cfg.config ? validateConfig(cfg.config) : [{ severity: "error", id: "parse", message: cfg.error || "Не удалось прочитать конфиг" }];
       return json(res, 200, { ok: true, path: cfg.path, issues, backups: listBackups() });
     }
@@ -590,7 +593,7 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === "/api/diagnostics" && req.method === "GET") {
       // Full health check: config issues + connectivity of every provider.
-      const cfg = readConfig();
+      const cfg = readConfig(url.searchParams.get("configPath") || "");
       const issues = cfg.config ? validateConfig(cfg.config) : [{ severity: "error", id: "parse", message: cfg.error || "не удалось прочитать конфиг" }];
       // Probed in parallel: each endpoint can take up to 8s, so a serial loop
       // over a dozen providers meant a two-minute request that usually timed out
@@ -798,6 +801,17 @@ const server = http.createServer(async (req, res) => {
         clearUndo();
         return json(res, 200, { ok: false, error: "Снапшот потерян (" + snap.error + ") — откат невозможен" });
       }
+      // The file must still be what the reverted write produced. Otherwise an
+      // external edit landed in between, and restoring the snapshot would
+      // silently destroy it — the same loss the hash guard prevents on every
+      // other write path. Old records (before afterHash existed) carry "" and
+      // skip the check: refusing them all would strand previously valid undos.
+      if (entry.afterHash && cfg.config && (cfg.hash || "") !== entry.afterHash) {
+        return json(res, 200, {
+          ok: false,
+          error: "Файл изменился после записи — откат затёр бы чужие правки. Восстанови из бэкапа вручную",
+        });
+      }
       let preFile = null;
       if (cfg.config) preFile = backupConfig(cfg.path, "before-undo");
       writeConfigText(snap.raw, cfg.path);
@@ -822,7 +836,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/api/backup" && req.method === "POST") {
-      const cfg = readConfig();
+      const body = await readBody(req);
+      const cfg = readConfig(body.configPath);
       const file = cfg.config ? backupConfig(cfg.path, "manual") : null;
       return json(res, 200, { ok: true, file, backups: listBackups() });
     }
@@ -831,20 +846,29 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const r = restoreBackup(body.file);
       if (!r.ok) return json(res, 400, { ok: false, error: r.error });
+      // A backup belongs to the file it was taken from, not to the file the UI
+      // happens to be viewing: restoring B's snapshot into A is a silent
+      // cross-file overwrite. Snapshots that predate the origin index have no
+      // origin recorded and fall back to the requested file, as before.
+      const cfg = r.origin ? readConfigAtPath(r.origin) : readConfig(body.configPath);
       // Safety: snapshot current config before overwriting.
-      const cfg = readConfig();
       let preFile = null;
       if (cfg.config) preFile = backupConfig(cfg.path, "before-restore");
       // Restores the exact bytes of the snapshot. Re-serialising the parsed
       // object instead would silently strip the comments the backup preserved.
       const written = writeConfigText(r.raw, cfg.path);
-      recordUndo(cfg.path, preFile, "Восстановление из бэкапа", (written && written.hash) || "");
-      return json(res, 200, { ok: true, file: r.file, preFile, hash: (written && written.hash) || "", backups: listBackups() });
+      if (!written.ok) return json(res, 400, { ok: false, error: written.error, path: cfg.path });
+      recordUndo(cfg.path, preFile, "Восстановление из бэкапа", written.hash || "");
+      return json(res, 200, {
+        ok: true, file: r.file, path: cfg.path, origin: r.origin || null,
+        preFile, hash: written.hash || "", backups: listBackups(),
+      });
     }
 
     if (url.pathname === "/api/import" && req.method === "POST") {
       // Load providers already present in the opencode config into our store so they can be edited.
-      const cfg = readConfig();
+      const body = await readBody(req);
+      const cfg = readConfig(body.configPath);
       if (!cfg.config) return json(res, 400, { ok: false, error: "opencode config не прочитан" });
       const store = loadStore();
       const imported = [];

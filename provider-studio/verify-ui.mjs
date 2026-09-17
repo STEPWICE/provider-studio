@@ -507,6 +507,15 @@ const maskGaps = [];
     if (/abc\.def-ghi/.test(mask("Authorization: Bearer abc.def-ghi"))) {
       maskGaps.push("a Bearer value survives masking");
     }
+    if (mask("key AIzaSyD-1234567890abcdefg rest").includes("AIzaSyD-1234567890abcdefg")) {
+      maskGaps.push("a Google key survives masking");
+    }
+    if (mask("key AKIAIOSFODNN7EXAMPLE rest").includes("AKIAIOSFODNN7EXAMPLE")) {
+      maskGaps.push("an AWS key survives masking");
+    }
+    if (mask("token ghp_abcdef1234567890 rest").includes("ghp_abcdef1234567890")) {
+      maskGaps.push("a GitHub token survives masking");
+    }
     if (mask("nothing secret here") !== "nothing secret here") maskGaps.push("plain text is mangled");
     if (!/window\.maskSecretsForReport/.test(js)) maskGaps.push("the mask function is not exposed for testing");
   }

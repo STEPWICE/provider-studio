@@ -123,6 +123,11 @@ withEnv({ XDG_CONFIG_HOME: join(root, "xdg"), OPENCODE_CONFIG: "" }, () => {
   eq("explicit argument overrides discovery", resolveOpencodeConfigPath(globalPath, cwd), globalPath);
   eq("explicit path is normalised", resolveOpencodeConfigPath(globalPath + "/../opencode.json", cwd), globalPath);
   eq("blank explicit is ignored", resolveOpencodeConfigPath("   ", cwd), projJsonc);
+  // An explicit path arrives over HTTP: only real config locations are
+  // honoured, anything else falls back to discovery rather than opening an
+  // arbitrary file for reading and writing.
+  eq("a foreign explicit path is ignored, not honoured",
+    resolveOpencodeConfigPath(join(root, "elsewhere.json"), cwd), projJsonc);
 });
 
 withEnv({ XDG_CONFIG_HOME: join(root, "xdg"), OPENCODE_CONFIG: join(root, "env-cfg.jsonc") }, () => {

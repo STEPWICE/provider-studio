@@ -361,20 +361,6 @@ export function renameProvider(fromKey, toKey, opts = {}) {
   }, { expectedHash, backup });
 }
 
-/**
- * Writes a whole config object. Only used by the restore path, where replacing
- * the file wholesale is the point. Everything else must go through the patcher.
- */
-export function writeConfig(config, path) {
-  const target = resolveOpencodeConfigPath(path);
-  let out = config;
-  if (out && typeof out === "object" && !Array.isArray(out) && !out.$schema) {
-    out = { $schema: SCHEMA_URL, ...out };
-  }
-  writeFileAtomic(target, JSON.stringify(out, null, 2) + "\n");
-  return target;
-}
-
 /** Writes raw text, e.g. restoring a backup verbatim. Refuses invalid JSONC. */
 export function writeConfigText(text, path) {
   const target = resolveOpencodeConfigPath(path);

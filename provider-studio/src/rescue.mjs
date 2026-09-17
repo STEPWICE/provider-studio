@@ -62,8 +62,32 @@ export function backupConfig(configPath, label = "auto") {
     dest = join(backupDir(), `${base}-${n}.jsonc`);
   }
   writeFileAtomic(dest, raw);
+  // Remember which config this snapshot came from. The backup list is shared
+  // across every config file, so without this a restore cannot tell "the file
+  // I am viewing" from "the file this snapshot belongs to" — and writes the
+  // wrong one. Best-effort: the snapshot itself is what matters.
+  try {
+    const idx = readBackupIndex();
+    idx[basename(dest)] = { config: configPath, at: Date.now() };
+    writeFileAtomic(join(backupDir(), "backup-index.json"), JSON.stringify(idx, null, 2));
+  } catch { /* index is a convenience, the backup is not */ }
   prune();
   return dest;
+}
+
+// Maps a backup filename to the config it was taken from. Snapshots written
+// before the index existed have no entry and report origin null ("unknown").
+function readBackupIndex() {
+  try {
+    const v = JSON.parse(readFileSync(join(backupDir(), "backup-index.json"), "utf8"));
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  } catch { return {}; }
+}
+
+/** Where a backup came from, or null when it predates the index. Exported for tests. */
+export function backupOrigin(file) {
+  const e = readBackupIndex()[String(file || "")];
+  return e && typeof e.config === "string" && e.config ? e.config : null;
 }
 
 export function listBackups() {
@@ -77,7 +101,7 @@ export function listBackups() {
     try {
       const st = statSync(join(dir, f));
       if (!st.isFile()) continue;
-      out.push({ file: f, size: st.size, mtime: st.mtimeMs });
+      out.push({ file: f, size: st.size, mtime: st.mtimeMs, origin: backupOrigin(f) });
     } catch { /* vanished between readdir and stat */ }
   }
   // Ties on mtime are broken by name, which embeds the counter, so the order is
@@ -114,13 +138,23 @@ export function restoreBackup(file) {
   if (!doc.value || typeof doc.value !== "object" || Array.isArray(doc.value)) {
     return { ok: false, error: "Бэкап повреждён: корень должен быть объектом" };
   }
-  return { ok: true, raw: text, config: doc.value, file: wanted };
+  return { ok: true, raw: text, config: doc.value, file: wanted, origin: backupOrigin(wanted) };
 }
 
 /** Keeps the newest N snapshots; older ones are dropped. */
 function prune(max = 30) {
+  const dropped = [];
   for (const b of listBackups().slice(max)) {
-    try { unlinkSync(join(backupDir(), b.file)); } catch { /* already gone */ }
+    try { unlinkSync(join(backupDir(), b.file)); dropped.push(b.file); } catch { /* already gone */ }
+  }
+  // Whatever is gone from disk must go from the index too, or restores keep
+  // offering snapshots that no longer exist.
+  if (dropped.length) {
+    try {
+      const idx = readBackupIndex();
+      for (const f of dropped) delete idx[f];
+      writeFileAtomic(join(backupDir(), "backup-index.json"), JSON.stringify(idx, null, 2));
+    } catch { /* index is a convenience */ }
   }
 }
 
