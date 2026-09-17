@@ -19,7 +19,7 @@
 // something the provider states, with `source` pointing at where it says so.
 
 /** Date the free-tier notes below were last checked against the providers. */
-export const FREE_TIER_CHECKED = "2026-08-29";
+export const FREE_TIER_CHECKED = "2026-09-17";
 
 export const PRESETS = [
   {
@@ -34,12 +34,13 @@ export const PRESETS = [
     // Discovery works, so we do not ship a model list that would go stale.
     discover: true,
     freeTier: {
-      // Counted live from /api/v1/models: models priced at 0/0. The count moves
-      // week to week, so it is described as approximate on purpose.
-      summary: "Модели с суффиксом «:free» — около 20 штук, цена 0/0.",
+      // The :free convention and the exact caps below are stated in the docs
+      // (FREE_MODEL_* constants on the limits page). No count is given: it
+      // moves week to week, and an unattributed number is worse than none.
+      summary: "Модели с суффиксом «:free», цена 0/0 — их видно при обнаружении.",
       limits: [
-        "Бесплатные модели помечены «:free» прямо в списке — их видно при обнаружении.",
-        "Лимит зависит от баланса аккаунта; точные цифры OpenRouter показывает в личном кабинете.",
+        "Бесплатные :free: 20 запросов в минуту; в сутки — 50 без покупок, 1000 при покупках от $10.",
+        "Счётчик виден через GET /api/v1/key (free_model_daily_requests); 402 бывает даже на бесплатных при отрицательном балансе.",
       ],
       source: "https://openrouter.ai/docs/api-reference/limits",
       checked: FREE_TIER_CHECKED,
@@ -194,6 +195,7 @@ export const PRESETS = [
       limits: [
         "$5 кредитов после привязки карты, сгорают через 30 дней.",
         "Когда кредиты кончились, доступ к API останавливается до покупки.",
+        "У пробного тира свои лимиты на модель (например 5 запросов в минуту).",
         "В сторонних подборках Cerebras до сих пор числится как «1M токенов в день бесплатно» — это устарело.",
       ],
       source: "https://inference-docs.cerebras.ai/support/rate-limits",
