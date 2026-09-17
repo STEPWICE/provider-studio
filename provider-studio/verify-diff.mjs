@@ -227,6 +227,25 @@ check("end to end: the comment is not reported as changed",
 const rawE2E = diffLines(REAL, patched.text);
 eq("end to end: unmasked diff replays to the patched text", replay(rawE2E), patched.text);
 
+// ------------------------------------------------------- big file, small change
+// Regression: the size guard used to measure the whole file, so any file over
+// ~2000 lines reported the entire content as added+removed with no hunks —
+// which also disabled the diff confirm button downstream.
+{
+  const big = Array.from({ length: 3000 }, (_, i) => `line ${i}`);
+  const changed = [...big];
+  changed.splice(1500, 0, "inserted line");
+  const d = diffLines(big.join("\n"), changed.join("\n"));
+  check("a one-line change in a 3000-line file is not truncated",
+    d.truncated === false && d.added === 1 && d.removed === 0, JSON.stringify({ added: d.added, removed: d.removed, truncated: d.truncated }));
+  check("the big diff replays exactly", replay(d) === changed.join("\n"));
+  check("the big diff yields hunks", toHunks(d).length === 1, String(toHunks(d).length));
+  // Two completely different big files must still refuse, not hang the tab.
+  const other = Array.from({ length: 3000 }, (_, i) => `other ${i}`);
+  const refused = diffLines(big.join("\n"), other.join("\n"));
+  check("fully different big files still refuse", refused.truncated === true && refused.lines.length === 0);
+}
+
 console.log(`\n${pass}/${pass + fails.length} passed`);
 if (fails.length) {
   console.log("failed:\n  " + fails.join("\n  "));

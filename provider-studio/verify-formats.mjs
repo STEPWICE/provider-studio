@@ -70,6 +70,26 @@ eq("two cyrillic names stay distinct", slugify("Бай") !== slugify("Тест")
 eq("slugify still falls back on depletion", slugify("上海"), "provider");
 eq("slugify keeps digits", slugify("gpt 4o"), "gpt-4o");
 
+// ------------------------------------------------------- import round-trip keeps specs
+// modelEntryToForm must leave unknown numbers blank ("", not 0): 0 counts as
+// "submitted" for managed keys, and a re-save then deleted every limit.
+{
+  const full = buildModelEntry({
+    id: "m", contextWindow: 1000, maxOutput: 100,
+    costInput: 1, costOutput: 2, costCacheRead: 0.5,
+  }).entry;
+  const form = modelEntryToForm("m", full);
+  eq("known limit survives to the form", [form.contextWindow, form.maxOutput], [1000, 100]);
+  eq("known cost survives to the form", [form.costInput, form.costOutput, form.costCacheRead], [1, 2, 0.5]);
+  const bare = modelEntryToForm("m2", { name: "m2" });
+  eq("unknown limit stays blank, not 0", [bare.contextWindow, bare.maxOutput], ["", ""]);
+  check("unknown cost stays absent", bare.costInput === undefined && bare.costOutput === undefined,
+    JSON.stringify(bare));
+  const back = buildModelEntry({ id: "m", ...form });
+  eq("limit round-trips back into the entry", back.entry.limit, { context: 1000, output: 100 });
+  eq("cost round-trips back into the entry", back.entry.cost.input, 1);
+}
+
 // ------------------------------------------------------- clearing scalar options
 // A merge only sets the leaves it carries, so without explicit deletes a
 // cleared Base URL / timeout would linger with its stale value.

@@ -26,15 +26,20 @@ export function splitLines(text) {
 function lcs(a, b) {
   const n = a.length;
   const m = b.length;
-  if ((n + 1) * (m + 1) > MAX_LCS_CELLS) return null;
 
-  // Trim the common prefix and suffix first: for a config edit this collapses
-  // almost the whole file and keeps the matrix tiny.
+  // Trim the common prefix and suffix BEFORE the size guard: for a config edit
+  // this collapses almost the whole file, and only the changed middle needs
+  // the matrix. Guarding the untrimmed size instead refused every file over
+  // ~2000 lines outright — a one-line change in a big config reported the
+  // whole file as added+removed with no hunks, which also disabled the diff
+  // confirm button downstream.
   let start = 0;
   while (start < n && start < m && a[start] === b[start]) start++;
   let endA = n;
   let endB = m;
   while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA--; endB--; }
+
+  if ((endA - start + 1) * (endB - start + 1) > MAX_LCS_CELLS) return null;
 
   const pairs = [];
   for (let i = 0; i < start; i++) pairs.push({ ai: i, bi: i });

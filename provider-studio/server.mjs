@@ -13,7 +13,7 @@ import { buildAutoFixChanges, planRefresh, runSelfCheck, isFreeEntry, buildRefre
 import { smartAudit } from "./src/smart-audit.mjs";
 import { loadDigest } from "./src/digest.mjs";
 import { buildManifest, buildGuide, TARGETS } from "./src/targets.mjs";
-import { FORMATS, slugify, decodeApiKey, detectApiFormat, isCustomProviderBlock, looksLikePackage } from "./src/formats.mjs";
+import { FORMATS, slugify, decodeApiKey, detectApiFormat, isCustomProviderBlock, looksLikePackage, modelEntryToForm } from "./src/formats.mjs";
 import { PRESETS } from "./src/presets.mjs";
 import {
   backupConfig, listBackups, restoreBackup, validateConfig, testConnection,
@@ -1014,16 +1014,10 @@ function decodeOpenProvider(key, p) {
   // provider root, where opencode never reads it. Fall back to it so importing
   // such a block does not lose the key that is plainly written in the file.
   const { useEnvVar, envVarName, apiKey } = decodeApiKey(p.options?.apiKey ?? p.apiKey);
-  const models = Object.entries(p.models || {}).map(([id, m]) => ({
-    id,
-    name: m?.name || id,
-    contextWindow: m?.limit?.context || 0,
-    maxOutput: m?.limit?.output || 0,
-    inputTypes: m?.modalities?.input || ["text"],
-    outputTypes: m?.modalities?.output || ["text"],
-    reasoning: !!m?.reasoning,
-    toolUse: m?.tool_call !== false,
-  }));
+  // One canonical translator, shared with the manage view: the inline copy
+  // used 0 for unknown limits, and 0 counts as "submitted" for managed keys —
+  // so re-saving an imported provider silently deleted every limit it had.
+  const models = Object.entries(p.models || {}).map(([id, m]) => modelEntryToForm(id, m));
   return {
     id: Date.now() + Math.floor(Math.random() * 1000),
     fromOpenCode: true,

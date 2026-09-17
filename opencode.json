@@ -690,7 +690,8 @@
       "name": "Xkiro",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
-        "baseURL": "https://api.xkiro.com/v1"
+        "baseURL": "https://api.xkiro.com/v1",
+        "apiKey": "{env:XKIRO_API_KEY}"
       },
       "models": {
         "qwen/qwen3.8-max:free": {
@@ -2680,7 +2681,8 @@
           "reasoning": true,
           "tool_call": true
         }
-      }
+      },
+      "env": ["XKIRO_API_KEY"]
     },
     "gorouter": {
       "name": "GoRouter",
