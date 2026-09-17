@@ -9,7 +9,8 @@ import {
 } from "./src/opencode.mjs";
 import { buildPreview } from "./src/diff.mjs";
 import { applyChangesVerified } from "./src/jsonc-edit.mjs";
-import { buildAutoFixChanges, planRefresh, runSelfCheck } from "./src/doctor.mjs";
+import { buildAutoFixChanges, planRefresh, runSelfCheck, isFreeEntry } from "./src/doctor.mjs";
+import { loadDigest } from "./src/digest.mjs";
 import { buildManifest, buildGuide, TARGETS } from "./src/targets.mjs";
 import { FORMATS, slugify, decodeApiKey, detectApiFormat, isCustomProviderBlock, looksLikePackage } from "./src/formats.mjs";
 import { PRESETS } from "./src/presets.mjs";
@@ -704,20 +705,33 @@ const server = http.createServer(async (req, res) => {
       const keys = Array.isArray(body.providers) && body.providers.length ? body.providers : null;
       const prune = body.prune === true;
       const plan = await planRefresh(cfg.config, { providerKeys: keys, prune });
+      // В превью pending раскрывается с free-меткой, чтобы интерфейс мог
+      // предложить «только бесплатные» без повторного опроса серверов.
+      const withFree = plan.map((p) => ({
+        ...p,
+        added: (p.pending || []).map((x) => ({
+          id: x.id,
+          free: isFreeEntry(x.entry),
+          ...(x.entry?.cost ? { cost: x.entry.cost } : {}),
+        })),
+      }));
       if (!body.apply) {
         return json(res, 200, {
           ok: true, path: cfg.path, hash: cfg.hash || "",
-          providers: plan.map(({ pending, ...rest }) => ({
+          providers: withFree.map(({ pending, ...rest }) => ({
             ...rest, addedCount: (rest.added || []).length,
             removedCount: (rest.removed || []).length,
-            pending: (pending || []).map((x) => x.id),
           })),
         });
       }
+      // Белый список моделей из превью: так «только бесплатные» применяется
+      // ровно к тому, что пользователь видел, а не к свежему опросу.
+      const only = Array.isArray(body.models) ? new Set(body.models.map((x) => String(x))) : null;
       const changes = [];
       for (const p of plan) {
         if (!p.ok) continue;
         for (const item of p.pending || []) {
+          if (only && !only.has(item.id)) continue;
           changes.push({ op: "merge", path: ["provider", p.key, "models", item.id], value: item.entry });
         }
         if (prune) {
@@ -793,6 +807,18 @@ const server = http.createServer(async (req, res) => {
         ok: true, label: entry.label, file: snap.file, preFile,
         hash: after.hash || "", backups: listBackups(), undo: null,
       });
+    }
+
+    // Ежедневный дайджест халявы и новостей (борд Ailyre, публичные JSON-фиды).
+    // Только чтение: кэш на 6 часов лежит в dataDir, при недоступности сети
+    // отдаётся протухший кэш с пометкой, а refresh=1 дёргает сеть принудительно.
+    if (url.pathname === "/api/digest" && req.method === "GET") {
+      try {
+        const digest = await loadDigest({ refresh: url.searchParams.get("refresh") === "1" });
+        return json(res, 200, { ok: true, ...digest });
+      } catch (e) {
+        return json(res, 200, { ok: false, error: `Дайджест недоступен: ${e?.message || e}`, perks: [], news: [] });
+      }
     }
 
     if (url.pathname === "/api/backup" && req.method === "POST") {

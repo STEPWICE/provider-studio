@@ -134,8 +134,9 @@ export function buildAutoFixChanges(config) {
       changes.push({ op: "delete", path: ["provider", key, "baseURL"] });
     }
 
-    if (!apiKeyHandled) fixApiKeyValue(key, p, changes, fixes, skipped);
+    if (!apiKeyHandled)     fixApiKeyValue(key, p, changes, fixes, skipped);
     fixHeaders(key, p, changes, fixes);
+    fixOptions(key, p, changes, fixes);
 
     const models = isPlainObject(p.models) ? p.models : null;
     if (models) {
@@ -232,6 +233,33 @@ function fixHeaders(key, p, changes, fixes) {
   if (!names.includes("anthropic-version")) {
     changes.push({ op: "merge", path: ["provider", key, "options"], value: { headers: { ...(isPlainObject(headers) ? headers : {}), "anthropic-version": ANTHROPIC_VERSION } } });
     fixes.push({ id: "no-anthropic-version", provider: key, message: `Провайдер «${key}»: добавлен заголовок anthropic-version` });
+  }
+}
+
+function fixOptions(key, p, changes, fixes) {
+  const opts = p.options;
+  if (opts === undefined || !opts || typeof opts !== "object" || Array.isArray(opts)) return;
+  const t = opts.timeout;
+  if (t !== undefined && !(typeof t === "number" && Number.isFinite(t) && t > 0)) {
+    changes.push({ op: "delete", path: ["provider", key, "options", "timeout"] });
+    fixes.push({ id: "bad-timeout", provider: key, message: `Провайдер «${key}»: убран некорректный options.timeout` });
+  }
+  const env = p.env;
+  if (env === undefined) return;
+  if (!Array.isArray(env)) {
+    changes.push({ op: "delete", path: ["provider", key, "env"] });
+    fixes.push({ id: "bad-env", provider: key, message: `Провайдер «${key}»: убран env не-массив` });
+    return;
+  }
+  const good = env.filter((n) => typeof n === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(n));
+  if (good.length !== env.length) {
+    if (good.length) {
+      changes.push({ op: "set", path: ["provider", key, "env"], value: good });
+      fixes.push({ id: "bad-env-name", provider: key, message: `Провайдер «${key}»: из env убраны записи, не похожие на имена переменных` });
+    } else {
+      changes.push({ op: "delete", path: ["provider", key, "env"] });
+      fixes.push({ id: "bad-env-name", provider: key, message: `Провайдер «${key}»: убран пустой после чистки env` });
+    }
   }
 }
 
@@ -387,6 +415,17 @@ export function discoveredToEntry(src) {
     costCacheWrite: src?.costCacheWrite,
   });
   return built ? built.entry : null;
+}
+
+/**
+ * Нулевая заявленная цена — это провайдер говорит «бесплатно». Неизвестная
+ * цена (cost нет) — не бесплатно: как и везде в инструменте, молчание не
+ * читается как «free», иначе платная модель попадёт в бесплатную выборку.
+ */
+export function isFreeEntry(entry) {
+  const c = entry?.cost;
+  return !!c && typeof c.input === "number" && typeof c.output === "number"
+    && c.input === 0 && c.output === 0;
 }
 
 /**

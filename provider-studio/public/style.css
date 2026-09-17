@@ -388,6 +388,11 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
 }
 .ext-change[hidden] { display: none !important; }
 
+/* Source links in the perks digest. Quiet by default: the list is scanned,
+   not read, so links must not compete with titles. */
+.digest-link { color: var(--accent-2); font-size: 11px; text-decoration: none; }
+.digest-link:hover { text-decoration: underline; }
+
 /* No max-width or top margin any more: these live in the side column, which
    sets its own width and spacing. Keeping the 720px cap would have left a gap
    inside a column that is often narrower than that anyway. */

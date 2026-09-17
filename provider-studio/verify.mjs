@@ -644,6 +644,14 @@ try {
           rs.end(JSON.stringify({ error: { message: "API key revoked" } }));
           return;
         }
+        // Responses API lives on its own path with its own body. A
+        // responses-only endpoint 404s /chat/completions, which used to read
+        // as a dead model rather than a wrong path.
+        if (seen.url === "/v1/responses") {
+          rs.writeHead(200, { "content-type": "application/json" });
+          rs.end(JSON.stringify({ output: [{ content: [{ text: "pong" }] }] }));
+          return;
+        }
         rs.writeHead(200, { "content-type": "application/json" });
         rs.end(JSON.stringify({ choices: [{ message: { content: "pong" } }] }));
       });
@@ -715,6 +723,20 @@ try {
     check("the anthropic format posts to /messages with x-api-key",
       anth.result?.ok === true && seen?.url === "/v1/messages" && seen?.xkey === "sk-anth",
       `${seen?.url} xkey=${seen?.xkey}`);
+
+    const resp = await (await post("/api/testchat", {
+      provider: { baseURL: chatURL, apiKey: "sk-chat", apiFormat: "openai-responses" },
+      modelId: "good-model",
+    })).json();
+    check("the responses format posts to /responses",
+      resp.result?.ok === true && seen?.url === "/v1/responses",
+      `${seen?.url} ${JSON.stringify(resp.result)}`);
+    {
+      const b = JSON.parse(seen?.body || "{}");
+      check("the responses probe uses the responses body shape",
+        b.input === "ping" && b.max_output_tokens > 2 && b.max_output_tokens <= 32 && b.messages === undefined,
+        seen?.body);
+    }
 
     // An unresolvable {env:VAR} must be named as such instead of producing a
     // generic auth failure.
@@ -931,6 +953,67 @@ try {
     check("a second undo reports nothing to revert", undoneAgain.ok === false, JSON.stringify(undoneAgain).slice(0, 160));
     const undoEmpty = await (await get("/api/state")).json();
     check("state stops advertising undo once spent", !undoEmpty.undo, JSON.stringify(undoEmpty.undo || null));
+  }
+
+  // ---- refresh-models: preview with free flags, whitelist apply, prune ----
+  // A local stub stands in for the gateway so the bytes of /models are fixed.
+  {
+    const modelStub = http.createServer((rq, rs) => {
+      rs.writeHead(200, { "Content-Type": "application/json" });
+      rs.end(JSON.stringify({ data: [
+        { id: "stub-free", pricing: { prompt: "0", completion: "0" } },
+        { id: "stub-paid", pricing: { prompt: "0.0000025", completion: "0.00001" } },
+      ] }));
+    });
+    await new Promise((r) => modelStub.listen(0, "127.0.0.1", r));
+    const modelsURL = `http://127.0.0.1:${modelStub.address().port}/v1`;
+    try {
+      const mk = await (await post("/api/apply", {
+        provider: { name: "Refreshable", baseURL: modelsURL, apiFormat: "openai-chat", setAsDefault: false, models: [{ id: "seed-model" }] },
+        targets: ["opencode"],
+      })).json();
+      check("refresh fixture provider applies",
+        mk.results?.opencode?.ok === true, JSON.stringify(mk).slice(0, 200));
+
+      const prev = await (await post("/api/refresh-models", { providers: ["refreshable"] })).json();
+      check("refresh preview succeeds", prev.ok === true, JSON.stringify(prev).slice(0, 200));
+      const rp = (prev.providers || []).find((p) => p.key === "refreshable");
+      const addedBy = Object.fromEntries((rp?.added || []).map((a) => [a.id, a.free]));
+      check("refresh finds both stub models with correct free flags",
+        addedBy["stub-free"] === true && addedBy["stub-paid"] === false, JSON.stringify(rp?.added));
+      check("the seed model shows up as removed",
+        (rp?.removed || []).includes("seed-model"), JSON.stringify(rp?.removed));
+
+      const onlyFree = await (await post("/api/refresh-models", {
+        providers: ["refreshable"], apply: true, models: ["stub-free"], hash: prev.hash,
+      })).json();
+      check("whitelisted apply succeeds", onlyFree.ok === true, JSON.stringify(onlyFree).slice(0, 200));
+      const cfgAfterFree = readConfigFile();
+      check("only the whitelisted model is added",
+        !!cfgAfterFree.provider?.refreshable?.models?.["stub-free"] &&
+        !cfgAfterFree.provider?.refreshable?.models?.["stub-paid"],
+        Object.keys(cfgAfterFree.provider?.refreshable?.models || {}));
+      check("a free model records its zero cost",
+        cfgAfterFree.provider?.refreshable?.models?.["stub-free"]?.cost?.input === 0 &&
+        cfgAfterFree.provider?.refreshable?.models?.["stub-free"]?.cost?.output === 0,
+        JSON.stringify(cfgAfterFree.provider?.refreshable?.models?.["stub-free"]?.cost));
+
+      const prev2 = await (await post("/api/refresh-models", { providers: ["refreshable"] })).json();
+      const rp2 = (prev2.providers || []).find((p) => p.key === "refreshable");
+      check("an added model is no longer pending",
+        (rp2?.added || []).map((a) => a.id).join(",") === "stub-paid",
+        JSON.stringify(rp2?.added));
+
+      const pruned = await (await post("/api/refresh-models", {
+        providers: ["refreshable"], apply: true, prune: true, hash: prev2.hash,
+      })).json();
+      check("prune apply succeeds", pruned.ok === true, JSON.stringify(pruned).slice(0, 200));
+      const keys = Object.keys(readConfigFile().provider?.refreshable?.models || {}).sort();
+      check("prune adds the rest and drops the ghost",
+        JSON.stringify(keys) === JSON.stringify(["stub-free", "stub-paid"]), keys);
+    } finally {
+      await new Promise((r) => modelStub.close(r));
+    }
   }
 } finally {
   child.kill();

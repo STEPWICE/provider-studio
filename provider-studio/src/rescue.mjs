@@ -224,6 +224,7 @@ export function validateConfig(config) {
 
     validateApiKey(key, p, issues);
     validateHeaders(key, p, issues);
+    validateOptions(key, p, issues);
 
     const models = p.models && typeof p.models === "object" && !Array.isArray(p.models)
       ? Object.entries(p.models) : [];
@@ -236,8 +237,57 @@ export function validateConfig(config) {
     for (const [mid, m] of models) validateModel(key, mid, m, issues);
   }
 
+  // Два провайдера на один адрес — почти всегда копипаст из соседнего блока:
+  // запросы уходят не туда, а ключ проверяется не тот. Только предупреждение:
+  // зеркала одного шлюза существуют намеренно, и удалять тут нечего.
+  const seenBase = new Map();
+  for (const [key, p] of Object.entries(config.provider)) {
+    if (!p || typeof p !== "object" || Array.isArray(p) || p.type === "local") continue;
+    const raw = p.options?.baseURL;
+    const base = typeof raw === "string" ? raw.trim().replace(/\/+$/, "").toLowerCase() : "";
+    if (!base) continue;
+    if (seenBase.has(base)) {
+      issues.push(issue("warn", "duplicate-baseurl",
+        `Провайдеры «${seenBase.get(base)}» и «${key}» указывают на один Base URL — обычно это копипаст`,
+        { provider: key }));
+    } else {
+      seenBase.set(base, key);
+    }
+  }
+
   validateDefaultModel(config, issues);
   return issues;
+}
+
+// Таймаут и env-массив руками пишут редко, но когда пишут — пишут как попало:
+// строкой, нулём или отрицательным. Нулевой таймаут означает «не ждать вообще»,
+// и первый же запрос умирает, а чинится это удалением поля.
+function validateOptions(key, p, issues) {
+  const opts = p.options;
+  // timeout живёт в options, а env — на верхнем уровне: проверять одно только
+  // при наличии другого — значит пропускать половину битого.
+  if (opts !== undefined && opts && typeof opts === "object" && !Array.isArray(opts)) {
+    const t = opts.timeout;
+    if (t !== undefined && !(typeof t === "number" && Number.isFinite(t) && t > 0)) {
+      issues.push(issue("error", "bad-timeout",
+        `Провайдер «${key}»: options.timeout должен быть положительным числом, сейчас: ${JSON.stringify(t)}`,
+        { provider: key, fixable: true }));
+    }
+  }
+  const env = p.env;
+  if (env === undefined) return;
+  if (!Array.isArray(env)) {
+    issues.push(issue("error", "bad-env",
+      `Провайдер «${key}»: env должен быть массивом имён переменных`,
+      { provider: key, fixable: true }));
+    return;
+  }
+  // Одного сообщения на провайдера достаточно: дальше всё равно правится списком.
+  if (env.some((n) => typeof n !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(n))) {
+    issues.push(issue("error", "bad-env-name",
+      `Провайдер «${key}»: в env есть запись, не похожая на имя переменной — opencode её не подставит`,
+      { provider: key, fixable: true }));
+  }
 }
 
 function validateApiKey(key, p, issues) {
@@ -787,22 +837,9 @@ export async function testCompletion({ baseURL, apiKey, apiFormat, modelId } = {
   const auth = probeHeaders(apiKey, apiFormat);
   if (auth.problem) return { ok: false, message: auth.problem, fault: "key" };
 
-  const anthropic = String(apiFormat || "").includes("anthropic");
   const base = guard.url.toString().replace(/\/+$/, "");
-  const path = anthropic ? "/messages" : "/chat/completions";
-  // Uses the same rule as discovery: a version segment anywhere in the path
-  // means the base is already inside the API. Appending "/v1" to Google's
-  // `/v1beta/openai` produced `/v1beta/openai/v1/chat/completions`, which is a
-  // different URL that happens to return the same 400 for a missing key — so
-  // the mistake stayed invisible until a real key was used.
-  const target = hasVersionSegment(new URL(base).pathname) ? base + path : base + "/v1" + path;
-  // 16, not 1. Asking for a single token is the cheapest possible probe, but
-  // some gateways reject it outright ("max_tokens must be greater than 2") and
-  // the tool then blamed the model for a limit the probe itself had picked.
-  // 16 tokens is still a rounding error in cost and clears those minimums.
-  const body = anthropic
-    ? { model, max_tokens: PROBE_MAX_TOKENS, messages: [{ role: "user", content: "ping" }] }
-    : { model, max_tokens: PROBE_MAX_TOKENS, messages: [{ role: "user", content: "ping" }], stream: false };
+  const target = completionTarget(base, apiFormat);
+  const body = completionBody(model, apiFormat);
 
   const headers = { ...auth.headers, "Content-Type": "application/json" };
   let r;
@@ -879,6 +916,50 @@ export async function testCompletion({ baseURL, apiKey, apiFormat, modelId } = {
     return { ok: false, reach: "up", fault: "model", status: r.status, message: `Запрос отклонён (${r.status})${tail}` };
   }
   return { ok: false, reach: "up", fault: "endpoint", status: r.status, message: `HTTP ${r.status}${tail}` };
+}
+
+/**
+ * Where a live completion probe goes, by API format.
+ *
+ * A responses-only endpoint answers /chat/completions with 404, and probing
+ * it the chat way reported a working provider as a dead model. Exported so
+ * the rule is unit-testable without standing up a server.
+ */
+export function completionTarget(baseURL, apiFormat) {
+  const base = String(baseURL || "").replace(/\/+$/, "");
+  const fmt = String(apiFormat || "");
+  const path = fmt.includes("anthropic") ? "/messages"
+    : fmt.includes("responses") ? "/responses"
+    : "/chat/completions";
+  // Same rule as discovery: a version segment anywhere in the path means the
+  // base is already inside the API. Appending "/v1" to Google's
+  // `/v1beta/openai` produced `/v1beta/openai/v1/chat/completions`, which is a
+  // different URL that happens to return the same 400 for a missing key — so
+  // the mistake stayed invisible until a real key was used.
+  let prefix = "/v1";
+  try {
+    prefix = hasVersionSegment(new URL(base).pathname) ? "" : "/v1";
+  } catch { /* unparseable base: guarded earlier, default to /v1 */ }
+  return base + prefix + path;
+}
+
+/**
+ * What a live completion probe sends, by API format.
+ *
+ * Responses API speaks its own body (input/max_output_tokens, no messages and
+ * no stream flag). The budget rule is shared: 16 tokens, not 1 — asking for a
+ * single token is the cheapest possible probe, but some gateways reject it
+ * outright ("max_tokens must be greater than 2") and the tool then blamed the
+ * model for a limit the probe itself had picked.
+ */
+export function completionBody(model, apiFormat) {
+  const fmt = String(apiFormat || "");
+  if (fmt.includes("responses")) {
+    return { model, input: "ping", max_output_tokens: PROBE_MAX_TOKENS };
+  }
+  const body = { model, max_tokens: PROBE_MAX_TOKENS, messages: [{ role: "user", content: "ping" }] };
+  if (!fmt.includes("anthropic")) body.stream = false;
+  return body;
 }
 
 /** Pulls the human-readable message out of a provider's error body. */

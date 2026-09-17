@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.mjs",
     "build": "node build-sea.mjs",
-    "verify": "node verify-jsonc.mjs && node verify-paths.mjs && node verify-env.mjs && node verify-formats.mjs && node verify-diff.mjs && node verify-rescue.mjs && node verify-catalog.mjs && node verify-batch.mjs && node verify-doctor.mjs && node verify.mjs && node verify-ui.mjs && node verify-sea.mjs",
+    "verify": "node verify-jsonc.mjs && node verify-paths.mjs && node verify-env.mjs && node verify-formats.mjs && node verify-diff.mjs && node verify-rescue.mjs && node verify-catalog.mjs && node verify-batch.mjs && node verify-doctor.mjs && node verify-digest.mjs && node verify.mjs && node verify-ui.mjs && node verify-sea.mjs",
     "verify:exe": "node build-sea.mjs && node verify-sea.mjs"
   },
   "devDependencies": {

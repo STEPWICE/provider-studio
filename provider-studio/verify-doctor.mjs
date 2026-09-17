@@ -162,6 +162,45 @@ function applyOk(configObj, label) {
   check("$schema добавлен", second.applied.value?.["$schema"] === D.SCHEMA_URL);
 }
 
+// ------------------------------------------------------- options: timeout/env
+{
+  const { applied, fixes } = applyOk({
+    $schema: "https://opencode.ai/config.json",
+    provider: {
+      a: {
+        npm: "x", env: ["GOOD_KEY", "has-dash"],
+        options: { baseURL: "https://a.dev", timeout: 0 },
+        models: { m: {} },
+      },
+    },
+    model: "a/m",
+  }, "options");
+  eq("битый timeout удалён", applied.value?.provider?.a?.options?.timeout, undefined);
+  eq("из env убрана только битая запись", applied.value?.provider?.a?.env, ["GOOD_KEY"]);
+  check("фиксы названы",
+    fixes.some((f) => f.id === "bad-timeout") && fixes.some((f) => f.id === "bad-env-name"));
+  const errs = validateConfig(applied.value).filter((i) => i.severity === "error");
+  check("после автофикса ошибок не остаётся", errs.length === 0, JSON.stringify(errs.map((i) => i.id)));
+
+  // Дубли baseURL — предупреждение для человека, а не правка: какое из двух
+  // зеркало, а какое копипаст, знает только владелец.
+  const dupText = JSON.stringify({
+    $schema: "https://opencode.ai/config.json",
+    provider: {
+      a: { npm: "x", options: { baseURL: "https://same.dev/v1" }, models: { m: {} } },
+      b: { npm: "x", options: { baseURL: "https://same.dev/v1" }, models: { m: {} } },
+    },
+    model: "a/m",
+  });
+  const dup = D.buildAutoFixChanges(JSON.parse(dupText));
+  const dupApplied = applyChangesVerified(dupText, dup.changes);
+  check("дубль baseURL не правится молча",
+    dupApplied.ok === true
+    && dupApplied.value?.provider?.a?.options?.baseURL === "https://same.dev/v1"
+    && dupApplied.value?.provider?.b?.options?.baseURL === "https://same.dev/v1",
+    JSON.stringify(dup.changes));
+}
+
 // ------------------------------------------------------- план обновления
 {
   const sync = D.planModelSync(
@@ -216,6 +255,17 @@ function applyOk(configObj, label) {
     },
   }, { providerKeys: ["one"], fetchFn: stub });
   eq("фильтр по провайдерам работает", only.map((p) => p.key), ["one"]);
+}
+
+// ------------------------------------------------------- free-метка записей
+{
+  check("нулевая цена — бесплатно", D.isFreeEntry({ cost: { input: 0, output: 0 } }) === true);
+  check("ненулевая цена — платно", D.isFreeEntry({ cost: { input: 2.5, output: 10 } }) === false);
+  // Неизвестная цена — не бесплатно: иначе платная модель попадёт в выборку
+  // «только бесплатные» и счёт придёт сюрпризом.
+  check("нет цены — не бесплатно", D.isFreeEntry({}) === false);
+  check("полцены — не цена", D.isFreeEntry({ cost: { input: 0 } }) === false);
+  check("мусор не роняет", D.isFreeEntry(null) === false && D.isFreeEntry("x") === false);
 }
 
 // ------------------------------------------------------- самопроверка

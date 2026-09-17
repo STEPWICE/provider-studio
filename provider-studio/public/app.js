@@ -214,6 +214,10 @@ async function init() {
   $("#btnValidate").addEventListener("click", validate);
   $("#btnBackupNow").addEventListener("click", backupNow);
   $("#btnUndo").addEventListener("click", doUndo);
+  $("#btnPerks").addEventListener("click", async () => {
+    setBtnLoading($("#btnPerks"), true);
+    try { await renderDigest(false); } finally { setBtnLoading($("#btnPerks"), false); }
+  });
   $("#extChangeBtn").addEventListener("click", async () => {
     $("#extChange").hidden = true;
     state.extNotifiedHash = "";
@@ -2221,44 +2225,89 @@ async function doRefreshModels() {
     if (st) st.textContent = "В конфиге нет провайдеров для обновления.";
     return;
   }
-  const totalAdd = rows.reduce((n, p) => n + (p.addedCount || (p.added || []).length), 0);
-  const totalDel = prune ? rows.reduce((n, p) => n + (p.removedCount || (p.removed || []).length), 0) : 0;
-  if (st) st.textContent = `Новых моделей: ${totalAdd}${prune ? `, пропавших: ${totalDel}` : ""}`;
-  if (out) {
-    out.innerHTML = rows.map((p) => {
-      const added = asArray(p.added || (p.pending || []));
-      const removed = prune ? asArray(p.removed) : [];
-      const detail = p.ok
-        ? `${added.length ? `+ ${esc(added.slice(0, 8).join(", "))}${added.length > 8 ? `\u2026 (+${added.length - 8})` : ""}` : "нового нет"}`
-          + `${removed.length ? `<br>− ${esc(removed.slice(0, 8).join(", "))}${removed.length > 8 ? `\u2026` : ""}` : ""}`
-        : esc(p.message || "ошибка");
-      return `<div class="diag-row"><span class="diag-name">${esc(p.key)}</span>`
-        + `<span class="diag-meta">${p.ok ? `всего на сервере: ${p.total ?? "?"}` : "не опрошен"}</span></div>`
-        + `<div class="diag-sub">${detail}</div>`;
-    }).join("")
-      + (totalAdd || totalDel ? `<div class="diag-fix"><button class="btn btn-mini" id="diagRefreshApply" type="button">Применить (${totalAdd + totalDel})</button></div>` : "");
-    const applyBtn = $("#diagRefreshApply");
-    if (applyBtn) {
-      applyBtn.onclick = async () => {
-        setBtnLoading(applyBtn, true);
-        try {
-          const res = await api("/api/refresh-models", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ configPath: state.configPath, hash: state.configHash, prune, apply: true }),
-          });
-          if (res && res.conflict) await refreshConfigState();
-          if (!res || !res.ok) return toast((res && res.error) || "Не удалось записать модели", "err");
-          if (res.hash) state.configHash = res.hash;
-          if (res.backupFile) setBackupInfo(`\u21bb Автобэкап: ${res.backupFile}`);
-          refreshBackups();
-          refreshUndo();
-          toast(res.noop ? "Модели уже актуальны" : "Список моделей обновлён. Перезапусти opencode.", "ok");
-          await diagnose();
-        } finally {
-          setBtnLoading(applyBtn, false);
-        }
-      };
+  // План целиком — в память: фильтр «только бесплатные» применяется локально,
+  // без повторного опроса серверов, а на запись уходит белый список id.
+  state.refreshPlan = rows;
+  renderRefreshPlan();
+}
+
+function refreshSelectedIds() {
+  const freeOnly = $("#diagFreeOnly") ? $("#diagFreeOnly").checked : false;
+  const ids = [];
+  for (const p of asArray(state.refreshPlan)) {
+    if (!p.ok) continue;
+    for (const a of asArray(p.added)) {
+      const id = typeof a === "string" ? a : a.id;
+      const free = typeof a === "object" && !!a.free;
+      if (id && (!freeOnly || free)) ids.push(id);
     }
+  }
+  return ids;
+}
+
+function renderRefreshPlan() {
+  const st = $("#diagActionStatus");
+  const out = $("#diagActionOut");
+  const rows = asArray(state.refreshPlan);
+  const prune = $("#diagPrune") ? $("#diagPrune").checked : false;
+  const freeOnly = $("#diagFreeOnly") ? $("#diagFreeOnly").checked : false;
+  const totalAdd = rows.reduce((n, p) => n + asArray(p.added).length, 0);
+  const totalDel = prune ? rows.reduce((n, p) => n + (p.removedCount || asArray(p.removed).length), 0) : 0;
+  const willApply = refreshSelectedIds().length;
+  if (st) st.textContent = `Новых моделей: ${totalAdd}${freeOnly ? " (показаны к записи только бесплатные)" : ""}${prune ? `, пропавших: ${totalDel}` : ""}`;
+  if (!out) return;
+  const fmtAdded = (added) => {
+    const list = asArray(added);
+    if (!list.length) return "нового нет";
+    return "+ " + list.slice(0, 8).map((a) => {
+      const id = typeof a === "string" ? a : a.id;
+      const free = typeof a === "object" && !!a.free;
+      const dim = freeOnly && !free ? ` style="opacity:.45"` : "";
+      return `<span${dim}>${esc(id)}${free ? ` <span class="tag free">free</span>` : ""}</span>`;
+    }).join(", ") + (list.length > 8 ? `\u2026 (+${list.length - 8})` : "");
+  };
+  out.innerHTML = rows.map((p) => {
+    const removed = prune ? asArray(p.removed) : [];
+    const detail = p.ok
+      ? `${fmtAdded(p.added)}`
+        + `${removed.length ? `<br>− ${esc(removed.slice(0, 8).join(", "))}${removed.length > 8 ? `\u2026` : ""}` : ""}`
+      : esc(p.message || "ошибка");
+    return `<div class="diag-row"><span class="diag-name">${esc(p.key)}</span>`
+      + `<span class="diag-meta">${p.ok ? `всего на сервере: ${p.total ?? "?"}` : "не опрошен"}</span></div>`
+      + `<div class="diag-sub">${detail}</div>`;
+  }).join("")
+    + ((totalAdd || totalDel)
+      ? `<div class="diag-fix">`
+        + `<label class="check-line"><input type="checkbox" id="diagFreeOnly"${freeOnly ? " checked" : ""} /> только бесплатные</label>`
+        + `<button class="btn btn-mini" id="diagRefreshApply" type="button">Применить (${willApply + totalDel})</button></div>`
+      : "");
+  const freeBox = $("#diagFreeOnly");
+  if (freeBox) freeBox.onchange = () => renderRefreshPlan();
+  const applyBtn = $("#diagRefreshApply");
+  if (applyBtn) {
+    applyBtn.onclick = async () => {
+      setBtnLoading(applyBtn, true);
+      try {
+        const res = await api("/api/refresh-models", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            configPath: state.configPath, hash: state.configHash,
+            prune: $("#diagPrune") ? $("#diagPrune").checked : false,
+            apply: true, models: refreshSelectedIds(),
+          }),
+        });
+        if (res && res.conflict) await refreshConfigState();
+        if (!res || !res.ok) return toast((res && res.error) || "Не удалось записать модели", "err");
+        if (res.hash) state.configHash = res.hash;
+        if (res.backupFile) setBackupInfo(`\u21bb Автобэкап: ${res.backupFile}`);
+        refreshBackups();
+        refreshUndo();
+        toast(res.noop ? "Модели уже актуальны" : "Список моделей обновлён. Перезапусти opencode.", "ok");
+        await diagnose();
+      } finally {
+        setBtnLoading(applyBtn, false);
+      }
+    };
   }
 }
 
@@ -2287,6 +2336,58 @@ async function doSelfCheck() {
     ).join("");
   }
   toast(bad ? "Самопроверка: есть проблемы" : "Самопроверка: всё в порядке", bad ? "err" : "ok");
+}
+
+/**
+ * Daily freebies digest: what providers are giving away right now (promos,
+ * trials, student plans) plus the service news that affect availability.
+ * Read-only by design — a perk is a lead to check, not a button that spends.
+ */
+async function renderDigest(force) {
+  const el = $("#issues");
+  el.hidden = false;
+  el.innerHTML = `<div class="result-card"><h3>Халява</h3><div class="ok-line" style="color:var(--muted)">Загружаю…</div></div>`;
+  syncSidePlaceholder();
+  const r = await api("/api/digest" + (force ? "?refresh=1" : ""));
+  if (!r || (!r.ok && !asArray(r.perks).length && !asArray(r.news).length)) {
+    el.innerHTML = `<div class="result-card"><h3>Халява</h3>`
+      + `<div class="err-line">\u2715 ${esc((r && r.error) || "не удалось загрузить")}</div></div>`;
+    return toast("Дайджест недоступен", "err");
+  }
+  const perks = asArray(r.perks);
+  const news = asArray(r.news);
+  const when = r.as_of ? `данные борда на ${esc(r.as_of)}` : "дата неизвестна";
+  const stale = r.stale ? ` \u00b7 <span class="warn-line">кэш (сеть недоступна)</span>` : "";
+  let html = `<div class="result-card"><h3>Халява</h3>`
+    + `<div class="ok-line" style="color:var(--muted)">${when}${stale}</div>`
+    + `<div class="diag-fix"><button class="btn btn-mini" id="digestRefresh" type="button">Обновить</button></div>`
+    + `<div class="diag-sect">Раздают (${perks.length})</div>`;
+  if (!perks.length) html += `<div class="ok-line" style="color:var(--muted)">\u2014 пусто \u2014</div>`;
+  for (const p of perks) {
+    const badge = p.status === "upcoming" ? "скоро" : p.status === "active" ? "идёт" : esc(p.status || "");
+    html += `<div class="diag-row"><span class="diag-name">${esc(p.title || p.id || "?")}</span>`
+      + `<span class="tag">${esc(badge)}</span></div>`
+      + `<div class="diag-sub">${esc([p.provider, p.product].filter(Boolean).join(" · "))}`
+      + `${p.window ? ` \u00b7 ${esc(p.window)}` : ""}</div>`
+      + (p.summary ? `<div class="diag-sub">${esc(p.summary)}</div>` : "")
+      + (p.claim ? `<div class="diag-sub">Как забрать: ${esc(p.claim)}</div>` : "")
+      + (p.source ? `<div class="diag-sub"><a class="digest-link" href="${esc(p.source)}" target="_blank" rel="noopener">источник \u2197</a></div>` : "");
+  }
+  html += `<div class="diag-sect">Новости (${news.length})</div>`;
+  if (!news.length) html += `<div class="ok-line" style="color:var(--muted)">\u2014 пусто \u2014</div>`;
+  for (const n of news.slice(0, 12)) {
+    html += `<div class="diag-row"><span class="diag-name">${esc(n.title || n.id || "?")}</span></div>`
+      + `<div class="diag-sub">${esc([n.provider, n.product].filter(Boolean).join(" · "))}`
+      + (n.source ? ` \u00b7 <a class="digest-link" href="${esc(n.source)}" target="_blank" rel="noopener">источник \u2197</a>` : "")
+      + `</div>`;
+  }
+  html += `</div>`;
+  el.innerHTML = html;
+  const rb = $("#digestRefresh");
+  if (rb) rb.onclick = async () => {
+    setBtnLoading(rb, true);
+    try { await renderDigest(true); } finally { setBtnLoading(rb, false); }
+  };
 }
 
 /**

@@ -191,6 +191,37 @@ check("a whitespace-only env var counts as unset",
   has({ provider: { a: { npm: "x", options: { apiKey: "{env:PS_TEST_KEY_BLANK}" }, models: {} } } }, "env-missing"));
 delete process.env.PS_TEST_KEY_BLANK;
 
+// options.timeout must be a positive number; env must hold valid var names.
+check("a string timeout is an error",
+  has({ provider: { a: { npm: "x", options: { timeout: "fast" }, models: {} } } }, "bad-timeout"));
+check("a zero timeout is an error",
+  has({ provider: { a: { npm: "x", options: { timeout: 0 }, models: {} } } }, "bad-timeout"));
+check("a positive timeout is accepted",
+  !has({ provider: { a: { npm: "x", options: { timeout: 30000 }, models: {} } } }, "bad-timeout"));
+check("a non-array env is an error",
+  has({ provider: { a: { npm: "x", env: "FOO", models: {} } } }, "bad-env"));
+check("an invalid env entry is an error",
+  has({ provider: { a: { npm: "x", env: ["GOOD_KEY", "has-dash"], models: {} } } }, "bad-env-name"));
+check("valid env entries are accepted",
+  !has({ provider: { a: { npm: "x", env: ["GOOD_KEY"], models: {} } } }, "bad-env-name"));
+// Two providers on one address are almost always a copy-paste. A warning, not
+// an error: mirrors of one gateway exist on purpose.
+{
+  const dup = R.validateConfig({ provider: {
+    a: { npm: "x", options: { baseURL: "https://same.dev/v1/" }, models: {} },
+    b: { npm: "x", options: { baseURL: "https://same.dev/v1" }, models: {} },
+  } });
+  check("a shared baseURL is reported",
+    dup.some((i) => i.id === "duplicate-baseurl"), JSON.stringify(dup.map((i) => i.id)));
+  check("a shared baseURL is only a warning",
+    dup.filter((i) => i.id === "duplicate-baseurl").every((i) => i.severity === "warn"));
+  check("distinct baseURLs are not reported",
+    !has({ provider: {
+      a: { npm: "x", options: { baseURL: "https://one.dev/v1" }, models: {} },
+      b: { npm: "x", options: { baseURL: "https://two.dev/v1" }, models: {} },
+    } }, "duplicate-baseurl"));
+}
+
 // Anthropic-compatible endpoints need a version header to authenticate.
 check("a raw anthropic block without anthropic-version is flagged",
   has({ provider: { a: { api: "anthropic", options: { baseURL: "https://a.dev" }, models: {} } } }, "no-anthropic-version"));
@@ -283,6 +314,36 @@ const blockedProbe = await R.testConnection({ baseURL: "http://169.254.169.254/"
 check("testConnection refuses the metadata address", blockedProbe.ok === false, JSON.stringify(blockedProbe));
 const deadModels = await R.fetchModels({ baseURL: "http://127.0.0.1:1/v1" });
 check("fetchModels fails cleanly on a dead endpoint", deadModels.ok === false && Array.isArray(deadModels.models), JSON.stringify(deadModels));
+
+// ------------------------------------------------- completion target/body
+// A responses-only endpoint answers /chat/completions with 404. Probing it the
+// chat way reported a working provider as a dead model, so the format decides
+// both the path and the body shape.
+{
+  eq("chat posts to /chat/completions",
+    R.completionTarget("https://x.dev/v1", "openai-chat"), "https://x.dev/v1/chat/completions");
+  eq("a version anywhere in the path suppresses the extra /v1",
+    R.completionTarget("https://x.dev/v1beta/openai", "openai-chat"), "https://x.dev/v1beta/openai/chat/completions");
+  eq("a bare host gets /v1",
+    R.completionTarget("https://x.dev/openai", "openai-chat"), "https://x.dev/openai/v1/chat/completions");
+  eq("anthropic posts to /messages",
+    R.completionTarget("https://x.dev/v1", "anthropic"), "https://x.dev/v1/messages");
+  eq("responses posts to /responses",
+    R.completionTarget("https://x.dev/v1", "openai-responses"), "https://x.dev/v1/responses");
+  eq("responses keeps the version rule too",
+    R.completionTarget("https://x.dev/openai", "openai-responses"), "https://x.dev/openai/v1/responses");
+
+  const chat = R.completionBody("m", "openai-chat");
+  eq("chat sends messages without streaming", [chat.model, chat.max_tokens, chat.stream, Array.isArray(chat.messages)],
+    ["m", 16, false, true]);
+  const anth = R.completionBody("m", "anthropic");
+  check("anthropic sends no stream flag", anth.stream === undefined, JSON.stringify(anth));
+  const resp = R.completionBody("m", "openai-responses");
+  eq("responses speaks its own body", [resp.model, resp.input, resp.max_output_tokens, resp.messages],
+    ["m", "ping", 16, undefined]);
+  check("the probe stays cheap in every format",
+    [chat.max_tokens, resp.max_output_tokens].every((n) => n > 2 && n <= 32));
+}
 
 // ------------------------------------------------- probe auth headers
 // Format decides the header name: an anthropic endpoint ignores Bearer, so
