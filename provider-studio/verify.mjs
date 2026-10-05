@@ -409,6 +409,28 @@ try {
   const noName = await post("/api/apply", { provider: { name: "   ", baseURL: "https://x/v1", models: [] }, targets: ["opencode"] });
   check("apply rejects an empty name with 400", noName.status === 400, noName.status);
 
+  // ---- the schema gate blocks only what the write ADDS, never pre-existing dirt ----
+  writeFileSync(CONFIG, JSON.stringify({
+    $schema: "https://opencode.ai/config.json",
+    provider: {
+      legacy: {
+        npm: "@ai-sdk/openai-compatible", name: "Legacy",
+        options: { baseURL: "https://legacy.example/v1" },
+        models: { "legacy-model": { name: "Legacy Model" } },
+        handWritten: true,
+      },
+    },
+    model: "legacy/legacy-model",
+  }, null, 2), "utf8");
+  const dirtyApply = await (await post("/api/apply", {
+    provider: { name: "Gate Test", baseURL: "https://gate.example/v1", apiFormat: "openai-chat", setAsDefault: false, models: [{ id: "g" }] },
+    targets: ["opencode"],
+  })).json();
+  check("apply over a config with pre-existing dirt succeeds",
+    dirtyApply.ok === true && dirtyApply.results?.opencode?.ok === true, JSON.stringify(dirtyApply).slice(0, 300));
+  check("the write neither cleans nor spreads someone else's dirt",
+    readConfigFile().provider?.legacy?.handWritten === true, JSON.stringify(readConfigFile().provider?.legacy));
+
   // ---- backup / restore ----
   const bk = await (await post("/api/backup", {})).json();
   check("/api/backup creates a snapshot", !!bk.file && Array.isArray(bk.backups) && bk.backups.length > 0, JSON.stringify(bk).slice(0, 200));

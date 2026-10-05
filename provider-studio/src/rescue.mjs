@@ -201,6 +201,24 @@ function issue(severity, id, message, extra = {}) {
 }
 
 /**
+ * Errors the write would ADD, ignoring ones already there. A patcher bug must
+ * not be able to hand opencode a config it rejects: with
+ * additionalProperties:false a single stray field invalidates every provider,
+ * so the write is refused instead of landing. Pre-existing errors never block —
+ * fixing the file is the doctor's job, not the price of every save.
+ * Environment-state issues (env-missing and friends) never block either: they
+ * describe the machine, not the text — a variable that does not exist yet is
+ * the normal order of operations (apply first, setx second, one-click offer
+ * included), and blocking on it would brick every first-time setup.
+ */
+const ENV_STATE_IDS = new Set(["env-missing", "env-not-inherited", "env-truncated"]);
+export function introducedErrors(beforeConfig, afterConfig) {
+  const key = (i) => [i.severity, i.id, i.provider || "", i.model || "", i.field || ""].join("\u0000");
+  const before = new Set(validateConfig(beforeConfig).filter((i) => i.severity === "error").map(key));
+  return validateConfig(afterConfig).filter((i) => i.severity === "error" && !ENV_STATE_IDS.has(i.id) && !before.has(key(i)));
+}
+
+/**
  * Reports what would stop this config from working, worst first.
  * Only reports what is actually checkable here; anything requiring the network
  * belongs in the diagnostics endpoint.
@@ -542,6 +560,19 @@ function validateModel(key, mid, m, issues) {
           `Модель «${key}/${mid}»: output (${m.limit.output}) больше context (${m.limit.context}) — проверь значения`,
           { provider: key, model: mid }));
       }
+      // Агентская работа = длинные ответы: с выходом меньше ~1K модель будет
+      // обрезать код и рассуждения на полуслове. Значение при этом может быть
+      // честным (провайдер так заявил) — поэтому warn, а не error и без автофикса.
+      if (hasOut && m.limit.output < 1024) {
+        issues.push(issue("warn", "tiny-output",
+          `Модель «${key}/${mid}»: выход всего ${m.limit.output} токенов — ответы будут обрезаться, для агентской работы мало`,
+          { provider: key, model: mid }));
+      }
+      if (hasCtx && m.limit.context < 8000) {
+        issues.push(issue("warn", "small-context",
+          `Модель «${key}/${mid}»: контекст всего ${m.limit.context} токенов — средний чат с кодом в него не влезет`,
+          { provider: key, model: mid }));
+      }
     }
   }
 
@@ -594,9 +625,17 @@ function validateDefaultModel(config, issues) {
     }
     const [prov, ...rest] = value.split("/");
     const mdl = rest.join("/");
-    if (!config.provider?.[prov]?.models?.[mdl]) {
+    const target = config.provider?.[prov]?.models?.[mdl];
+    if (!target) {
       issues.push(issue("warn", field === "model" ? "bad-default" : "bad-small-model",
         `Модель ${value} (${field}) не найдена среди провайдеров`, { fixable: true, field }));
+      continue;
+    }
+    // Агент без инструментов — это чат: дефолт на модели с tool_call:false
+    // тихо лишает opencode скиллов и вызовов на каждом запросе.
+    if (target && typeof target === "object" && !Array.isArray(target) && target.tool_call === false) {
+      issues.push(issue("warn", field === "model" ? "default-no-tools" : "small-model-no-tools",
+        `Модель ${value} (${field}) с tool_call:false — агент не сможет вызывать инструменты и скиллы`, { fixable: true, field }));
     }
   }
 }
@@ -1133,7 +1172,12 @@ function providerErrorMessage(raw) {
 // ----------------------------------------------------------- model discovery
 
 const VISION_PATTERN = /(vision|image|\bvl\b|gpt-4o|gpt-4\.1|gpt-5|omni|qwen.*-vl|llava|pixtral|moondream|glm-4v|internvl|minicpm-v|phi-3.*vision)/i;
-const REASON_PATTERN = /(reason|reasoning|\bthink\b|thinking|deepseek-r\d|deepseek-reasoner|\br1\b|\bo1\b|\bo3\b|\bo4\b|openthink|qwq|kimi-k2|flash-thinking|glm-.+-air|o3-mini)/i;
+// Явные маркеры ОТСУТСТВИЯ thinking (проверены по каталогу models.dev):
+// gemini-2.5-flash-nothink, grok-4-fast-non-reasoning, gpt-5.1-chat-latest —
+// реально без thinking, хотя содержат "think"/"reasoning"/"gpt-5" как
+// подстроки. Отрицание проверяется первым и бьёт любую догадку ниже.
+const NO_REASON_PATTERN = /nothink|non-reasoning|no-?think|chat-latest/i;
+const REASON_PATTERN = /(reason|reasoning|\bthink\b|thinking|deepseek-r\d|deepseek-reasoner|\br1\b|\bo1\b|\bo3\b|\bo4\b|openthink|qwq|kimi-k2|flash-thinking|o3-mini|gpt-5|claude-(opus|sonnet)-[4-9]|claude-haiku-4|claude-3-7-sonnet|distill|magistral|\bmimo\b)/i;
 // Only a "free" that stands as its own segment. The loose /free/i this replaces
 // also matched "freeway" and "carefree", and as the last-resort fallback for the
 // paid/free verdict a false positive here tells the user a billed model is free.
@@ -1176,7 +1220,8 @@ function guessCapabilities(id) {
     input,
     output: ["text"],
     vision: input.includes("image"),
-    reasoning: REASON_PATTERN.test(id),
+    // Отрицание — это факт из имени, а не несработавшая догадка.
+    reasoning: NO_REASON_PATTERN.test(id) ? false : REASON_PATTERN.test(id),
     // `free` deliberately does not live here: see extractPricing, which answers
     // it from the payload and falls back to the name only when nothing else is
     // available.
@@ -1267,11 +1312,11 @@ function extractNumbers(m) {
 
   return {
     contextWindow:
-      pick(m, ["context_window", "contextWindow", "context_length", "context", "input_token_limit", "max_context_length"]) ||
+      pick(m, ["context_window", "contextWindow", "context_length", "contextLength", "context", "input_token_limit", "max_context_length", "maxContextLength", "maxContextWindow"]) ||
       pick(limit, ["context", "context_window"]) ||
       pick(top, ["context_length"]),
     maxOutput:
-      pick(m, ["max_output_tokens", "maxOutput", "max_tokens", "max_completion_tokens", "output_token_limit"]) ||
+      pick(m, ["max_output_tokens", "maxOutput", "maxOutputTokens", "max_tokens", "max_completion_tokens", "output_token_limit"]) ||
       pick(limit, ["output", "max_output_tokens"]) ||
       pick(top, ["max_completion_tokens"]),
   };
@@ -1305,6 +1350,29 @@ function modalityFromJson(m) {
   return out.length > 1 ? out : null;
 }
 
+/**
+ * Capabilities stated via OpenRouter-style `supported_parameters`.
+ * Returns { reasoning: bool|null, toolUse: bool|null, temperature: bool } —
+ * null means "not stated", which is different from false and must not
+ * override a better source.
+ */
+function statedCapabilities(m) {
+  const out = { reasoning: null, toolUse: null, temperature: false };
+  const list = m && typeof m === "object" && Array.isArray(m.supported_parameters)
+    ? m.supported_parameters.map((x) => String(x).toLowerCase())
+    : [];
+  if (!list.length) return out;
+  // reasoning_effort (OpenAI), effort (Anthropic), thinking/thinking_budget/
+  // enable_thinking/include_reasoning (Qwen, Gemini, Vertex) — разные имена
+  // одного: модель умеет думать и управляется уровнем effort.
+  if (list.some((s) => /reasoning|thinking|effort/.test(s))) out.reasoning = true;
+  if (list.some((s) => s === "tools" || s === "tool_choice" || s === "parallel_tool_calls" || s === "function_call")) {
+    out.toolUse = true;
+  }
+  if (list.includes("temperature")) out.temperature = true;
+  return out;
+}
+
 /** Normalises a /models response (several shapes) into a flat model list. */
 export function parseModels(json) {
   let arr = [];
@@ -1332,6 +1400,15 @@ export function parseModels(json) {
     }
     caps.vision = caps.input.includes("image");
     if (declared && typeof declared.reasoning === "boolean") caps.reasoning = declared.reasoning;
+    // OpenRouter-style gateways list supported_parameters instead: a stated
+    // "reasoning"/"tools" entry is a fact about this endpoint, while the name
+    // guess is not. response_format alone is JSON mode, not tool calling.
+    const stated = statedCapabilities(m);
+    if (stated.reasoning !== null) caps.reasoning = stated.reasoning;
+    const toolUse = declared && typeof declared.tools === "boolean"
+      ? declared.tools
+      : stated.toolUse;
+    if (stated.temperature === true) caps.temperature = true;
     const nums = extractNumbers(m);
     const price = extractPricing(m, id);
     // Track what the provider actually stated, as opposed to what we inferred
@@ -1342,9 +1419,10 @@ export function parseModels(json) {
     if (nums.contextWindow) declaredFields.push("contextWindow");
     if (nums.maxOutput) declaredFields.push("maxOutput");
     if (mod) declaredFields.push("inputTypes");
-    if (declared && typeof declared.reasoning === "boolean") declaredFields.push("reasoning");
-    if (declared && typeof declared.tools === "boolean") declaredFields.push("toolUse");
+    if (declared && typeof declared.reasoning === "boolean" || stated.reasoning !== null) declaredFields.push("reasoning");
+    if (declared && typeof declared.tools === "boolean" || stated.toolUse !== null) declaredFields.push("toolUse");
     if (declared && typeof declared.vision === "boolean") declaredFields.push("vision");
+    if (stated.temperature) declaredFields.push("temperature");
     const rawName = m && typeof m === "object"
       ? (typeof m.display_name === "string" && m.display_name.trim() ? m.display_name.trim()
         : (typeof m.name === "string" && m.name.trim() ? m.name.trim() : id))
@@ -1369,6 +1447,8 @@ export function parseModels(json) {
       costCacheRead: price.cacheRead ?? null,
       costCacheWrite: price.cacheWrite ?? null,
       vision: caps.vision,
+      toolUse,
+      temperature: stated.temperature === true ? true : undefined,
       // Which of the above the endpoint stated itself. Everything not listed
       // here is inference and may be replaced by a better source.
       declaredFields,

@@ -385,6 +385,18 @@ function applyOk(configObj, label) {
   const p3 = D.enrichExisting({ name: "m" }, { inputTypes: ["text", "image"], declaredFields: [] });
   eq("незаявленный вижн не пишется", p3, null);
   check("мусор не роняет", D.enrichExisting(null, {}) === null && D.enrichExisting({}, null) === null);
+  // Флаги возможностей — только заявленные и только в пустые поля.
+  const p4 = D.enrichExisting({ name: "m" }, {
+    toolUse: false, reasoning: true, temperature: true,
+    declaredFields: ["toolUse", "reasoning", "temperature"],
+  });
+  eq("заявленные флаги дописываются", p4, { toolCall: false, reasoning: true, temperature: true });
+  const p5 = D.enrichExisting(
+    { name: "m", tool_call: true, reasoning: false },
+    { toolUse: false, reasoning: true, declaredFields: ["toolUse", "reasoning"] });
+  eq("ручные флаги святы", p5, null);
+  const p6 = D.enrichExisting({ name: "m" }, { toolUse: false, reasoning: true, declaredFields: [] });
+  eq("незаявленные флаги не пишутся", p6, null);
 
   // Сквозной план с fetch-стабом.
   const stub = async () => ({

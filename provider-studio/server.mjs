@@ -3,12 +3,12 @@ import path from "node:path";
 import { readFileSync, unlinkSync } from "node:fs";
 import { exec } from "node:child_process";
 import {
-  readConfig, readConfigAtPath, upsertProviderAsDefault, opencodeSummary, setDefaultModel,
-  planProviderChange, planProviderRemoval, planProvidersRemoval, removeProvider, removeProviders, renameProvider,
+  readConfig, readConfigAtPath, opencodeSummary, setDefaultModel,
+  planProviderChange, planProvidersRemoval, removeProviders, renameProvider,
   listOpencodeConfigs, writeConfigText, commitPlan, SCHEMA_URL,
 } from "./src/opencode.mjs";
 import { buildPreview } from "./src/diff.mjs";
-import { applyChangesVerified } from "./src/jsonc-edit.mjs";
+import { applyChangesVerified, parseJsonc } from "./src/jsonc-edit.mjs";
 import { buildAutoFixChanges, planRefresh, runSelfCheck, isFreeEntry, buildRefreshChanges } from "./src/doctor.mjs";
 import { smartAudit } from "./src/smart-audit.mjs";
 import { loadDigest } from "./src/digest.mjs";
@@ -22,7 +22,7 @@ import {
 import { PRESETS } from "./src/presets.mjs";
 import {
   backupConfig, listBackups, restoreBackup, validateConfig, testConnection,
-  fetchModels, testCompletion,
+  fetchModels, testCompletion, introducedErrors,
 } from "./src/rescue.mjs";
 import { loadCatalog, enrichModels } from "./src/catalog.mjs";
 import { runBatch } from "./src/batch.mjs";
@@ -228,6 +228,22 @@ function probeCredentials(p) {
     return { apiKey: "", blocker: keyRefProblem(ref) };
   }
   return { apiKey: resolved.value, blocker: "" };
+}
+
+/**
+ * Last line of defence before a write: refuses text that would ADD
+ * schema errors opencode rejects the whole file for. Pre-existing problems
+ * never block — fixing the file is the doctor's job, not the price of a save.
+ * Returns an error string, or "" when the write may proceed.
+ */
+function refuseIntroduced(beforeText, afterText) {
+  const before = parseJsonc(beforeText);
+  const after = parseJsonc(afterText);
+  if (!before.ok || !after.ok) return "";
+  const added = introducedErrors(before.value, after.value);
+  if (!added.length) return "";
+  const shown = added.slice(0, 3).map((i) => i.message).join(" | ");
+  return `Запись отклонена: она добавляет ошибки схемы (${added.length}): ${shown}`;
 }
 
 /**
@@ -544,25 +560,37 @@ const server = http.createServer(async (req, res) => {
         if (t === "opencode") {
           // The backup is taken by the writer, immediately before the write, so
           // there is no window where a snapshot is missing or already stale.
-          const r = upsertProviderAsDefault(provider, {
-            setAsDefault,
+          // Planned first (not via upsertProviderAsDefault) so the schema gate
+          // below can compare before/after before anything touches the disk.
+          const pre = planProviderChange(provider, {
             configPath: body.configPath,
+            setAsDefault,
             defaultModelId: body.defaultModelId || provider.defaultModelId || "",
             previousKey: body.previousKey || "",
+          });
+          if (!pre.ok) {
+            return json(res, 400, { ok: false, error: pre.error, path: pre.configPath });
+          }
+          const blocked = refuseIntroduced(pre.before, pre.after);
+          if (blocked) {
+            return json(res, 400, { ok: false, error: blocked, path: pre.configPath });
+          }
+          const committed = commitPlan(pre, {
             expectedHash: body.hash,
             backup: (p) => backupConfig(p, "before-" + (provider.name || "apply")),
           });
-          if (r.backupFile) backupFile = r.backupFile;
-          if (!r.ok) {
-            return json(res, r.conflict ? 409 : 400, { ok: false, error: r.error, conflict: !!r.conflict, path: r.configPath });
+          if (!committed.ok) {
+            return json(res, committed.conflict ? 409 : 400, committed);
           }
+          const r = { ...committed, modelId: pre.defaultModel, commentsLost: false };
+          if (r.backupFile) backupFile = r.backupFile;
           results.opencode = {
             ok: r.ok,
             error: r.error || null,
             path: r.configPath,
-            model: r.defaultModel || null,
+            model: pre.defaultModel || null,
             created: !!r.created,
-            commentsLost: !!r.commentsLost,
+            commentsLost: false,
             hash: r.hash || "",
             previousKey: r.previousKey || "",
           };
@@ -913,6 +941,8 @@ const server = http.createServer(async (req, res) => {
         withPlugin,
       });
       if (!plan.ok) return json(res, 400, { ok: false, error: plan.error, path: plan.configPath });
+      const poolBlocked = refuseIntroduced(plan.before, plan.after);
+      if (poolBlocked) return json(res, 400, { ok: false, error: poolBlocked, path: plan.configPath });
       const committed = commitPlan(plan, {
         expectedHash: body.hash,
         backup: (p) => backupConfig(p, "before-pool-" + (slugify(provider.name) || "pool")),
@@ -1229,6 +1259,8 @@ const server = http.createServer(async (req, res) => {
       }
       const applied = applyChangesVerified(cfg.raw, changes);
       if (!applied.ok) return json(res, 400, { ok: false, error: applied.error, path: cfg.path });
+      const refreshBlocked = refuseIntroduced(cfg.raw, applied.text);
+      if (refreshBlocked) return json(res, 400, { ok: false, error: refreshBlocked, path: cfg.path });
       const committed = commitPlan(
         { ok: true, configPath: cfg.path, before: cfg.raw, after: applied.text, changes, hash: cfg.hash || "" },
         { expectedHash: body.hash, backup: (p) => backupConfig(p, "before-refresh-models") },

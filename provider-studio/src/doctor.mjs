@@ -562,6 +562,9 @@ export function buildRefreshChanges(plan, { only = null, prune = false, enrich =
         if (e.patch?.cost) v.cost = e.patch.cost;
         if (e.patch?.inputTypes) v.modalities = { input: e.patch.inputTypes };
         if (e.patch?.attachment) v.attachment = true;
+        if (e.patch?.toolCall !== undefined) v.tool_call = e.patch.toolCall;
+        if (e.patch?.reasoning !== undefined) v.reasoning = e.patch.reasoning;
+        if (e.patch?.temperature !== undefined) v.temperature = e.patch.temperature;
         if (Object.keys(v).length) {
           changes.push({ op: "merge", path: ["provider", p.key, "models", e.id], value: v });
         }
@@ -594,14 +597,25 @@ export function enrichExisting(existing, discovered) {
     out.cost = { input: discovered.costInput, output: discovered.costOutput };
   }
   const existingInput = Array.isArray(existing.modalities?.input) ? existing.modalities.input : ["text"];
-  const declared = Array.isArray(discovered.declaredFields) && discovered.declaredFields.includes("inputTypes");
+  const declared = Array.isArray(discovered.declaredFields) ? new Set(discovered.declaredFields) : new Set();
   const dInput = Array.isArray(discovered.inputTypes) ? discovered.inputTypes : ["text"];
-  if (declared && existingInput.length === 1 && existingInput[0] === "text" && dInput.length > 1) {
+  if (declared.has("inputTypes") && existingInput.length === 1 && existingInput[0] === "text" && dInput.length > 1) {
     out.inputTypes = dInput;
   }
   const finalInput = out.inputTypes || existingInput;
   if (finalInput.some((t) => t !== "text") && existing.attachment !== true) {
     out.attachment = true;
+  }
+  // Флаги возможностей — только заявленные эндпоинтом и только в пустые поля:
+  // догадка по имени для автозаписи слишком слаба, а ручное значение свято.
+  if (existing.tool_call === undefined && declared.has("toolUse") && typeof discovered.toolUse === "boolean") {
+    out.toolCall = discovered.toolUse;
+  }
+  if (existing.reasoning === undefined && declared.has("reasoning") && typeof discovered.reasoning === "boolean") {
+    out.reasoning = discovered.reasoning;
+  }
+  if (existing.temperature === undefined && declared.has("temperature") && discovered.temperature === true) {
+    out.temperature = true;
   }
   return Object.keys(out).length ? out : null;
 }

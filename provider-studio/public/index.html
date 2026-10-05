@@ -206,6 +206,17 @@
             <input type="number" id="m-output" placeholder="напр. 65536" min="0" />
           </div>
         </div>
+      <div class="form-grid">
+          <div class="field">
+            <label>Цена входа ($/1M токенов)</label>
+            <input type="number" id="m-costin" placeholder="необязательно" min="0" step="any" />
+          </div>
+          <div class="field">
+            <label>Цена выхода ($/1M токенов)</label>
+            <input type="number" id="m-costout" placeholder="необязательно" min="0" step="any" />
+          </div>
+        </div>
+        <div class="fmt-note">Цены нужны умному аудиту для сравнения «где дешевле»; пустые — значит «неизвестно», а не «бесплатно».</div>
 
       <div class="field">
         <label>Типы входа</label>
@@ -224,6 +235,7 @@
           <input type="checkbox" id="m-tools" checked />
           Поддержка вызова инструментов (tools)
         </label>
+        <div class="fmt-note">Уровень effort (low/medium/high) задаётся уже в самих запросах — здесь хранится только сам факт поддержки, его же проверяет диагностика.</div>
       </div>
       <div class="modal-foot">
         <button class="btn btn-ghost" id="m-cancel">Отмена</button>

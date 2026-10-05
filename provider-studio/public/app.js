@@ -1353,6 +1353,7 @@ function renderModelList() {
         <div class="meta">${limits}${m.name && m.name !== m.id ? " \u00b7 " + esc(m.name) : ""}${probeNote(probe)}</div>
       </div>
       <div class="tags">
+        ${priceTag(m)}
         ${(m.inputTypes || []).map((t) => `<span class="tag ${t === "image" ? "vis" : ""}">${esc(t)}</span>`).join("")}
         ${m.reasoning ? `<span class="tag reason">reasoning</span>` : ""}
         ${m.toolUse !== false ? `<span class="tag">tools</span>` : ""}
@@ -1398,6 +1399,10 @@ function openModelModal(index = null) {
   // into the config, and opencode needs context and output together or neither.
   $("#m-context").value = m.contextWindow ? String(m.contextWindow) : "";
   $("#m-output").value = m.maxOutput ? String(m.maxOutput) : "";
+  // Цены — только пара целиком: половина цены схемой не принимается, а 0
+  // вместо «неизвестно» прочитался бы как «бесплатно».
+  $("#m-costin").value = m.costInput != null && m.costOutput != null ? String(m.costInput) : "";
+  $("#m-costout").value = m.costInput != null && m.costOutput != null ? String(m.costOutput) : "";
   $("#m-reasoning").checked = !!m.reasoning;
   $("#m-tools").checked = m.toolUse !== false;
   renderChipGroup("#m-inputs", INPUT_TYPES, m.inputTypes || ["text"], () => {});
@@ -1434,6 +1439,8 @@ $("#m-save").addEventListener("click", () => {
     name: $("#m-name").value.trim(),
     contextWindow: Number($("#m-context").value) || 0,
     maxOutput: Number($("#m-output").value) || 0,
+    costInput: $("#m-costin").value.trim() === "" ? null : Number($("#m-costin").value),
+    costOutput: $("#m-costout").value.trim() === "" ? null : Number($("#m-costout").value),
     inputTypes: JSON.parse($("#m-inputs").dataset.selected || "[\"text\"]"),
     outputTypes: JSON.parse($("#m-outputs").dataset.selected || "[\"text\"]"),
     reasoning: $("#m-reasoning").checked,
@@ -1443,6 +1450,12 @@ $("#m-save").addEventListener("click", () => {
   // opencode requires context and output together; one without the other is invalid.
   const half = (model.contextWindow > 0) !== (model.maxOutput > 0);
   if (half) return toast("Заполни оба поля (контекст и макс. выход) или оставь оба пустыми", "err");
+  // Цена — тоже пара: записанная наполовину улетела бы в конфиг неполным cost,
+  // который схема отвергает целиком.
+  const halfCost = (model.costInput != null) !== (model.costOutput != null)
+    || (model.costInput != null && !(model.costInput >= 0 && model.costOutput >= 0));
+  if (halfCost) return toast("Укажи обе цены (вход и выход) или оставь обе пустыми", "err");
+  if (model.costInput == null) { delete model.costInput; delete model.costOutput; }
   const dup = state.models.findIndex((m) => m.id === model.id);
   if (dup >= 0 && dup !== state.editingModelIndex) return toast("Такая модель уже добавлена", "err");
   if (state.editingModelIndex != null) state.models[state.editingModelIndex] = model;
@@ -1717,7 +1730,10 @@ async function applyNow(provider) {
         ${r.ok ? `<div class="ok-line">\u2713 Применено. Модель по умолчанию: ${esc(r.model || "\u2014")}</div>`
                : `<div class="err-line">\u2715 ${esc(r.error || "ошибка")}</div>`}
         ${notes.map((n) => `<div class="ok-line" style="color:var(--muted)">${esc(n)}</div>`).join("")}
-        <div class="ok-line" style="color:var(--muted)">config: ${esc(r.path || "")}</div>`;
+        <div class="ok-line" style="color:var(--muted)">config: ${esc(r.path || "")}</div>
+        ${r.ok && r.model ? `<div class="diag-fix"><button class="btn btn-mini" data-test-default="${esc(r.model)}" type="button">Проверить боем: ${esc(r.model)}</button></div>` : ""}`;
+      const liveBtn = card.querySelector("[data-test-default]");
+      if (liveBtn) liveBtn.onclick = () => testDefaultModel(liveBtn.dataset.testDefault, liveBtn);
       toast(r.ok ? "Готово. Перезапусти opencode." : "opencode: " + (r.error || "ошибка"), r.ok ? "ok" : "err");
     } else {
       card.innerHTML = `
@@ -1781,6 +1797,31 @@ async function copyJson() {
   toast("JSON скопирован (без ключа)", "ok");
 }
 
+/**
+ * One live request to the model that just became the default, straight from
+ * the apply result card. Same probe as the per-row button, so "записано"
+ * turns into "работает" in one click instead of a trip back to the list.
+ */
+async function testDefaultModel(fullId, btn) {
+  const s = String(fullId || "");
+  const slash = s.indexOf("/");
+  const modelId = slash < 0 ? s : s.slice(slash + 1);
+  if (!modelId) return toast("Нечего проверять: нет id модели", "err");
+  const provider = collectProvider();
+  if (!provider.baseURL) return toast("Укажи Base URL для теста", "err");
+  if (btn) setBtnLoading(btn, true);
+  try {
+    const r = await apiSafe("/api/testchat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider, modelId }),
+    });
+    const res = (r && r.result) || {};
+    toast(`${res.ok ? "✓" : "✕"} ${s}: ${res.message || (r && r.error) || ""}`, res.ok ? "ok" : "err");
+  } finally {
+    if (btn) setBtnLoading(btn, false);
+  }
+}
+
 async function testConnection() {
   const provider = collectProvider();
   if (!provider.baseURL) return toast("Укажи Base URL для теста", "err");
@@ -1823,6 +1864,39 @@ function setBackupInfo(msg) {
   el.textContent = msg;
 }
 
+/**
+ * Human summary of a backup filename:
+ * opencode-20261006-004608-before-remove-2.jsonc → { label, when }.
+ * Falls back to the raw name when it does not look like ours.
+ */
+function backupMeta(file) {
+  const m = String(file || "").match(/^opencode-(\d{8})-(\d{6})-(.+?)(-\d+)?\.jsonc$/);
+  if (!m) return { label: String(file || ""), when: "" };
+  const rawLabel = m[3];
+  const label = rawLabel === "manual" ? "вручную"
+    : rawLabel === "before-remove" ? "перед удалением"
+    : rawLabel === "before-restore" ? "перед восстановлением"
+    : rawLabel === "before-undo" ? "перед откатом"
+    : rawLabel === "before-autofix" ? "перед автофиксом"
+    : rawLabel === "before-refresh-models" ? "перед обновлением моделей"
+    : rawLabel === "before-default-model" ? "перед сменой модели"
+    : rawLabel === "before-rename" ? "перед переименованием"
+    : rawLabel.startsWith("before-pool-") ? `перед пулом ${rawLabel.slice("before-pool-".length).replace(/-/g, " ")}`
+    : rawLabel.startsWith("before-") ? `перед: ${rawLabel.slice("before-").replace(/-/g, " ")}`
+    : rawLabel.replace(/-/g, " ");
+  const dt = new Date(
+    Number(m[1].slice(0, 4)), Number(m[1].slice(4, 6)) - 1, Number(m[1].slice(6, 8)),
+    Number(m[2].slice(0, 2)), Number(m[2].slice(2, 4)), Number(m[2].slice(4, 6)),
+  );
+  const mins = Math.max(0, Math.round((Date.now() - dt.getTime()) / 60000));
+  const when = !Number.isFinite(mins) ? "" : mins < 1 ? "только что"
+    : mins < 60 ? `${mins} мин назад`
+    : mins < 60 * 24 ? `${Math.round(mins / 60)} ч назад`
+    : mins < 60 * 48 ? "вчера"
+    : `${Math.round(mins / (60 * 24))} дн назад`;
+  return { label, when };
+}
+
 async function backupNow() {
   setBackupInfo("Создаю бэкап\u2026");
   const r = await apiSafe("/api/backup", {
@@ -1855,17 +1929,28 @@ function renderBackups(backups) {
   if (!backups.length) { el.hidden = true; syncSidePlaceholder(); return; }
   el.hidden = false;
   syncSidePlaceholder();
-  el.innerHTML = `<div class="result-card"><h3>Бэкапы</h3>` +
-    backups.map((b) => {
+  // 30 строк с машинными именами никто не читает: первые 7 + раскрывашка.
+  // Имя вида opencode-20261006-004608-before-remove-2.jsonc превращается в
+  // «перед удалением · 12 мин назад», полное имя остаётся в tooltip.
+  const shown = state.showAllBackups ? backups : backups.slice(0, 7);
+  el.innerHTML = `<div class="result-card"><h3>Бэкапы (${backups.length})</h3>` +
+    shown.map((b) => {
       // A backup remembers which file it came from; restoring blindly wrote it
       // into whatever file was being viewed. The origin tag keeps that visible.
       const origin = b.origin ? String(b.origin).split(/[\\/]/).pop() : "?";
+      const meta = backupMeta(b.file);
       return `<div class="backup-row">
-        <span class="bname" title="${esc(b.origin || "файл-источник неизвестен")}">${esc(b.file)}</span>
-        <span class="bsize">${(b.size / 1024).toFixed(1)} KB · ${esc(origin)}</span>
+        <span class="bname" title="${esc(b.file)}">${esc(meta.label)}</span>
+        <span class="bsize">${esc(meta.when)} · ${(b.size / 1024).toFixed(1)} KB · ${esc(origin)}</span>
         <button class="btn btn-ghost bs" data-file="${esc(b.file)}">Восстановить</button>
       </div>`;
-    }).join("") + `</div>`;
+    }).join("")
+    + (backups.length > shown.length
+      ? `<button class="btn btn-ghost btn-sm" id="backupsMore" type="button">Показать все (${backups.length})</button>`
+      : (state.showAllBackups ? `<button class="btn btn-ghost btn-sm" id="backupsMore" type="button">Свернуть</button>` : ""))
+    + `</div>`;
+  const more = $("#backupsMore");
+  if (more) more.onclick = () => { state.showAllBackups = !state.showAllBackups; renderBackups(state.backups); };
   el.querySelectorAll(".backup-row .bs").forEach((btn) => btn.addEventListener("click", async () => {
     if (!confirm("Восстановить конфиг из этого бэкапа? Текущий будет заменён (перед этим его снимут в бэкап).")) return;
     const r = await apiSafe("/api/restore", {
@@ -1931,7 +2016,47 @@ async function openDiscover() {
   for (const m of state.discoverModels) {
     if (state.models.some((e) => e.id === m.id)) state.discoverSelected.add(m.id);
   }
+  backfillFromDiscovered();
   renderDiscoverList();
+}
+
+/**
+ * Fills blanks in the already-added models from a fresh discovery, without
+ * touching anything the user set by hand. Previously the only way to get
+ * specs onto a hand-added row was to delete it and re-add from the dialog —
+ * now the dialog heals the list on arrival. Only fills, never overwrites:
+ * limits, prices, vision and reasoning come over; an explicit `false` stays.
+ */
+function backfillFromDiscovered() {
+  if (!state.models.length || !state.discoverModels.length) return;
+  const live = new Map(state.discoverModels.map((m) => [m.id, m]));
+  let filled = 0;
+  for (const m of state.models) {
+    const src = live.get(m.id);
+    if (!src) continue;
+    let touched = false;
+    if (!m.contextWindow && src.contextWindow > 0 && src.maxOutput > 0 && !m.maxOutput) {
+      m.contextWindow = src.contextWindow; m.maxOutput = src.maxOutput; touched = true;
+    }
+    if ((m.costInput == null || m.costOutput == null) && src.costInput != null && src.costOutput != null) {
+      m.costInput = src.costInput; m.costOutput = src.costOutput; touched = true;
+    }
+    if (src.costCacheRead != null && m.costCacheRead == null) { m.costCacheRead = src.costCacheRead; touched = true; }
+    if (src.costCacheWrite != null && m.costCacheWrite == null) { m.costCacheWrite = src.costCacheWrite; touched = true; }
+    const curIn = Array.isArray(m.inputTypes) ? m.inputTypes : ["text"];
+    const srcIn = Array.isArray(src.inputTypes) ? src.inputTypes : ["text"];
+    if (curIn.length === 1 && curIn[0] === "text" && srcIn.length > 1) {
+      m.inputTypes = [...srcIn]; touched = true;
+    }
+    if (!m.reasoning && src.reasoning === true) { m.reasoning = true; touched = true; }
+    if (src.toolUse === false && m.toolUse !== false) { m.toolUse = false; touched = true; }
+    if (src.temperature === true && m.temperature !== true) { m.temperature = true; touched = true; }
+    if (touched) filled++;
+  }
+  if (filled) {
+    renderModelList();
+    toast(`Дозаполнены характеристики: ${filled} (только пустые поля)`, "ok");
+  }
 }
 
 /**
@@ -1995,10 +2120,22 @@ function pickableModelRow(m, selected) {
     <div class="tags">
       ${priceTag(m)}
       ${(m.inputTypes || []).includes("image") ? `<span class="tag vis">vision</span>` : ""}
-      ${m.reasoning ? `<span class="tag reason">reasoning</span>` : ""}
+      ${m.reasoning ? `<span class="tag reason" title="${esc(reasonWhy(m))}">reasoning</span>` : ""}
       ${catalogTag(m)}
     </div>
   </div>`;
+}
+
+/**
+ * Where the reasoning flag came from: a provider statement is a fact, a name
+ * guess is not. The user picks models off these rows, so the difference has
+ * to be visible exactly here — not buried in docs.
+ */
+function reasonWhy(m) {
+  const stated = Array.isArray(m.declaredFields) && m.declaredFields.includes("reasoning");
+  return stated
+    ? "провайдер заявил поддержку thinking"
+    : "догадка по имени модели — проверь у провайдера";
 }
 
 /**
@@ -2079,6 +2216,8 @@ function modelFromDiscovered(src) {
       : {}),
     ...(src.costCacheRead != null ? { costCacheRead: src.costCacheRead } : {}),
     ...(src.costCacheWrite != null ? { costCacheWrite: src.costCacheWrite } : {}),
+    // temperature у схемы — boolean-флаг возможности, а не значение сэмплирования.
+    ...(src.temperature === true ? { temperature: true } : {}),
   };
 }
 

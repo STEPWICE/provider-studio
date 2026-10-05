@@ -231,6 +231,17 @@ check("https does not warn",
   !has({ provider: { a: { npm: "x", options: { baseURL: "https://api.example.com/v1" }, models: {} } } }, "insecure-http"));
 check("loopback http does not warn",
   !has({ provider: { a: { npm: "x", options: { baseURL: "http://localhost:11434/v1" }, models: {} } } }, "insecure-http"));
+check("a tiny output warns about truncation",
+  has({ provider: { a: { npm: "x", models: { m: { limit: { context: 128000, output: 512 } } } } } }, "tiny-output"));
+check("a small context warns",
+  has({ provider: { a: { npm: "x", models: { m: { limit: { context: 4096, output: 2048 } } } } } }, "small-context"));
+check("sane limits are quiet",
+  !has({ provider: { a: { npm: "x", models: { m: { limit: { context: 128000, output: 4096 } } } } } }, "tiny-output")
+  && !has({ provider: { a: { npm: "x", models: { m: { limit: { context: 128000, output: 4096 } } } } } }, "small-context"));
+check("a default model without tool_call warns",
+  has({ provider: { a: { npm: "x", models: { m: { tool_call: false } } } }, model: "a/m" }, "default-no-tools"));
+check("a default model with tools is quiet",
+  !has({ provider: { a: { npm: "x", models: { m: { tool_call: true } } } }, model: "a/m" }, "default-no-tools"));
 // Two providers on one address are almost always a copy-paste. A warning, not
 // an error: mirrors of one gateway exist on purpose.
 {
@@ -556,10 +567,71 @@ eq("the models/ prefix is stripped from the name",
   check("a declared vision capability is honoured", declared[0].vision === true, JSON.stringify(declared[0]));
   check("a declared reasoning:false overrides the name guess", declared[1].reasoning === false, JSON.stringify(declared[1]));
 
+  // OpenRouter-style supported_parameters are stated facts too.
+  const stated = R.parseModels({ data: [
+    { id: "or-model", supported_parameters: ["temperature", "tools", "reasoning", "max_tokens"] },
+    { id: "plain-or", supported_parameters: ["temperature"] },
+  ] });
+  check("supported_parameters enable reasoning", stated[0].reasoning === true, JSON.stringify(stated[0]));
+  check("supported_parameters enable toolUse", stated[0].toolUse === true, JSON.stringify(stated[0]));
+  check("supported_parameters temperature is recorded", stated[0].temperature === true, JSON.stringify(stated[0]));
+  check("supported_parameters are marked declared", stated[0].declaredFields.includes("reasoning") && stated[0].declaredFields.includes("toolUse"), JSON.stringify(stated[0].declaredFields));
+  check("response_format alone is not tool calling", stated[1].toolUse == null || stated[1].toolUse === false, JSON.stringify(stated[1]));
+
+  // Extra number spellings gateways actually send.
+  const more = R.parseModels({ data: [
+    { id: "g", contextLength: 64000, maxOutputTokens: 2048 },
+    { id: "h", maxContextLength: 32000 },
+  ] });
+  eq("contextLength is read", [more[0].contextWindow, more[0].maxOutput], [64000, 2048]);
+  eq("maxContextLength is read", more[1].contextWindow, 32000);
+
+  // Pre-write gate: a write that ADDS schema errors is refused, pre-existing
+  // ones never block.
+  {
+    const clean = { provider: { a: { npm: "x", models: { m: { name: "M" } } } } };
+    const dirty = { provider: { a: { npm: "x", oops: 1, models: { m: { name: "M" } } } } };
+    eq("an introduced error is reported", R.introducedErrors(clean, dirty).map((i) => i.id), ["unknown-provider-field"]);
+    eq("pre-existing errors do not block", R.introducedErrors(dirty, dirty), []);
+    eq("a clean write is not blocked", R.introducedErrors(clean, clean), []);
+    // env-missing is machine state, not text: blocking on it would brick every
+    // first-time setup (apply first, setx second).
+    const unsetting = { provider: { a: { npm: "x", options: { apiKey: "{env:PS_DEFINITELY_ABSENT_XYZ}" }, models: {} } } };
+    eq("a missing variable never blocks a write", R.introducedErrors(clean, unsetting), []);
+  }
+
   // display_name is what the provider wants shown; the id stays the key.
   const dn = R.parseModels({ data: [{ id: "z-ai/glm-4.7-flash", display_name: "GLM-4.7 Flash" }] })[0];
   eq("display_name is used for the label", dn.name, "GLM-4.7 Flash");
   eq("the id is left untouched", dn.id, "z-ai/glm-4.7-flash");
+}
+
+// ------------------------------------------------------------ thinking detect
+// The reasoning flag drives agent behaviour in opencode, so both directions
+// must be right: missing thinking cripples the agent, invented thinking
+// breaks tool calls on models that cannot think.
+{
+  const think = (id, extra = {}) => R.parseModels({ data: [{ id, ...extra }] })[0];
+  check("gpt-5 reasons", think("gpt-5.2").reasoning === true);
+  check("claude 4+ reasons", think("claude-sonnet-4-6").reasoning === true);
+  check("claude haiku 4 reasons", think("claude-haiku-4-5-20251001").reasoning === true);
+  check("-thinking suffix reasons", think("deepseek-v3.2-thinking").reasoning === true);
+  check("distilled reasons", think("deepseek-r1-distill-qwen-32b").reasoning === true);
+  check("magistral reasons", think("mistral-magistral-small-2509").reasoning === true);
+  check("mimo reasons", think("xiaomi-mimo-v2.5").reasoning === true);
+  check("-nothink does not reason", think("gemini-2.5-flash-nothink").reasoning === false);
+  check("-non-reasoning does not reason", think("grok-4-fast-non-reasoning").reasoning === false);
+  check("chat-latest does not reason", think("gpt-5.1-chat-latest").reasoning === false);
+  check("glm air is not a thinker", think("glm-4.5-air").reasoning === false);
+  check("plain chat does not reason", think("qwen3-max").reasoning === false);
+  check("effort param means reasoning",
+    think("x-model", { supported_parameters: ["reasoning_effort", "max_tokens"] }).reasoning === true);
+  check("anthropic effort param means reasoning",
+    think("y-model", { supported_parameters: ["effort", "temperature"] }).reasoning === true);
+  check("temperature param is recorded",
+    think("y-model", { supported_parameters: ["effort", "temperature"] }).temperature === true);
+  check("a declared reasoning:false still wins",
+    think("deepseek-r1", { capabilities: { reasoning: false } }).reasoning === false);
 }
 
 // ------------------------------------------------------- probe error classes
