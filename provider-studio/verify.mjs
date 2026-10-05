@@ -4,7 +4,7 @@
 // Usage: node verify.mjs   (from the provider-studio directory)
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import http from "node:http";
@@ -118,6 +118,12 @@ function rawRequest({ method = "GET", path = "/", headers = {}, body }) {
 
 try {
   check("server starts and answers /api/state", await waitUp(), serverLog);
+  const head = await rawRequest({ method: "HEAD", path: "/" });
+  check("HEAD responses have no body", head.status === 200 && head.body === "", JSON.stringify(head));
+  const nullBody = await rawRequest({ method: "POST", path: "/api/apply", headers: jsonHeaders, body: "null" });
+  check("null JSON bodies are rejected with 400", nullBody.status === 400, JSON.stringify(nullBody));
+  const badPath = await rawRequest({ method: "GET", path: "/%E0%A4%A" });
+  check("malformed request URLs do not crash the server", badPath.status === 404, JSON.stringify(badPath));
 
   // ---- store normalisation (used to be a hard crash) ----
   const state = await (await get("/api/state")).json();
@@ -129,6 +135,14 @@ try {
   check("state providers carry their real config keys",
     state.opencode.providers.every((p) => typeof p.key === "string" && p.key.length > 0),
     JSON.stringify(state.opencode.providers.map((p) => p.key)));
+
+  // ---- light watch poll (the 5s watcher must not refetch the whole state) ----
+  const watch = await (await get("/api/watch")).json();
+  check("/api/watch answers with path and hash",
+    watch.ok === true && typeof watch.path === "string" && typeof watch.hash === "string" && watch.hash.length === 64,
+    JSON.stringify(watch).slice(0, 160));
+  check("/api/watch agrees with /api/state on the hash",
+    watch.hash === state.opencode.hash, `${watch.hash} vs ${state.opencode.hash}`);
 
   // ---- apply with env-var key ----
   const applyRes = await (await post("/api/apply", {
@@ -210,6 +224,7 @@ try {
     JSON.stringify(samePrev.diff || {}).slice(0, 300));
 
   // ---- stale-hash writes must be refused, not silently applied ----
+  const storeBeforeConflict = readFileSync(STORE, "utf8");
   const staleApply = await post("/api/apply", {
     provider: { name: "BAI Test", baseURL: "https://api.b.ai/v1", apiFormat: "openai-chat", models: [{ id: "deepseek-v4" }] },
     targets: ["opencode"],
@@ -217,6 +232,7 @@ try {
   });
   check("apply with a stale hash returns 409", staleApply.status === 409, staleApply.status);
   check("a refused apply leaves the file alone", readConfigText() === beforePreview, "file changed despite the conflict");
+  check("a refused apply leaves the provider store alone", readFileSync(STORE, "utf8") === storeBeforeConflict, "store changed despite the conflict");
 
   // The hash from a fresh preview must be accepted.
   const freshPrev = await (await post("/api/preview", {
@@ -275,6 +291,45 @@ try {
   const rmPrevGhost = await (await post("/api/preview-remove", { key: "does-not-exist" })).json();
   check("the removal preview flags notFound too",
     rmPrevGhost.ok === false && rmPrevGhost.notFound === true, JSON.stringify(rmPrevGhost).slice(0, 160));
+
+  // ---- pool removal takes the shards and the plugin, not just the head ----
+  // Regression: removing a pool head left shard-2..N, the plugin entry and the
+  // plugin file behind — every pool removal orphaned a working config.
+  const poolApply = await (await post("/api/pool-apply", {
+    provider: {
+      name: "Pool Victim", baseURL: "https://pool.example/v1", apiFormat: "openai-chat",
+      setAsDefault: false, models: [{ id: "m1" }],
+    },
+    keys: ["sk-pool-key-one-12345", "sk-pool-key-two-67890"],
+    envBase: "PS_POOL_VICTIM_KEY",
+  })).json();
+  check("pool apply succeeds", poolApply.ok === true && (poolApply.shardKeys || []).length === 2,
+    JSON.stringify(poolApply).slice(0, 300));
+  const poolPlugin = poolApply.pluginFile || "";
+  check("pool apply stages the rotation plugin next to the config",
+    !!poolPlugin && existsSync(poolPlugin), poolPlugin);
+  const poolPrev = await (await post("/api/preview-remove", { key: "pool-victim" })).json();
+  check("pool removal preview names both shards",
+    poolPrev.ok === true && (poolPrev.removedKeys || []).length === 2,
+    JSON.stringify(poolPrev.removedKeys || poolPrev));
+  check("pool removal preview drops the plugin entry",
+    poolPrev.ok === true && !!poolPrev.pluginEntry, JSON.stringify(poolPrev.pluginEntry));
+  const poolRm = await (await post("/api/remove-provider", { key: "pool-victim" })).json();
+  check("pool removal succeeds", poolRm.ok === true && (poolRm.removedKeys || []).length === 2,
+    JSON.stringify(poolRm).slice(0, 300));
+  check("pool removal deletes the plugin file",
+    poolRm.pluginRemoved === true && !existsSync(poolPlugin), `${poolRm.pluginRemoved} ${poolPlugin}`);
+  const cfgPoolRm = readConfigFile();
+  check("no pool shard survives in the config",
+    cfgPoolRm.provider?.["pool-victim"] === undefined && cfgPoolRm.provider?.["pool-victim-2"] === undefined,
+    Object.keys(cfgPoolRm.provider || {}));
+  check("the plugin entry is gone from the config",
+    !JSON.stringify(cfgPoolRm.plugin || []).includes("keypool-pool-victim"),
+    JSON.stringify(cfgPoolRm.plugin || []));
+  const afterPool = await (await get("/api/state")).json();
+  check("the pool row is gone from the store",
+    !afterPool.providers.some((p) => p.name === "Pool Victim"),
+    JSON.stringify(afterPool.providers.map((p) => p.name)));
 
   // ---- non-ASCII bodies must survive the request decode ----
   const uni = await (await post("/api/preview", {
@@ -614,6 +669,44 @@ try {
           rs.end(JSON.stringify({ error: { message: "Rate limit reached" } }));
           return;
         }
+        // Live case (dacall.ai): 503 "No available accounts: no available
+        // accounts" — модель есть в /models, но под неё нет свободных
+        // upstream-аккаунтов. Это ёмкость, а не ключ и не модель.
+        if (/noacc-model/.test(raw)) {
+          rs.writeHead(503, { "content-type": "application/json" });
+          rs.end(JSON.stringify({ error: { message: "No available accounts: no available accounts", type: "api_error" }, type: "error" }));
+          return;
+        }
+        // Live case (dacall.ai другим ключом): 404 'Model "x" is not supported
+        // by any configured account in this group' — модель не подключена на
+        // этой группе, ключ рабочий.
+        if (/unplugged-model/.test(raw)) {
+          rs.writeHead(404, { "content-type": "application/json" });
+          rs.end(JSON.stringify({ error: { message: 'Model "unplugged-model" is not supported by any configured account in this group' } }));
+          return;
+        }
+        // Китайские агрегаторы: 400 «баланс пуст», 403 «слишком частые запросы»,
+        // 503 «нет свободных каналов». Всё это — не ключ и не модель.
+        if (/cn-broke-model/.test(raw)) {
+          rs.writeHead(400, { "content-type": "application/json" });
+          rs.end(JSON.stringify({ error: { message: "账户余额不足，请充值后重试" } }));
+          return;
+        }
+        if (/cn-key-model/.test(raw)) {
+          rs.writeHead(400, { "content-type": "application/json" });
+          rs.end(JSON.stringify({ error: { message: "令牌无效，请检查 API Key" } }));
+          return;
+        }
+        if (/cn-qps-model/.test(raw)) {
+          rs.writeHead(403, { "content-type": "application/json" });
+          rs.end(JSON.stringify({ error: { message: "请求过于频繁，请稍后重试" } }));
+          return;
+        }
+        if (/cn-noacc-model/.test(raw)) {
+          rs.writeHead(503, { "content-type": "application/json" });
+          rs.end(JSON.stringify({ error: { message: "当前无可用渠道，请稍后重试" } }));
+          return;
+        }
         // A real gateway (gorouter) refuses max_tokens <= 2. When the probe
         // asked for 1, the tool reported the model as broken over a limit it
         // had chosen itself, so hold the probe to that minimum here.
@@ -730,6 +823,26 @@ try {
     })).json();
     check("a 429 is reported as a quota problem", quota.result?.fault === "quota", JSON.stringify(quota.result));
 
+    const noacc = await (await post("/api/testchat", {
+      provider: { baseURL: chatURL, apiKey: "sk-chat", apiFormat: "openai-chat" },
+      modelId: "noacc-model",
+    })).json();
+    check("a 503 about no available accounts is a quota problem, not a dead model",
+      noacc.result?.fault === "quota", JSON.stringify(noacc.result));
+    check("no-accounts is transient so the batch retries it",
+      noacc.result?.transient === true, JSON.stringify(noacc.result));
+    check("the no-accounts message names the capacity cause",
+      /нет свободных мощностей/.test(noacc.result?.message || ""), noacc.result?.message);
+
+    const unplugged = await (await post("/api/testchat", {
+      provider: { baseURL: chatURL, apiKey: "sk-chat", apiFormat: "openai-chat" },
+      modelId: "unplugged-model",
+    })).json();
+    check("a 404 about no configured account is a plan limit, not a missing model",
+      unplugged.result?.fault === "plan", JSON.stringify(unplugged.result));
+    check("the unplugged message says the key is fine",
+      /ключ рабочий/.test(unplugged.result?.message || ""), unplugged.result?.message);
+
     const anth = await (await post("/api/testchat", {
       provider: { baseURL: chatURL, apiKey: "sk-anth", apiFormat: "anthropic-messages" },
       modelId: "claude-x",
@@ -813,6 +926,34 @@ try {
     })).json();
     check("an ordinary 400 is still blamed on the model",
       malformed.result?.fault === "model", JSON.stringify(malformed.result));
+
+    // Китайские агрегаторы отвечают теми же смыслами на своём языке.
+    const cnBroke = await (await post("/api/testchat", {
+      provider: { baseURL: chatURL, apiKey: "sk-chat", apiFormat: "openai-chat" },
+      modelId: "cn-broke-model",
+    })).json();
+    check("a chinese 400 about balance is blamed on the account",
+      cnBroke.result?.fault === "plan", JSON.stringify(cnBroke.result));
+    const cnKey = await (await post("/api/testchat", {
+      provider: { baseURL: chatURL, apiKey: "sk-chat", apiFormat: "openai-chat" },
+      modelId: "cn-key-model",
+    })).json();
+    check("a chinese 400 about a bad token is blamed on the key",
+      cnKey.result?.fault === "key", JSON.stringify(cnKey.result));
+    const cnQps = await (await post("/api/testchat", {
+      provider: { baseURL: chatURL, apiKey: "sk-chat", apiFormat: "openai-chat" },
+      modelId: "cn-qps-model",
+    })).json();
+    check("a chinese 403 about rate is blamed on quota, not the key",
+      cnQps.result?.fault === "quota" && cnQps.result?.transient === true,
+      JSON.stringify(cnQps.result));
+    const cnNoacc = await (await post("/api/testchat", {
+      provider: { baseURL: chatURL, apiKey: "sk-chat", apiFormat: "openai-chat" },
+      modelId: "cn-noacc-model",
+    })).json();
+    check("a chinese 503 about no channels is quota with retry",
+      cnNoacc.result?.fault === "quota" && cnNoacc.result?.transient === true,
+      JSON.stringify(cnNoacc.result));
 
     // An empty 403 must not be read as a rejected key: the key demonstrably
     // works, and a wrong one produces a 401 with an error body instead.
@@ -1108,6 +1249,37 @@ try {
       JSON.stringify(refused).slice(0, 200));
     check("the external edit survives the refused undo",
       readConfigText().includes("undo-guard-external"), readConfigText().slice(-300));
+  }
+
+  {
+    const originalStore = readFileSync(STORE, "utf8");
+    const originalConfig = readConfigText();
+    writeFileSync(STORE, "{broken json", "utf8");
+    const corruptState = await get("/api/state");
+    const corruptStateBody = await corruptState.json();
+    const corruptApply = await post("/api/apply", {
+      provider: { name: "Must Not Persist", baseURL: "https://lost.example/v1", apiFormat: "openai-chat", models: [{ id: "m" }] },
+      targets: ["opencode"],
+    });
+    const corruptDelete = await post("/api/delete", { name: "BAI Test" });
+    check("a corrupt provider store returns an explicit error", corruptState.status === 500 && corruptStateBody.ok === false,
+      `${corruptState.status} ${JSON.stringify(corruptStateBody)}`);
+    check("a corrupt provider store blocks apply", corruptApply.status === 500, corruptApply.status);
+    check("a corrupt provider store blocks delete", corruptDelete.status === 500, corruptDelete.status);
+    check("corrupt store bytes are preserved", readFileSync(STORE, "utf8") === "{broken json", "corrupt store was overwritten");
+    check("a blocked apply does not change opencode config", readConfigText() === originalConfig, "config changed with corrupt store");
+    writeFileSync(STORE, originalStore, "utf8");
+    const recoveredState = await (await get("/api/state")).json();
+    check("restoring a valid provider store recovers state", Array.isArray(recoveredState.providers), JSON.stringify(recoveredState.providers));
+  }
+
+  {
+    unlinkSync(STORE);
+    const missingState = await (await get("/api/state")).json();
+    check("a missing provider store is a normal empty store", Array.isArray(missingState.providers) && missingState.providers.length === 0,
+      JSON.stringify(missingState.providers));
+    const recreated = await (await post("/api/delete", { name: "anything" })).json();
+    check("saving recreates a missing provider store", Array.isArray(recreated.providers), JSON.stringify(recreated));
   }
 
   // ---- a cyrillic name gets a transliterated key, not a "provider" pile-up ----

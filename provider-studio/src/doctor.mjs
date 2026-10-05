@@ -21,14 +21,16 @@ import {
   decodeApiKey, detectApiFormat, suggestEnvVarName,
   buildModelEntry,
 } from "./formats.mjs";
-import { lookupEnv } from "./env.mjs";
+import { lookupEnv, resolveKeyRef } from "./env.mjs";
 import {
   backupDir, dataDir, ensureDir,
   resolveOpencodeConfigPath, defaultOpencodeConfigPath,
 } from "./paths.mjs";
 import { proxyForUrl, describeProxy } from "./proxy.mjs";
-
-export const SCHEMA_URL = "https://opencode.ai/config.json";
+import { SCHEMA_URL } from "./opencode.mjs";
+// Single source of truth lives in opencode.mjs (two copies already drifted
+// once); re-exported so existing importers keep working.
+export { SCHEMA_URL };
 const ANTHROPIC_VERSION = "2023-06-01";
 
 const PROVIDER_FIELD_SET = new Set([...PROVIDER_FIELDS, "type", "$schema"]);
@@ -102,6 +104,12 @@ export function buildAutoFixChanges(config) {
       fixes.push({ id: "npm-as-name", provider: key, message: `Провайдер «${key}»: пакет «${pkg}» перенесён из name в npm` });
     }
 
+    // fixOptions идёт раньше ключа: обе правки трогают env-массив, а записи
+    // применяются по порядку — очистка битого env должна лечь первой, иначе
+    // она затёрла бы только что добавленную переменную. normaliseKeyValue
+    // получает уже очищенный список через effectiveEnv().
+    fixOptions(key, p, changes, fixes);
+
     // Ключ и адрес на верхнем уровне: схема их не знает, opencode их не читает.
     // Значение чинится сразу, а не переезжает как есть: иначе открытый ключ
     // остался бы открытым текстом в options, а $VAR — битой ссылкой, и
@@ -110,7 +118,7 @@ export function buildAutoFixChanges(config) {
     if (p.apiKey !== undefined) {
       const top = p.apiKey;
       if (p.options?.apiKey === undefined && typeof top === "string" && top) {
-        const finalKey = normaliseKeyValue(top, key, changes, fixes);
+        const finalKey = normaliseKeyValue(top, key, changes, fixes, undefined, effectiveEnv(p));
         changes.push({ op: "merge", path: ["provider", key, "options"], value: { apiKey: finalKey } });
         if (finalKey === top) {
           fixes.push({ id: "apikey-top-level", provider: key, message: `Провайдер «${key}»: apiKey перенесён в options` });
@@ -136,7 +144,6 @@ export function buildAutoFixChanges(config) {
 
     if (!apiKeyHandled)     fixApiKeyValue(key, p, changes, fixes, skipped);
     fixHeaders(key, p, changes, fixes);
-    fixOptions(key, p, changes, fixes);
 
     const models = isPlainObject(p.models) ? p.models : null;
     if (models) {
@@ -158,12 +165,13 @@ export function buildAutoFixChanges(config) {
  * (env-массив) и записи в fixes/skipped. Путь записи выбирает вызывающий:
  * при переезде с верхнего уровня это merge, иначе set.
  */
-function normaliseKeyValue(apiKey, key, changes, fixes, skipped) {
+function normaliseKeyValue(apiKey, key, changes, fixes, skipped, existingEnv) {
   // $VAR / ${VAR} отправляются буквально как ключ. Правильный синтаксис {env:VAR}.
   const bare = apiKey.match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/);
   if (bare) {
     const suggest = `{env:${bare[1]}}`;
     fixes.push({ id: "bad-env-ref", provider: key, message: `Провайдер «${key}»: «${apiKey}» заменено на «${suggest}»` });
+    ensureEnvHas(key, changes, bare[1], existingEnv);
     return suggest;
   }
   const decoded = decodeApiKey(apiKey);
@@ -172,7 +180,7 @@ function normaliseKeyValue(apiKey, key, changes, fixes, skipped) {
   // в fixApiKeyValue: в конфиге остаётся ссылка, значение задаётся вручную.
   if (decoded.apiKey.length > 0) {
     const envName = suggestEnvVarName(key);
-    changes.push({ op: "merge", path: ["provider", key], value: { env: [envName] } });
+    ensureEnvHas(key, changes, envName, existingEnv);
     fixes.push({
       id: "plaintext-key", provider: key,
       message: `Провайдер «${key}»: ключ вынесен в переменную ${envName} — задай её вручную, старый ключ из файла стёрт`,
@@ -183,6 +191,30 @@ function normaliseKeyValue(apiKey, key, changes, fixes, skipped) {
   return apiKey;
 }
 
+/**
+ * Env-массив после чистки fixOptions: только валидные имена. Именно от него
+ * считается union в normaliseKeyValue — иначе очистка, идущая раньше по
+ * порядку записей, затёрла бы добавленную переменную.
+ */
+function effectiveEnv(p) {
+  return Array.isArray(p?.env)
+    ? p.env.filter((n) => typeof n === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(n))
+    : [];
+}
+
+/**
+ * Ensures the provider's `env` array contains `name`, preserving anything
+ * already there. Arrays are leaves in mergePath (replaced wholesale), so a
+ * plain merge of {env:[name]} would silently drop hand-written entries.
+ */
+function ensureEnvHas(key, changes, name, existingEnv) {
+  const keep = Array.isArray(existingEnv)
+    ? existingEnv.filter((n) => typeof n === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(n))
+    : [];
+  if (keep.includes(name)) return;
+  changes.push({ op: "merge", path: ["provider", key], value: { env: [...keep, name] } });
+}
+
 function fixApiKeyValue(key, p, changes, fixes, skipped) {
   const apiKey = p.options?.apiKey;
   if (typeof apiKey !== "string" || !apiKey) return;
@@ -191,7 +223,7 @@ function fixApiKeyValue(key, p, changes, fixes, skipped) {
   // повторная валидация (remaining). Проверять наличие здесь — значит молча
   // оставить битую форму только потому, что переменная пока не задана.
   if (/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(apiKey)) {
-    const fixed = normaliseKeyValue(apiKey, key, changes, fixes, skipped);
+    const fixed = normaliseKeyValue(apiKey, key, changes, fixes, skipped, effectiveEnv(p));
     if (fixed !== apiKey) {
       changes.push({ op: "set", path: ["provider", key, "options", "apiKey"], value: fixed });
     }
@@ -202,6 +234,14 @@ function fixApiKeyValue(key, p, changes, fixes, skipped) {
     return;
   }
   const decoded = decodeApiKey(apiKey);
+  // {file:...} — валидная форма из схемы: чинить нечего, переписывать в {env:}
+  // нельзя (путь — не переменная). Отсутствующий файл — ручной шаг.
+  if (decoded.useFile) {
+    if (!resolveKeyRef(apiKey).resolved) {
+      skipped.push({ id: "file-missing", provider: key, message: `Провайдер «${key}»: файл с ключом ${decoded.filePath} не читается — проверь путь вручную` });
+    }
+    return;
+  }
   if (decoded.useEnvVar) {
     // Переменная отсутствует — создавать её молча нельзя (значение неизвестно),
     // это ручной шаг. Не skip-молчание: skipped объясняет, что делать.
@@ -211,7 +251,7 @@ function fixApiKeyValue(key, p, changes, fixes, skipped) {
     }
     return;
   }
-  const fixed = normaliseKeyValue(apiKey, key, changes, fixes, skipped);
+  const fixed = normaliseKeyValue(apiKey, key, changes, fixes, skipped, effectiveEnv(p));
   if (fixed !== apiKey) {
     changes.push({ op: "set", path: ["provider", key, "options", "apiKey"], value: fixed });
   }
@@ -241,10 +281,13 @@ function fixOptions(key, p, changes, fixes) {
   // timeout живёт в options, а env — на верхнем уровне: выходить при отсутствии
   // options — значит оставить битой env, о которой валидатор уже доложил.
   if (opts !== undefined && opts && typeof opts === "object" && !Array.isArray(opts)) {
-    const t = opts.timeout;
-    if (t !== undefined && !(typeof t === "number" && Number.isFinite(t) && t > 0)) {
-      changes.push({ op: "delete", path: ["provider", key, "options", "timeout"] });
-      fixes.push({ id: "bad-timeout", provider: key, message: `Провайдер «${key}»: убран некорректный options.timeout` });
+    // false выключает таймаут по схеме — это осознанная настройка, не мусор.
+    for (const field of ["timeout", "headerTimeout", "chunkTimeout"]) {
+      const t = opts[field];
+      if (t !== undefined && t !== false && !(typeof t === "number" && Number.isFinite(t) && t > 0)) {
+        changes.push({ op: "delete", path: ["provider", key, "options", field] });
+        fixes.push({ id: "bad-timeout", provider: key, message: `Провайдер «${key}»: убран некорректный options.${field}` });
+      }
     }
   }
   const env = p.env;
@@ -277,6 +320,20 @@ function fixModel(key, mid, m, changes, fixes, skipped) {
     if (!MODEL_FIELD_SET.has(field)) {
       changes.push({ op: "delete", path: [...base, field] });
       fixes.push({ id: "unknown-model-field", provider: key, model: mid, message: `Модель «${key}/${mid}»: убрано поле «${field}» — его нет в схеме` });
+    }
+  }
+  // model.provider — только {npm, api}: остальное роняет модель целиком.
+  if (m.provider !== undefined) {
+    if (!isPlainObject(m.provider)) {
+      changes.push({ op: "delete", path: [...base, "provider"] });
+      fixes.push({ id: "bad-model-provider", provider: key, model: mid, message: `Модель «${key}/${mid}»: убран provider не-объект` });
+    } else {
+      for (const field of Object.keys(m.provider)) {
+        if (field !== "npm" && field !== "api") {
+          changes.push({ op: "delete", path: [...base, "provider", field] });
+          fixes.push({ id: "unknown-model-provider-field", provider: key, model: mid, message: `Модель «${key}/${mid}»: убрано provider.${field} — его нет в схеме` });
+        }
+      }
     }
   }
   // modalities должны быть массивами из известного списка.

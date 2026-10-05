@@ -1,17 +1,17 @@
 :root {
-  --bg: #09090b;
+  --bg: #0c0c10;
   --panel: #18181b;
   --panel-2: #27272a;
   --card: #18181b;
-  --border: #27272a;
+  --border: #2a2a30;
   --border-2: #3f3f46;
   --text: #fafafa;
-  --muted: #a1a1aa;
+  --muted: #a8a8b3;
   --accent: #6366f1;
   --accent-2: #818cf8;
   --ok: #22c55e;
   --err: #ef4444;
-  --radius: 8px;
+  --radius: 10px;
   --warn: #fbbf24;
   /* The exe ships offline, so a webfont name would silently fall back to a
      different metric. Name only fonts that are actually installed. */
@@ -65,7 +65,8 @@ body {
 .brand { display: flex; align-items: center; gap: 10px; }
 .logo {
   width: 32px; height: 32px; border-radius: 8px;
-  background: var(--accent);
+  background: linear-gradient(135deg, var(--accent), #a855f7);
+  box-shadow: 0 2px 12px rgba(99,102,241,.45);
   display: grid; place-items: center; font-weight: 700; font-size: 12px; color: #fff;
 }
 .brand-name { font-weight: 600; font-size: 15px; }
@@ -217,10 +218,15 @@ body {
 }
 .side-empty-title { font-weight: 600; color: var(--text); margin-bottom: 6px; font-size: 13px; }
 .side-empty p { margin: 0; }
+/* Шаги-подсказки в плейсхолдере: нумерация акцентным цветом, чтобы глаз цеплялся за порядок. */
+.side-steps { margin: 8px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+.side-steps li::marker { color: var(--accent-2); font-weight: 700; }
+.side-steps b { color: var(--text); font-weight: 600; }
 
 .card {
   background: var(--card); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 24px; max-width: 760px; min-width: 0;
+  box-shadow: 0 12px 32px rgba(0,0,0,.28);
 }
 .card-head { display: flex; flex-direction: column; gap: 16px; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
@@ -233,8 +239,17 @@ input, select {
   padding: 10px 12px; font-size: 13px; outline: none;
   font-family: inherit; width: 100%; transition: border-color .15s;
 }
-input:focus, select:focus { border-color: var(--accent); }
+input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(99,102,241,.18); }
 input::placeholder { color: #52525b; }
+textarea {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 12px; font-size: 12px; outline: none;
+  font-family: var(--mono); width: 100%; transition: border-color .15s;
+  resize: vertical;
+}
+textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(99,102,241,.18); }
+textarea::placeholder { color: #52525b; font-family: inherit; }
 
 .key-row { display: flex; gap: 8px; align-items: stretch; }
 .key-row input { flex: 1; min-width: 0; }
@@ -257,6 +272,19 @@ input::placeholder { color: #52525b; }
 }
 .env-toggler.on .ck { background: var(--accent); border-color: var(--accent); }
 .envname { margin-top: 8px; }
+
+/* Пул ключей: многострочное поле + построчные вердикты живой проверки. */
+.pool-area { margin-top: 2px; min-height: 64px; }
+.pool-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.pool-status { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.pool-key-row { display: flex; gap: 8px; align-items: baseline; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; }
+.pool-key-row .pool-mask { font-family: var(--mono); font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.pool-key-row .pool-msg { flex: 1; min-width: 0; overflow-wrap: break-word; }
+.pool-mark-ok { color: var(--ok); }
+.pool-mark-pay { color: var(--warn); }
+.pool-mark-retry { color: var(--accent-2); }
+.pool-mark-bad { color: var(--err); }
+.pool-balance { color: var(--muted); font-size: 11px; flex-shrink: 0; }
 
 /* State of the environment variable the config will reference. Writing
    {env:FOO} while FOO is unset authenticates with an empty string. */
@@ -430,7 +458,10 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
 }
 .btn:hover { border-color: var(--accent); background: var(--panel); }
 .btn-primary { background: var(--accent); color: #fff; border-color: transparent; }
-.btn-primary:hover { background: var(--accent-2); }
+.btn-primary:hover { background: var(--accent-2); transform: translateY(-1px); box-shadow: 0 4px 14px rgba(99,102,241,.35); }
+.btn-primary:active { transform: translateY(0); box-shadow: none; }
+/* Тёплое выделение вместо системно-синего — мелочи, из которых складывается «своя» тулза. */
+::selection { background: rgba(99,102,241,.35); }
 .btn-soft { background: rgba(99,102,241,.1); border-color: transparent; color: var(--accent-2); }
 .btn-soft:hover { background: rgba(99,102,241,.15); }
 /* Availability dot in the sidebar. Grey until a diagnostics run has actually
@@ -460,7 +491,7 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
 .results[hidden] { display: none !important; }
 .result-card {
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-  padding: 16px;
+  padding: 16px; box-shadow: 0 8px 24px rgba(0,0,0,.25);
 }
 .result-card h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
 .result-card .ok-line { color: var(--ok); font-size: 12px; }
@@ -480,6 +511,7 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
   width: 440px; max-width: 90vw; background: var(--panel); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 24px;
   display: flex; flex-direction: column; gap: 16px;
+  box-shadow: 0 24px 64px rgba(0,0,0,.5);
 }
 .modal-head { display: flex; justify-content: space-between; align-items: center; font-weight: 600; font-size: 16px; }
 .close { background: none; border: 0; color: var(--muted); font-size: 20px; cursor: pointer; transition: color .15s; }
@@ -687,4 +719,17 @@ input[type="checkbox"] { width: auto; accent-color: var(--accent); }
   .form-grid { grid-template-columns: 1fr; }
   .topbar { flex-wrap: wrap; }
   .col-side { max-height: none; }
+}
+
+/* --- Motion -------------------------------------------------------------- */
+/* Модалки появляются с лёгким подъёмом вместо резкого хлопка — воспринимается
+   быстрее, хотя по времени то же самое. Backdrop тоже плавно темнеет. */
+.modal-backdrop { animation: backdrop-in .16s ease; }
+.modal { animation: modal-in .18s ease; }
+@keyframes backdrop-in { from { opacity: 0; } }
+@keyframes modal-in { from { opacity: 0; transform: translateY(10px) scale(.985); } }
+/* Уважение к настройкам ОС: кому анимация вредна — тому её нет. */
+@media (prefers-reduced-motion: reduce) {
+  .modal-backdrop, .modal { animation: none; }
+  .btn-primary:hover { transform: none; }
 }

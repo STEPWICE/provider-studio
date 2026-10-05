@@ -1,15 +1,17 @@
 // src/targets.mjs
-// For harnesses whose config lives in an opaque VS Code store (Kilo, Cline, Roo, ZCode, DeepSeek Harness)
-// we can't safely patch the internal DB, so we produce exact field-by-field guidance + a copyable manifest.
+// For harnesses whose config lives in an opaque VS Code store (Kilo, Cline,
+// Roo Code) we can't safely patch the internal DB, so we produce exact
+// field-by-field guidance + a copyable manifest.
 
 import { FORMATS } from "./formats.mjs";
 
+// Только реально существующие харнесы: мёртвые кнопки путеводителя хуже, чем
+// их отсутствие — уводят настраивать то, чего нет. Остальное покрывает
+// «Generic / other» (сервер принимает и неизвестные id через fallback).
 export const TARGETS = [
   { id: "kilo", label: "Kilo Code" },
   { id: "cline", label: "Cline" },
   { id: "roo", label: "Roo Code" },
-  { id: "zcode", label: "ZCode" },
-  { id: "deepseek-harness", label: "DeepSeek Harness" },
   { id: "generic", label: "Generic / other" },
 ];
 

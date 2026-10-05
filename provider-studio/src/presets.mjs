@@ -115,11 +115,14 @@ export const PRESETS = [
     keyURL: "https://console.anthropic.com/settings/keys",
     needsKey: true,
     // Anthropic has no public /models listing for every plan, so seed the
-    // catalogue instead of leaving the user with an empty list.
+    // catalogue instead of leaving the user with an empty list. IDs, limits
+    // and prices are the pinned snapshots from the official models overview
+    // (platform.claude.com/docs/en/models/overview): dateless IDs from the 4.6
+    // generation on are snapshots, not moving aliases.
     discover: false,
     models: [
-      { id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4", contextWindow: 200000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
-      { id: "claude-3-5-haiku-20241022", name: "Claude 3.5 Haiku", contextWindow: 200000, maxOutput: 8192, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: false, toolUse: true },
+      { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", contextWindow: 1000000, maxOutput: 128000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true, costInput: 2, costOutput: 10 },
+      { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", contextWindow: 200000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true, costInput: 1, costOutput: 5 },
     ],
   },
   {
@@ -211,51 +214,8 @@ export const PRESETS = [
     apiFormat: "openai-chat",
     envVarName: "XKIRO_API_KEY",
     needsKey: true,
-    discover: true,
-    // Seed — запасной список на случай, если обнаружение не сработает.
-    // Снят с живого /v1/models 2026-09-17 (109 моделей, :free — 26 штук):
-    // только id, без характеристик — их подтянет обнаружение или каталог.
-    // Протухает: сверяй с живым списком, суффикс :free — маркер бесплатности.
-    models: [
-      { id: "qwen/qwen3.7-flash:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.6-max-preview:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.5-plus:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3-max:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.5-flash:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.8-max:free", free: true, freeSource: "name" },
-      { id: "minimax/minimax-m3:free", free: true, freeSource: "name" },
-      { id: "minimax/minimax-m2.7:free", free: true, freeSource: "name" },
-      { id: "minimax/minimax-m2.5-highspeed:free", free: true, freeSource: "name" },
-      { id: "minimax/minimax-m2:free", free: true, freeSource: "name" },
-      { id: "minimax/minimax-m2.7-highspeed:free", free: true, freeSource: "name" },
-      { id: "minimax/minimax-m2.5:free", free: true, freeSource: "name" },
-      { id: "minimax/minimax-m2.1:free", free: true, freeSource: "name" },
-      { id: "minimax/minimax-m2.1-highspeed:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.7-plus:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.6-plus:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.5-omni-plus:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.7-max:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.5-397b-a17b:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.5-omni-flash:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.6-27b:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen-plus-2025-07-28:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3-vl-plus:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3-omni-flash:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3.6-35b-a3b:free", free: true, freeSource: "name" },
-      { id: "qwen/qwen3-coder-plus:free", free: true, freeSource: "name" },
-    ],
-  },
-  {
-    // Локальный роутер: адрес и поведение — из живого конфига. Ключ не нужен,
-    // но сам GoRouter должен быть запущен, иначе пробы честно скажут «отклонено».
-    id: "gorouter",
-    label: "GoRouter (локально)",
-    hint: "Локальный роутер. Ключ не нужен, но GoRouter должен быть запущен.",
-    baseURL: "http://localhost:14747/v1",
-    apiFormat: "openai-chat",
-    envVarName: "",
-    needsKey: false,
-    local: true,
+    // Без seed-списка намеренно: захардкоженные id протухают за недели, а живое
+    // обнаружение (discover:true) отдаёт актуальный каталог с ценами и :free.
     discover: true,
   },
   {

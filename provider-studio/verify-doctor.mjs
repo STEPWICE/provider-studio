@@ -182,6 +182,25 @@ function applyOk(configObj, label) {
   const errs = validateConfig(applied.value).filter((i) => i.severity === "error");
   check("после автофикса ошибок не остаётся", errs.length === 0, JSON.stringify(errs.map((i) => i.id)));
 
+// timeout:false и {file:} — валидные формы из схемы: автофикс их не трогает.
+{
+  const { applied, changes, skipped } = applyOk({
+    provider: {
+      a: {
+        npm: "x", options: { baseURL: "https://a.dev", timeout: false, headerTimeout: false, apiKey: "{file:/tmp/ps-doctor-key}" },
+        models: { m: {} },
+      },
+    },
+    model: "a/m",
+  }, "schema-forms");
+  eq("timeout:false пережил автофикс", applied.value?.provider?.a?.options?.timeout, false);
+  eq("headerTimeout:false пережил автофикс", applied.value?.provider?.a?.options?.headerTimeout, false);
+  eq("файловая ссылка не переписана в env", applied.value?.provider?.a?.options?.apiKey, "{file:/tmp/ps-doctor-key}");
+  check("по валидным формам правок нет", !changes.some((c) => JSON.stringify(c.path).includes("timeout") || JSON.stringify(c.path).includes("apiKey")),
+    JSON.stringify(changes.map((c) => c.path)));
+  check("отсутствующий файл объяснён вручную", skipped.some((s) => s.id === "file-missing"), JSON.stringify(skipped.map((s) => s.id)));
+}
+
   // Дубли baseURL — предупреждение для человека, а не правка: какое из двух
   // зеркало, а какое копипаст, знает только владелец.
   const dupText = JSON.stringify({

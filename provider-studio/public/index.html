@@ -36,7 +36,7 @@
       <header class="topbar">
         <div class="topbar-title">
           <h1>Настройки моделей</h1>
-          <p class="muted">Добавь кастомный API-эндпоинт и его модели.</p>
+          <p class="muted">Подключи любой API — проверим, что он отвечает, покажем diff и запишем аккуратно, с бэкапом.</p>
         </div>
         <div class="topbar-right">
           <select id="configPicker" class="config-picker" aria-label="Какой конфиг править" title="Какой файл конфигурации править"></select>
@@ -84,6 +84,18 @@
             <input type="text" id="f-envname" class="envname" placeholder="Имя переменной, например BAI_API_KEY" aria-label="Имя переменной окружения" />
             <div class="env-state" id="envState" hidden></div>
             <div class="fmt-note" id="keyHint"></div>
+          </div>
+
+          <div class="field">
+            <label>Пул ключей <span class="muted">— необязательно, по одному на строке</span></label>
+            <textarea id="f-pool" class="pool-area" rows="3" placeholder="Вставь запасные ключи — каждый с новой строки. Основной ключ бери из поля выше." autocomplete="off" spellcheck="false"></textarea>
+            <div class="pool-row">
+              <button class="btn btn-ghost btn-sm" id="btnPoolCheck" type="button" title="Проверить каждый ключ пула живым запросом">&#x26A1; Проверить пул</button>
+              <button class="btn btn-ghost btn-sm" id="btnPoolSave" type="button" title="Записать все ключи пула в переменные окружения">Записать пул в env</button>
+              <span class="muted" id="poolCount"></span>
+            </div>
+            <div class="pool-status" id="poolStatus" hidden></div>
+            <div class="fmt-note">Если на одном ключе кончатся баланс или квота (401/402/429), плагин переключит запросы на следующий живой ключ сам.</div>
           </div>
 
           <div class="field">
@@ -150,7 +162,12 @@
              what the buttons above it will produce. -->
         <div class="side-empty" id="sideEmpty">
           <div class="side-empty-title">Здесь появятся результаты</div>
-          <p>Нажми «Диагностика», чтобы проверить, какие провайдеры отвечают и какая модель стоит по умолчанию.</p>
+          <p>Короткий путь к рабочей связке:</p>
+          <ol class="side-steps">
+            <li>Заполни форму слева или запусти <b>Мастер настройки</b>.</li>
+            <li>Нажми <b>Диагностика</b> — проверим, какие провайдеры отвечают.</li>
+            <li><b>Показать diff</b>, потом <b>Применить</b> — запись всегда с бэкапом.</li>
+          </ol>
         </div>
         <div class="issues" id="issues" hidden></div>
         <div class="backups" id="backups" hidden></div>
@@ -279,6 +296,10 @@
             <button type="button" class="btn-eye" id="wizEye" title="Показать/скрыть ключ">&#x1F441;</button>
           </div>
           <div class="fmt-note" id="wizKeyNote"></div>
+        </div>
+        <div class="field">
+          <label>Пул ключей <span class="muted">— необязательно, по одному на строке</span></label>
+          <textarea id="wiz-pool" class="pool-area" rows="3" placeholder="Запасные ключи — каждый с новой строки" autocomplete="off" spellcheck="false"></textarea>
         </div>
         <label class="check-line">
           <input type="checkbox" id="wiz-env" checked />

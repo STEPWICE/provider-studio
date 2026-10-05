@@ -5,6 +5,7 @@
  * file drives disagreement rather than agreement.
  */
 import * as C from "./src/catalog.mjs";
+import { readLimitedResponseText } from "./src/proxy.mjs";
 
 let passed = 0;
 const failures = [];
@@ -186,6 +187,26 @@ eq("an unknown model yields nothing", C.suggestSpecs(cat, "nope").found, false);
   C.clearCatalogCache();
   await C.loadCatalog({ fetchImpl: counting });
   eq("clearing the cache forces a refetch", calls, 2);
+}
+
+{
+  const declared = new Response("too large", { headers: { "content-length": "9" } });
+  let declaredError = "";
+  try { await readLimitedResponseText(declared, 8); } catch (e) { declaredError = e.message; }
+  check("an oversized content-length is rejected", /обрезан/.test(declaredError), declaredError);
+
+  let cancelled = false;
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(5));
+      controller.enqueue(new Uint8Array(5));
+    },
+    cancel() { cancelled = true; },
+  });
+  let actualError = "";
+  try { await readLimitedResponseText(new Response(stream), 8); } catch (e) { actualError = e.message; }
+  check("actual bytes over the limit are rejected", /обрезан/.test(actualError), actualError);
+  check("an oversized actual body is cancelled", cancelled);
 }
 
 console.log(`\n${passed}/${passed + failures.length} passed`);

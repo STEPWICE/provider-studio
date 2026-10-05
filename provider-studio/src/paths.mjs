@@ -178,7 +178,8 @@ export function sha256(text) {
  */
 export function fileStamp(path) {
   if (!existsSync(path)) return { exists: false, size: 0, mtime: 0, hash: "" };
-  const st = statSync(path);
+  let st;
+  try { st = statSync(path); } catch { return { exists: false, size: 0, mtime: 0, hash: "" }; }
   let hash = "";
   try { hash = sha256(readFileSync(path, "utf8")); } catch { /* binary or locked */ }
   return { exists: true, size: st.size, mtime: st.mtimeMs, hash };

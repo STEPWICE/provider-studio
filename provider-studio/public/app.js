@@ -46,6 +46,12 @@ const state = {
   // Hash of the on-disk change the external-edit banner was already shown for,
   // so the poll does not re-raise a dismissed banner every 5 seconds.
   extNotifiedHash: "",
+  // Key-pool ceiling from the server (/api/state poolMax). The pool is
+  // write-only: raw keys never come back from the server, only masks.
+  poolMax: 20,
+  // Unsaved pool textarea per provider key (memory only, never persisted):
+  // switching providers no longer eats a just-pasted key list.
+  poolDrafts: new Map(),
 };
 
 const INPUT_TYPES = ["text", "image", "video", "audio", "pdf"];
@@ -111,6 +117,13 @@ function setBtnLoading(btn, loading) {
   }
 }
 
+// One line at every button instead of four: shows "…" while the handler runs
+// and always restores the button, even when the handler throws.
+async function withLoading(btn, fn) {
+  setBtnLoading(btn, true);
+  try { await fn(); } finally { setBtnLoading(btn, false); }
+}
+
 async function init() {
   const d = await apiSafe("/api/state");
   if (!d || (!asArray(d.formats).length && !d.opencode)) {
@@ -120,6 +133,7 @@ async function init() {
   state.formats = asArray(d.formats);
   state.targets = asArray(d.targets);
   state.presets = asArray(d.presets);
+  if (Number(d.poolMax) > 0) state.poolMax = Math.trunc(Number(d.poolMax));
   // The store file has historically held a bare object; never assume an array.
   const live = asArray(d.opencode && d.opencode.providers);
   const byName = new Map();
@@ -195,19 +209,10 @@ async function init() {
   });
   $("#f-envname").addEventListener("input", () => { $("#f-envname").dataset.touched = "1"; });
   $("#btnAddModel").addEventListener("click", () => openModelModal());
-  $("#btnTestAll").addEventListener("click", async () => {
-    setBtnLoading($("#btnTestAll"), true);
-    try { await testAllModels(); } finally { setBtnLoading($("#btnTestAll"), false); }
-  });
-  $("#btnApply").addEventListener("click", async () => {
-    setBtnLoading($("#btnApply"), true);
-    try { await apply(); } finally { setBtnLoading($("#btnApply"), false); }
-  });
+  $("#btnTestAll").addEventListener("click", () => withLoading($("#btnTestAll"), testAllModels));
+  $("#btnApply").addEventListener("click", () => withLoading($("#btnApply"), apply));
   $("#btnPaste").addEventListener("click", copyJson);
-  $("#btnPreview").addEventListener("click", async () => {
-    setBtnLoading($("#btnPreview"), true);
-    try { await preview(); } finally { setBtnLoading($("#btnPreview"), false); }
-  });
+  $("#btnPreview").addEventListener("click", () => withLoading($("#btnPreview"), preview));
   $("#diffClose").addEventListener("click", closeDiff);
   $("#diffCancel").addEventListener("click", closeDiff);
   $("#diffBackdrop").addEventListener("click", (e) => { if (e.target.id === "diffBackdrop") closeDiff(); });
@@ -230,31 +235,30 @@ async function init() {
     toast("Правки пойдут в: " + (state.configPath || "конфиг по умолчанию"), "");
   });
   $("#btnNew").addEventListener("click", () => {
-    if (confirm("Сбросить форму? Несохранённые изменения будут потеряны.")) {
+    if (confirm("Начать с чистого листа? Несохранённые правки в форме пропадут.")) {
+      stashPoolDraft();
       state.models = [];
       state.editingKey = "";
       renderModelList();
       $$("#f-name, #f-baseurl, #f-apikey, #f-envname").forEach(el => el.value = "");
+      clearPoolBox();
       delete $("#f-envname").dataset.touched;
       $("#f-format").value = "openai-chat";
       updateFormatNote();
       restoreDefaults();
       state.dirty = false;
       state.savedSnapshot = formSnapshot();
-      toast("Форма очищена", "");
+      toast("Форма очищена — можно добавлять новый провайдер", "");
     }
   });
-  $("#btnTest").addEventListener("click", async () => {
-    setBtnLoading($("#btnTest"), true);
-    try { await testConnection(); } finally { setBtnLoading($("#btnTest"), false); }
-  });
+  $("#btnTest").addEventListener("click", () => withLoading($("#btnTest"), testConnection));
+  $("#btnPoolCheck").addEventListener("click", () => withLoading($("#btnPoolCheck"), checkPool));
+  $("#btnPoolSave").addEventListener("click", () => withLoading($("#btnPoolSave"), savePoolEnv));
+  $("#f-pool").addEventListener("input", renderPoolCount);
   $("#btnValidate").addEventListener("click", validate);
   $("#btnBackupNow").addEventListener("click", backupNow);
   $("#btnUndo").addEventListener("click", doUndo);
-  $("#btnPerks").addEventListener("click", async () => {
-    setBtnLoading($("#btnPerks"), true);
-    try { await renderDigest(false); } finally { setBtnLoading($("#btnPerks"), false); }
-  });
+  $("#btnPerks").addEventListener("click", () => withLoading($("#btnPerks"), () => renderDigest(false)));
   $("#extChangeBtn").addEventListener("click", async () => {
     $("#extChange").hidden = true;
     state.extNotifiedHash = "";
@@ -267,14 +271,8 @@ async function init() {
   setInterval(pollExternalChanges, 5000);
   refreshUndo();
   $("#btnImport").addEventListener("click", importFromOpenCode);
-  $("#btnDiscover").addEventListener("click", async () => {
-    setBtnLoading($("#btnDiscover"), true);
-    try { await openDiscover(); } finally { setBtnLoading($("#btnDiscover"), false); }
-  });
-  $("#btnDiag").addEventListener("click", async () => {
-    setBtnLoading($("#btnDiag"), true);
-    try { await diagnose(); } finally { setBtnLoading($("#btnDiag"), false); }
-  });
+  $("#btnDiscover").addEventListener("click", () => withLoading($("#btnDiscover"), openDiscover));
+  $("#btnDiag").addEventListener("click", () => withLoading($("#btnDiag"), diagnose));
   $("#discoverClose").addEventListener("click", closeDiscover);
   $("#discoverCancel").addEventListener("click", closeDiscover);
   $("#discoverAdd").addEventListener("click", addDiscovered);
@@ -312,10 +310,7 @@ async function init() {
     const inp = $("#wiz-apikey");
     inp.type = inp.type === "password" ? "text" : "password";
   });
-  $("#wizReload").addEventListener("click", async () => {
-    setBtnLoading($("#wizReload"), true);
-    try { await loadWizardModels(); } finally { setBtnLoading($("#wizReload"), false); }
-  });
+  $("#wizReload").addEventListener("click", () => withLoading($("#wizReload"), loadWizardModels));
   $("#wizFreeOnly").addEventListener("click", () => {
     state.wizFreeOnly = !state.wizFreeOnly;
     $("#wizFreeOnly").classList.toggle("on", state.wizFreeOnly);
@@ -578,9 +573,20 @@ const CYRILLIC_MAP = {
   я: "ya", ґ: "g", є: "ye", і: "i", ї: "yi",
 };
 function slugifyName(name) {
-  return String(name || "").toLowerCase()
+  const raw = String(name || "").trim();
+  const s = raw.toLowerCase()
     .replace(/[а-яёґєії]/g, (c) => CYRILLIC_MAP[c] ?? "")
     .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  if (s) return s;
+  // Same non-latin fallback as slugify() in src/formats.mjs: distinct CJK /
+  // Arabic names must predict distinct keys, or the preview shows a key the
+  // server will not use.
+  if (/[^\x00-\x7F]/.test(raw)) {
+    let h = 0;
+    for (let i = 0; i < raw.length; i++) h = (Math.imul(h, 31) + raw.charCodeAt(i)) | 0;
+    return `provider-${(h >>> 0).toString(36)}`;
+  }
+  return "";
 }
 
 // Mirrors detectFormatFromURL() in src/presets.mjs. Kept in sync by verify-ui.
@@ -746,14 +752,16 @@ async function doUndo() {
  */
 async function pollExternalChanges() {
   if (document.hidden) return;
+  // Light endpoint: the full /api/state carried presets, formats and the whole
+  // backup listing every 5s for a 64-char hash. /api/watch answers one read.
   let d = null;
-  try { d = await api("/api/state" + "?configPath=" + encodeURIComponent(state.configPath || "")); } catch { return; }
-  if (!d || !d.opencode) return;
+  try { d = await api("/api/watch" + "?configPath=" + encodeURIComponent(state.configPath || "")); } catch { return; }
+  if (!d || !d.ok) return;
   syncUndoButton(d.undo);
   // Belt and braces: the server already scopes by configPath, but comparing
   // against a different file's hash would cry wolf on every poll.
-  if (state.configPath && d.opencode.path !== state.configPath) return;
-  const live = d.opencode.hash || "";
+  if (state.configPath && d.path !== state.configPath) return;
+  const live = d.hash || "";
   if (!live || live === state.configHash) {
     state.extNotifiedHash = "";
     const e = $("#extChange");
@@ -899,6 +907,7 @@ async function deleteEverywhere(name) {
   state.configHash = r.hash || "";
 
   const orphaned = asArray(r.orphaned);
+  const removed = asArray(r.removedKeys);
   openDiff({
     title: `Удалить «${key}» полностью`,
     meta: `<div class="diff-path">${esc(r.path || "")}</div>
@@ -906,7 +915,8 @@ async function deleteEverywhere(name) {
       <span class="minus">-${r.diff ? r.diff.removed : 0}</span></div>`,
     diff: r.diff,
     // A dangling default model stops opencode from starting, so say so up front.
-    hint: (orphaned.length ? `Будет переназначено: ${orphaned.join(", ")}. ` : "")
+    hint: (removed.length > 1 ? `Пул ключей: уйдут ${removed.length} шардов${r.pluginEntry ? " и плагин ротации" : ""}. ` : "")
+      + (orphaned.length ? `Будет переназначено: ${orphaned.join(", ")}. ` : "")
       + "Уберёт из opencode-конфига и из списка (с бэкапом и откатом).",
     confirmLabel: "Удалить полностью",
     onConfirm: async () => {
@@ -932,6 +942,7 @@ async function deleteEverywhere(name) {
 function loadProviderIntoForm(name) {
   const p = state.providers.find((x) => x.name === name);
   if (!p) return;
+  stashPoolDraft();
   // Remember the key this provider currently has in the config: renaming the
   // display name must move that block, not leave an orphan behind.
   state.editingKey = slugifyName(p.name);
@@ -939,7 +950,10 @@ function loadProviderIntoForm(name) {
   $("#f-name").value = p.name || "";
   $("#f-baseurl").value = p.baseURL || "";
   // Keys are never persisted server-side, so this is empty for stored providers.
+  // The pool is write-only for the same reason: raw keys never come back.
   $("#f-apikey").value = p.apiKey || "";
+  clearPoolBox();
+  restorePoolDraft();
   if (p.apiFormat) $("#f-format").value = p.apiFormat;
   updateFormatNote();
   state.models = (p.models || []).map((m) => ({ ...m }));
@@ -997,12 +1011,19 @@ async function testAllModels() {
 
   box.hidden = false;
   box.className = "batch-status";
+  // A 200-model run takes minutes server-side with a single end response, so a
+  // frozen "Проверяю…" reads as a hang. Tick the elapsed time — honest progress
+  // without pretending to know the pace.
+  const started = Date.now();
+  const mmss = (ms) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
   box.textContent = `Проверяю ${ids.length} моделей\u2026`;
+  const ticker = setInterval(() => { box.textContent = `Проверяю ${ids.length} моделей\u2026 ${mmss(Date.now() - started)}`; }, 1000);
 
   const r = await apiSafe("/api/testchat-batch", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ provider: collectProvider(), modelIds: ids }),
   });
+  clearInterval(ticker);
   if (!r || (!r.result && !r.ok)) {
     box.className = "batch-status err";
     box.textContent = `\u2715 ${(r && r.error) || "не удалось проверить"}`;
@@ -1056,11 +1077,251 @@ async function testSingleModel(index, btn) {
     state.probeResults = state.probeResults || {};
     state.probeResults[m.id] = { id: m.id, ...(r.result || { ok: false, message: (r && r.error) || "не удалось проверить" }) };
     const p = state.probeResults[m.id];
-    toast(`${p.ok ? "\u2713" : "\u2715"} ${m.id}: ${p.message || ""}`, p.ok ? "ok" : "err");
+    toast(`${p.ok ? "✓" : "✕"} ${m.id}: ${p.message || ""}`, p.ok ? "ok" : "err");
   } finally {
     if (btn) setBtnLoading(btn, false);
     renderModelList();
   }
+}
+
+/**
+ * Пул ключей: write-only textarea «по ключу с новой строки».
+ *
+ * Сырые ключи живут только в поле формы и уходят на локальный сервер
+ * для проб/записи в env; обратно сервер возвращает только маски.
+ * Поэтому пул никогда не подгружается из конфига — поле всегда пустое
+ * после загрузки провайдера.
+ */
+function poolKeys() {
+  const raw = String($("#f-pool") ? $("#f-pool").value || "" : "");
+  const seen = new Set();
+  const out = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const k = line.trim();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+    if (out.length >= (state.poolMax || 20)) break;
+  }
+  return out;
+}
+
+function poolEnvBase(provider) {
+  const fromField = $("#f-envname") ? $("#f-envname").value.trim() : "";
+  if (fromField) return fromField;
+  if (provider && provider.envVarName) return provider.envVarName;
+  return suggestEnvName((provider && provider.name) || ($("#f-name") ? $("#f-name").value : ""));
+}
+
+function renderPoolCount() {
+  const el = $("#poolCount");
+  if (!el) return;
+  const n = poolKeys();
+  const rawLines = String($("#f-pool").value || "").split(/\r?\n/).filter((l) => l.trim()).length;
+  el.textContent = n.length ? `Ключей: ${n.length}${rawLines > n.length ? ` (дубли убраны: ${rawLines - n.length})` : ""}` : "";
+}
+
+// Маркер построчного вердикта — те же пять состояний, что у моделей.
+function poolMark(x) {
+  if (!x) return "";
+  if (x.ok) return `<span class="pool-mark-ok" title="Ключ рабочий">✓</span> `;
+  if (x.fault === "plan") return `<span class="pool-mark-pay" title="Ключ рабочий, но баланс/тариф не даёт ответить">₽</span> `;
+  if (x.fault === "quota" || x.fault === "blocked" || x.transient) return `<span class="pool-mark-retry" title="Временно отклонён — при ротации будет повтор">↻</span> `;
+  return `<span class="pool-mark-bad" title="Ключ не работает">✕</span> `;
+}
+
+function poolBalanceText(b) {
+  if (!b || typeof b !== "object") return "";
+  if (b.supported && b.ok && (b.remaining != null || b.limit != null)) {
+    const parts = [];
+    if (b.remaining != null) parts.push(`остаток ${b.remaining}`);
+    if (b.limit != null) parts.push(`лимит ${b.limit}`);
+    if (b.usage != null) parts.push(`потрачено ${b.usage}`);
+    return parts.join(" · ");
+  }
+  return b.note || "";
+}
+
+function renderPoolResults(results) {
+  const box = $("#poolStatus");
+  if (!box) return;
+  box.hidden = false;
+  const rows = asArray(results).map((x) => {
+    const bal = poolBalanceText(x.balance);
+    return `<div class="pool-key-row">${poolMark(x)}<span class="pool-mask">ключ ${Number(x.index) + 1} ${esc(x.mask || "")}</span>`
+      + `<span class="pool-msg">${esc(x.message || "")}</span>`
+      + (bal ? `<span class="pool-balance">${esc(bal)}</span>` : "") + `</div>`;
+  }).join("");
+  const passed = asArray(results).filter((x) => x.ok).length;
+  box.innerHTML = `<div class="muted">Живых ключей: ${passed} из ${asArray(results).length}</div>` + rows;
+}
+
+// Write-only поле: сырые ключи никогда не возвращаются с сервера, поэтому при
+// смене провайдера или очистке формы остатки прошлой проверки прячутся здесь,
+// а не копипастой в каждом обработчике.
+function clearPoolBox() {
+  $("#f-pool").value = "";
+  const poolBox = $("#poolStatus");
+  if (poolBox) { poolBox.hidden = true; poolBox.innerHTML = ""; }
+  renderPoolCount();
+}
+
+// Вставленные, но не применённые ключи пула живут в памяти под ключом
+// провайдера: переключение туда-сюда их больше не съедает.
+function stashPoolDraft() {
+  const box = $("#f-pool");
+  if (!box) return;
+  if (!state.poolDrafts) state.poolDrafts = new Map();
+  const k = state.editingKey || "__new__";
+  if (box.value.trim()) state.poolDrafts.set(k, box.value);
+  else state.poolDrafts.delete(k);
+}
+
+function restorePoolDraft() {
+  const d = state.poolDrafts ? state.poolDrafts.get(state.editingKey || "__new__") : "";
+  if (d) {
+    $("#f-pool").value = d;
+    renderPoolCount();
+  }
+}
+
+async function checkPool() {
+  const keys = poolKeys();
+  if (!keys.length) return toast("Пул пуст — вставь ключи, каждый с новой строки", "err");
+  const baseURL = $("#f-baseurl").value.trim();
+  if (!baseURL) return toast("Укажи Base URL для проверки пула", "err");
+  const modelId = (state.models[0] && state.models[0].id) || "";
+  if (!modelId) return toast("Сначала добавь хотя бы одну модель — проба идёт через неё", "err");
+  if (!confirm(`Отправить по одному настоящему запросу с каждого ключа пула (${keys.length})?\n` +
+    `Это реальные запросы к провайдеру — они могут стоить денег.`)) return;
+  const box = $("#poolStatus");
+  box.hidden = false;
+  box.innerHTML = `<div class="muted">Проверяю ${keys.length} ключей…</div>`;
+  const r = await apiSafe("/api/pool-check", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      baseURL, apiFormat: $("#f-format").value,
+      keys, modelId,
+    }),
+  });
+  if (!r || !r.ok) {
+    box.innerHTML = `<div class="muted">✕ ${(r && r.error) || "не удалось проверить пул"}</div>`;
+    return toast((r && r.error) || "Не удалось проверить пул", "err");
+  }
+  renderPoolResults(r.results);
+}
+
+async function savePoolEnv() {
+  const keys = poolKeys();
+  if (!keys.length) return toast("Пул пуст — вставь ключи, каждый с новой строки", "err");
+  const provider = collectProvider();
+  const base = poolEnvBase(provider);
+  if (!base) return toast("Укажи имя переменной окружения", "err");
+  const btn = $("#btnPoolSave");
+  if (btn) setBtnLoading(btn, true);
+  try {
+    const r = await apiSafe("/api/setenv-pool", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base, keys }),
+    });
+    if (!r || !r.ok) return toast((r && r.error) || "Не удалось записать пул", "err");
+    const bad = (r.results || []).filter((x) => !x.ok);
+    if (bad.length) {
+      toast(`Записано частично: ${bad.map((x) => `${x.name}: ${x.error || "ошибка"}`).join("; ")}`, "err");
+    } else {
+      toast(`Пул записан: ${(r.results || []).length} переменных (${base}, ${base}_2…)`, "ok");
+    }
+    if (r.note) setStatus(r.note, "");
+  } finally {
+    if (btn) setBtnLoading(btn, false);
+  }
+}
+
+function poolRequestBody(provider) {
+  return {
+    provider,
+    keys: poolKeys(),
+    envBase: poolEnvBase(provider),
+    configPath: state.configPath,
+    previousKey: state.editingKey,
+    defaultModelId: $("#f-defaultmodel").value || "",
+    hash: state.configHash,
+    withPlugin: true,
+  };
+}
+
+async function poolPreview(provider) {
+  setStatus("Считаю изменения пула…", "");
+  const seq = ++previewSeq;
+  const r = await apiSafe("/api/pool-preview", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(poolRequestBody(provider)),
+  });
+  if (seq !== previewSeq) return;
+  if (!r.ok) return toast(r.error || "Не удалось построить diff пула", "err");
+  state.configHash = r.hash || "";
+  openDiff({
+    title: `Пул ключей: ${(r.shardKeys || []).length} шардов + плагин`,
+    meta: `<div class="diff-path">${esc(r.path || "")}</div>
+      <div class="diff-stat"><span class="plus">+${r.diff ? r.diff.added : 0}</span>
+      <span class="minus">-${r.diff ? r.diff.removed : 0}</span>
+      <span class="tag">шарды: ${esc((r.shardKeys || []).join(", "))}</span>
+      ${r.plugin ? `<span class="tag">плагин: ${esc(r.plugin.fileName)}</span>` : ""}</div>`,
+    diff: r.diff,
+    hint: r.defaultModel ? `Модель по умолчанию: ${r.defaultModel}. Ключи в конфиг не попадут — только ссылки {env:...} и плагин ротации.` : "",
+    onConfirm: async () => { await poolApplyNow(provider); },
+  });
+}
+
+async function poolApplyNow(provider) {
+  closeDiff();
+  setStatus("Применяю пул…", "");
+  const res = await apiSafe("/api/pool-apply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(poolRequestBody(provider)),
+  });
+  if (res.conflict) {
+    await refreshConfigState();
+    return toast("Файл изменился на диске. Нажми «Показать diff» и проверь заново.", "err");
+  }
+  if (!res.ok) return toast(res.error || "Не удалось применить пул", "err");
+  if (res.backupFile) setBackupInfo(`↻ Автобэкап: ${res.backupFile}`);
+  if (Array.isArray(res.providers)) {
+    state.providers = res.providers;
+    renderProviderList();
+  }
+  if (res.storeSynced === false) {
+    toast("Пул записан в конфиг, но sidebar-список не сохранился — проверь диск.", "err");
+  }
+  if (res.hash) state.configHash = res.hash;
+  state.editingKey = slugifyName(provider.name);
+  state.dirty = false;
+  state.savedSnapshot = formSnapshot();
+  refreshBackups();
+  refreshUndo();
+
+  const resultsEl = $("#results");
+  resultsEl.hidden = false;
+  syncSidePlaceholder();
+  const shardLines = (res.shards || []).map((s) => `<div class="ok-line" style="color:var(--muted)">${esc(s.key)} → {env:${esc(s.envVar)}}</div>`).join("");
+  resultsEl.innerHTML = `<div class="result-card"><h3>opencode · пул ключей</h3>`
+    + `<div class="ok-line">✓ Применено: ${(res.shardKeys || []).length} шардов. Модель по умолчанию: ${esc(res.defaultModel || "—")}</div>`
+    + shardLines
+    + (res.pluginFile ? `<div class="ok-line" style="color:var(--muted)">Плагин ротации: ${esc(res.pluginFile)} — перезапусти opencode</div>`
+      : `<div class="err-line">✕ Плагин не записан: ${esc(res.pluginError || "ошибка")}</div>`)
+    + `<div class="ok-line" style="color:var(--muted)">config: ${esc(res.path || "")}</div>`
+    + ((res.missingEnv && res.missingEnv.length)
+      ? `<div class="err-line">✕ Нет значений: ${esc(res.missingEnv.join(", "))} — нажми «Записать пул в env», затем перезапусти терминал и opencode.</div>`
+      : `<div class="ok-line" style="color:var(--muted)">Все переменные пула заданы.</div>`)
+    + `</div>`;
+  if (!(await offerPoolEnvSave(res))) toast("Пул применён. Не забудь записать ключи в env.", "ok");
+}
+
+async function poolApply(provider) {
+  if (provider.useEnvVar && !provider.envVarName)
+    return toast("Укажи имя переменной окружения — оно станет базой имён пула", "err");
+  await poolPreview(provider);
 }
 
 function plural(n, one, few, many) {
@@ -1291,6 +1552,8 @@ async function preview() {
   const provider = collectProvider();
   const err = validateForm(provider);
   if (err) return toast(err, "err");
+  // A non-empty pool takes the pool path: N shards + rotation plugin.
+  if (poolKeys().length) return poolPreview(provider);
 
   setStatus("Считаю изменения\u2026", "");
   const seq = ++previewSeq;
@@ -1329,6 +1592,8 @@ async function apply() {
   const provider = collectProvider();
   const err = validateForm(provider);
   if (err) return toast(err, "err");
+  // A non-empty pool takes the pool path: N shards + rotation plugin.
+  if (poolKeys().length) return poolApply(provider);
   if (!provider.useEnvVar && provider.apiKey &&
       !confirm("Ключ будет записан в opencode-конфиг открытым текстом. Продолжить?"))
     return;
@@ -1403,10 +1668,16 @@ async function applyNow(provider) {
     return toast("Файл изменился на диске. Нажми «Показать diff» и проверь заново.", "err");
   }
   if (!res.ok) return toast(res.error || "Не удалось применить", "err");
+  // The typed key is discarded on an $ENV write: offer to persist it now,
+  // while it is still on screen, instead of letting it evaporate.
+  await offerEnvSave(provider);
   if (res.backupFile) setBackupInfo(`\u21bb Автобэкап: ${res.backupFile}`);
   if (Array.isArray(res.providers)) {
     state.providers = res.providers;
     renderProviderList();
+  }
+  if (res.storeSynced === false) {
+    toast("В конфиг записано, но sidebar-список не сохранился — проверь диск.", "err");
   }
   // The write moved the file on, so the old hash is stale: adopt the new one or
   // the next save would be refused as a false conflict.
@@ -1628,6 +1899,7 @@ async function openDiscover() {
   const provider = collectProvider();
   if (!provider.baseURL) return toast("Сначала укажи Base URL", "err");
   $("#discoverBackdrop").hidden = false;
+  $("#disc-search").focus();
   $("#discoverStatus").className = "discover-status";
   $("#discoverStatus").textContent = "Загружаю /models\u2026";
   $("#discoverList").innerHTML = `<div class="discover-empty">Поиск моделей\u2026</div>`;
@@ -1858,6 +2130,8 @@ function openWizard() {
   renderPresetGrid();
   $("#wizardBackdrop").hidden = false;
   showWizardStep(0);
+  // Курсор сразу в фильтре: первый шаг — это выбор из списка.
+  $("#presetSearch").focus();
 }
 
 function closeWizard() { $("#wizardBackdrop").hidden = true; }
@@ -1994,6 +2268,66 @@ function syncWizEnvField() {
 }
 
 /**
+ * After a successful $ENV write the typed key exists only on screen: the
+ * config holds a reference to a variable that may not exist yet. One confirm
+ * writes it via setx, so «ключ пропал» never turns into «401 в opencode».
+ * Accepted → the field is cleared (the key now lives in the OS, not the form).
+ * Declined → the field is left alone for a manual setx.
+ */
+async function offerEnvSave(provider) {
+  if (!provider.useEnvVar || !provider.apiKey) return;
+  const st = await envVarStatus(provider.envVarName);
+  if (st && st.set) return;
+  if (!confirm(`Сохранить введённый ключ в переменную ${provider.envVarName}, чтобы конфиг сразу заработал?\n(запишется через setx для текущего пользователя)`)) return;
+  const r = await apiSafe("/api/setenv", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: provider.envVarName, value: provider.apiKey }),
+  });
+  if (!r || !r.ok) {
+    toast(`Не записалось: ${(r && r.error) || "ошибка"}. Задай вручную: setx ${provider.envVarName} "твой-ключ"`, "err");
+    return;
+  }
+  $("#f-apikey").value = "";
+  renderKeyHint();
+  toast(`Ключ сохранён в ${provider.envVarName}. Запускай opencode из нового окна терминала.`, "ok");
+}
+
+/**
+ * Same idea for a pool: pool-apply reports which variables still have no
+ * value, and the keys are still sitting in the textarea. One confirm writes
+ * exactly those. Refuses when the textarea changed since the apply — index
+ * order is what maps keys to BASE/BASE_2/…, so a mismatch would misfile them.
+ * Returns true when no reminder is needed (nothing missing, written, or the
+ * results card already instructs the manual path).
+ */
+async function offerPoolEnvSave(res) {
+  const missing = asArray(res.missingEnv);
+  if (!missing.length) return true;
+  const keys = poolKeys();
+  const names = asArray(res.envNames);
+  if (!keys.length || keys.length !== names.length) return true;
+  if (!confirm(`Записать ${keys.length} ключей пула в переменные окружения (${missing.length} из них ещё не заданы)?`)) return false;
+  const r = await apiSafe("/api/setenv-pool", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ envBase: names[0], keys }),
+  });
+  if (!r || !r.ok) {
+    toast((r && r.error) || "Не удалось записать пул", "err");
+    return true;
+  }
+  const bad = asArray(r.results).filter((x) => !x.ok);
+  if (bad.length) {
+    toast(`Записано частично: ${bad.map((x) => `${x.name}: ${x.error || "ошибка"}`).join("; ")}`, "err");
+    return true;
+  }
+  if (state.poolDrafts) state.poolDrafts.delete(state.editingKey || "__new__");
+  $("#f-pool").value = "";
+  renderPoolCount();
+  toast(`Пул записан: ${keys.length} переменных. Запускай opencode из нового окна терминала.`, "ok");
+  return true;
+}
+
+/**
  * Writes the variable using the key already typed into the form.
  *
  * The value is sent once and never echoed back; the response only reports
@@ -2114,6 +2448,8 @@ function renderWizardModels() {
 function renderWizardSummary() {
   const p = wizardProvider();
   const models = [...state.wizSelected];
+  const wizPoolN = String($("#wiz-pool") ? $("#wiz-pool").value || "" : "")
+    .split(/\r?\n/).map((l) => l.trim()).filter(Boolean).length;
   const rows = [
     ["Провайдер", esc(p.name || "\u2014"), ""],
     ["Ключ в конфиге", esc(slugifyName(p.name) || "\u2014"), "mono"],
@@ -2121,6 +2457,7 @@ function renderWizardSummary() {
     ["Формат API", esc(p.apiFormat), ""],
     ["Моделей выбрано", String(models.length), models.length ? "" : "warn"],
     ["Модель по умолчанию", esc(models[0] || "\u2014"), ""],
+    ["Ключей в пуле", wizPoolN ? wizPoolN + " — запишутся шардами + плагин ротации" : "—", ""],
     p.useEnvVar
       ? ["API-ключ", `в конфиг попадёт {env:${esc(p.envVarName)}}, сам ключ не записывается`, ""]
       : ["API-ключ", "будет записан в конфиг открытым текстом", "warn"],
@@ -2179,6 +2516,8 @@ function finishWizard() {
   $("#f-name").value = p.name;
   $("#f-baseurl").value = p.baseURL;
   $("#f-apikey").value = p.apiKey;
+  $("#f-pool").value = $("#wiz-pool") ? $("#wiz-pool").value : "";
+  renderPoolCount();
   $("#f-format").value = p.apiFormat;
   state.formatTouched = true;
   updateFormatNote();
@@ -2289,7 +2628,7 @@ async function diagnose() {
       <span class="diag-meta">${p.nModels} моделей</span>
       ${reachBadge(p)}
     </div>
-    <div class="diag-sub muted">${esc(p.conn || "")} \u00b7 ${esc(p.baseURL || "\u2014")}</div>`;
+    <div class="diag-sub muted">${esc(p.conn || "")} · ${esc(p.baseURL || "—")}${typeof p.ms === "number" ? ` · ${p.ms} мс` : ""}</div>`;
   }
 
   // If the default model points at a provider that is down, offer the one-click
@@ -2645,7 +2984,41 @@ async function doSelfCheck() {
  * Daily freebies digest: what providers are giving away right now (promos,
  * trials, student plans) plus the service news that affect availability.
  * Read-only by design — a perk is a lead to check, not a button that spends.
+ * But where a perk maps onto a known API preset, one click opens the wizard
+ * with that preset: that is the whole distance from "free models" to a
+ * working config, so the digest earns its button.
  */
+const DIGEST_PRESET_HINTS = [
+  [/nvidia/i, "nvidia-nim"],
+  [/z\.?ai|zhipu|\bglm\b/i, "zai"],
+  [/deepseek/i, "deepseek"],
+  [/google|gemini/i, "google-ai-studio"],
+  [/openai|chatgpt|codex/i, "openai"],
+  [/anthropic|claude/i, "anthropic"],
+  [/groq/i, "groq"],
+  [/mistral|codestral/i, "mistral"],
+  [/together/i, "together"],
+  [/cerebras/i, "cerebras"],
+  [/openrouter/i, "openrouter"],
+  [/ollama/i, "ollama"],
+];
+
+// A perk earns a "Настроить" button only when its provider is an API we know
+// the address of. Subscription and client-app credits (Cursor, Qoder, Manus…)
+// have no preset to open, so they render without one instead of guessing.
+function presetForPerk(p) {
+  const hay = `${p.provider || ""} ${p.product || ""} ${p.relatedModel || ""}`;
+  for (const [re, id] of DIGEST_PRESET_HINTS) {
+    if (re.test(hay)) {
+      const pr = state.presets.find((x) => x.id === id);
+      if (pr) return pr;
+    }
+  }
+  return null;
+}
+
+const DIGEST_GRANT_LABEL = { claim: "нужно забрать", auto: "включится само", policy: "условия тарифа" };
+
 async function renderDigest(force) {
   const el = $("#issues");
   el.hidden = false;
@@ -2654,30 +3027,59 @@ async function renderDigest(force) {
   const r = await apiSafe("/api/digest" + (force ? "?refresh=1" : ""));
   if (!r || (!r.ok && !asArray(r.perks).length && !asArray(r.news).length)) {
     el.innerHTML = `<div class="result-card"><h3>Халява</h3>`
-      + `<div class="err-line">\u2715 ${esc((r && r.error) || "не удалось загрузить")}</div></div>`;
+      + `<div class="err-line">✕ ${esc((r && r.error) || "не удалось загрузить")}</div></div>`;
     return toast("Дайджест недоступен", "err");
   }
+  state.lastDigest = r;
+  if (!state.digestFilter) state.digestFilter = "all";
+  paintDigest();
+}
+
+function paintDigest() {
+  const r = state.lastDigest;
+  if (!r) return;
+  const el = $("#issues");
+  const filter = state.digestFilter || "all";
   const perks = asArray(r.perks);
   const news = asArray(r.news);
   const when = r.as_of ? `данные борда на ${esc(r.as_of)}` : "дата неизвестна";
-  const stale = r.stale ? ` \u00b7 <span class="warn-line">кэш (сеть недоступна)</span>` : "";
+  const stale = r.stale ? ` · <span class="warn-line">кэш (сеть недоступна)</span>` : "";
   // Один фид висит, второй свеж: показываем что есть, а не красный экран.
-  const partial = r.partial ? ` \u00b7 <span class="warn-line">часть не загрузилась (${esc(r.error || "")})</span>` : "";
+  const partial = r.partial ? ` · <span class="warn-line">часть не загрузилась (${esc(r.error || "")})</span>` : "";
+  const chip = (id, label, title) =>
+    `<span class="filter-chip${filter === id ? " on" : ""}" data-df="${id}"${title ? ` title="${esc(title)}"` : ""}>${label}</span>`;
   let html = `<div class="result-card"><h3>Халява</h3>`
     + `<div class="ok-line" style="color:var(--muted)">${when}${stale}${partial}</div>`
     + `<div class="diag-fix"><button class="btn btn-mini" id="digestRefresh" type="button">Обновить</button></div>`
-    + `<div class="diag-sect">Раздают (${perks.length})</div>`;
-  if (!perks.length) html += `<div class="ok-line" style="color:var(--muted)">\u2014 пусто \u2014</div>`;
+    + `<div class="discover-filters">`
+    + chip("all", "Все")
+    + chip("api", "Можно подключить", "только раздачи с известным API-адресом — в один клик уходят в мастер")
+    + chip("claim", "Нужно забирать", "где требуется активное действие, а не просто подписка")
+    + `</div>`
+    + `<div class="diag-sect">Раздают</div>`;
+  let shown = 0;
   for (const p of perks) {
+    const preset = presetForPerk(p);
+    if (filter === "api" && !preset) continue;
+    if (filter === "claim" && p.grantMode !== "claim") continue;
+    shown++;
     const badge = p.status === "upcoming" ? "скоро" : p.status === "active" ? "идёт" : esc(p.status || "");
+    const grant = DIGEST_GRANT_LABEL[p.grantMode] || "";
     html += `<div class="diag-row"><span class="diag-name">${esc(p.title || p.id || "?")}</span>`
-      + `<span class="tag">${esc(badge)}</span></div>`
+      + `<span class="tag">${esc(badge)}</span>`
+      + (grant ? `<span class="tag">${esc(grant)}</span>` : "") + `</div>`
       + `<div class="diag-sub">${esc([p.provider, p.product].filter(Boolean).join(" · "))}`
-      + `${p.window ? ` \u00b7 ${esc(p.window)}` : ""}</div>`
+      + `${p.window ? ` · ${esc(p.window)}` : ""}`
+      + `${p.ends ? ` · до ${esc(p.ends)}` : ""}</div>`
+      + (p.relatedModel ? `<div class="diag-sub">Модель: ${esc(p.relatedModel)}</div>` : "")
       + (p.summary ? `<div class="diag-sub">${esc(p.summary)}</div>` : "")
       + (p.claim ? `<div class="diag-sub">Как забрать: ${esc(p.claim)}</div>` : "")
-      + (p.source ? `<div class="diag-sub"><a class="digest-link" href="${esc(p.source)}" target="_blank" rel="noopener">источник \u2197</a></div>` : "");
+      + `<div class="diag-sub">`
+      + (preset ? `<button class="btn btn-mini" data-digest-preset="${esc(preset.id)}" type="button">Настроить: ${esc(preset.label)}</button> ` : "")
+      + (p.source ? `<a class="digest-link" href="${esc(p.source)}" target="_blank" rel="noopener">источник ↗</a>` : "")
+      + `</div>`;
   }
+  if (!shown) html += `<div class="ok-line" style="color:var(--muted)">— с таким фильтром ничего нет —</div>`;
   html += `<div class="diag-sect">Новости (${news.length})</div>`;
   if (!news.length) html += `<div class="ok-line" style="color:var(--muted)">\u2014 пусто \u2014</div>`;
   // Rendered whole: the header promises news.length, and the feed holds
@@ -2690,11 +3092,16 @@ async function renderDigest(force) {
   }
   html += `</div>`;
   el.innerHTML = html;
+  el.querySelectorAll("[data-df]").forEach((ch) => ch.addEventListener("click", () => {
+    state.digestFilter = ch.dataset.df;
+    paintDigest();
+  }));
+  el.querySelectorAll("[data-digest-preset]").forEach((b) => b.addEventListener("click", () => {
+    openWizard();
+    selectPreset(b.dataset.digestPreset);
+  }));
   const rb = $("#digestRefresh");
-  if (rb) rb.onclick = async () => {
-    setBtnLoading(rb, true);
-    try { await renderDigest(true); } finally { setBtnLoading(rb, false); }
-  };
+  if (rb) rb.onclick = () => withLoading(rb, () => renderDigest(true));
 }
 
 /**
@@ -2710,7 +3117,9 @@ async function renderDigest(force) {
  */
 function maskSecretsForReport(text) {
   const stash = [];
-  const safe = String(text ?? "").replace(/\{env:[A-Za-z_][A-Za-z0-9_]*\}/g, (m) => {
+  // Env-имена и пути к файлам — не секреты: без них отчёт не объяснит
+  // env-missing/file-missing faults.
+  const safe = String(text ?? "").replace(/\{(env:[A-Za-z_][A-Za-z0-9_]*|file:[^}]+)\}/g, (m) => {
     stash.push(m);
     return `\u0000${stash.length - 1}\u0000`;
   });
@@ -2755,7 +3164,7 @@ async function copyDiagReport() {
     const state_ = p.reach === "unknown" ? "не проверяется"
       : p.reach === "up" && !p.fault ? "доступен"
       : `${p.reach || "?"}${p.fault ? ` (ошибка: ${p.fault})` : ""}`;
-    lines.push(`- ${p.key}: моделей ${p.nModels ?? "?"} — ${state_} — ${p.conn || ""} [${p.baseURL || "—"}]`);
+    lines.push(`- ${p.key}: моделей ${p.nModels ?? "?"} — ${state_} — ${p.conn || ""} [${p.baseURL || "—"}]${typeof p.ms === "number" ? ` ${p.ms} мс` : ""}`);
   }
   lines.push("", "## Конфиг");
   const issues = asArray(d.issues);

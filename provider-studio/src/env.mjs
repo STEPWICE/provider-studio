@@ -20,7 +20,8 @@
 //   scope). Those are the same stores `setx` writes to.
 
 import { execFileSync } from "node:child_process";
-import { IS_WINDOWS } from "./paths.mjs";
+import { readFileSync } from "node:fs";
+import { IS_WINDOWS, home } from "./paths.mjs";
 
 /** Env var names we accept — matches what opencode's `{env:...}` allows. */
 export const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -35,10 +36,14 @@ const MACHINE_ENV_KEY =
 // open is still picked up on the next check.
 const CACHE_TTL_MS = 2000;
 const cache = new Map(); // name -> { at, result }
+// Whole-key dumps share one TTL: one `reg query` per scope serves every
+// variable instead of one spawn per variable per scope.
+let dumpCache = { at: 0, user: null, machine: null };
 
 /** Drops memoised registry reads. Used by tests and after an explicit refresh. */
 export function clearEnvCache() {
   cache.clear();
+  dumpCache = { at: 0, user: null, machine: null };
 }
 
 /**
@@ -48,8 +53,16 @@ export function clearEnvCache() {
  * `reg` writes its "not found" message to stderr in the OEM codepage, which
  * arrives as mojibake and differs per system locale — so the message is never
  * parsed. Only the exit code and the parsed stdout decide the outcome.
+ *
+ * Prefers the whole-key dump (one spawn serves every variable); falls back to
+ * the single-value query when the dump is unavailable but a direct read works.
  */
-function readRegistryValue(key, name) {
+function readRegistryValue(key, name, { fresh = false } = {}) {
+  const dumped = readRegistryDump(key, { fresh });
+  if (dumped) {
+    const v = dumped.get(String(name).toLowerCase());
+    return v !== undefined ? v : null;
+  }
   let out;
   try {
     out = execFileSync("reg", ["query", key, "/v", name], {
@@ -62,6 +75,44 @@ function readRegistryValue(key, name) {
     return null; // missing value, missing key, or reg.exe unavailable
   }
   return parseRegQuery(out, name);
+}
+
+/**
+ * Dumps every value under a registry key in a single `reg query` call.
+ * Returns a Map of lowercased name -> raw value, or null when unreadable.
+ * Cached per TTL window, so a diagnostics run over a dozen providers costs
+ * two spawns total (user + machine scope) instead of two per variable.
+ */
+function readRegistryDump(key, { fresh = false } = {}) {
+  if (!IS_WINDOWS) return null;
+  const now = Date.now();
+  const slot = key === USER_ENV_KEY ? "user" : key === MACHINE_ENV_KEY ? "machine" : null;
+  if (!fresh && slot && dumpCache[slot] && now - dumpCache.at < CACHE_TTL_MS) return dumpCache[slot];
+  let out;
+  try {
+    out = execFileSync("reg", ["query", key], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 4000,
+      windowsHide: true,
+    });
+  } catch {
+    return null;
+  }
+  const map = new Map();
+  for (const line of String(out || "").split(/\r?\n/)) {
+    const m = line.match(
+      /^\s+(\S+)\s+(REG_SZ|REG_EXPAND_SZ|REG_MULTI_SZ|REG_DWORD|REG_QWORD|REG_BINARY|REG_NONE)\s{2,}([\s\S]*)$/,
+    );
+    if (m) { map.set(m[1].toLowerCase(), m[3]); continue; }
+    const e = line.match(/^\s+(\S+)\s+(REG_[A-Z_]+)\s*$/);
+    if (e) map.set(e[1].toLowerCase(), "");
+  }
+  if (slot) {
+    dumpCache = { ...dumpCache, at: now, [slot]: map };
+    return map;
+  }
+  return map;
 }
 
 /**
@@ -125,8 +176,11 @@ export function lookupEnv(name, { useCache = true } = {}) {
     found.push({ scope: "process", value: fromProcess.trim() });
   }
   if (IS_WINDOWS) {
+    // fresh follows useCache: the setx read-back check must see the registry
+    // as it is right now, not the dump from a moment ago.
+    const fresh = !useCache;
     for (const [scope, key] of [["user", USER_ENV_KEY], ["machine", MACHINE_ENV_KEY]]) {
-      const raw = readRegistryValue(key, clean);
+      const raw = readRegistryValue(key, clean, { fresh });
       if (typeof raw === "string" && raw.trim() !== "") {
         found.push({ scope, value: raw.trim() });
       }
@@ -152,7 +206,8 @@ export function lookupEnv(name, { useCache = true } = {}) {
  *
  * Accepts the `{env:VAR}` form opencode documents plus the `$VAR` / `${VAR}`
  * forms older versions of this tool wrote, so an imported config still probes
- * correctly.
+ * correctly. `{file:...}` is read from disk the way opencode reads it, so a
+ * file-backed key probes with the real bytes instead of the literal path.
  *
  * Returns { value, isRef, envVarName, resolved, scope }.
  *   isRef    — the field was a reference, not a literal key
@@ -163,6 +218,16 @@ export function lookupEnv(name, { useCache = true } = {}) {
  */
 export function resolveKeyRef(apiKey) {
   const raw = typeof apiKey === "string" ? apiKey.trim() : "";
+  const file = raw.match(/^\{file:([^}]+)\}$/);
+  if (file) {
+    const p = expandUser(file[1].trim());
+    let value = "";
+    try { value = readFileSync(p, "utf8").trim(); } catch { value = ""; }
+    return {
+      value, isRef: true, envVarName: "", filePath: p,
+      resolved: value !== "", scope: value !== "" ? "file" : null,
+    };
+  }
   const ref =
     raw.match(/^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/) ||
     raw.match(/^\$([A-Za-z_][A-Za-z0-9_]*)$/) ||
@@ -178,6 +243,14 @@ export function resolveKeyRef(apiKey) {
     resolved: info.set,
     scope: info.scope,
   };
+}
+
+/** Expands a leading ~ the way shells do, so {file:~/...} resolves. */
+function expandUser(p) {
+  const s = String(p || "");
+  if (s === "~") return home();
+  if (s.startsWith("~/") || s.startsWith("~\\")) return home() + s.slice(1);
+  return s;
 }
 
 /** The command that creates the variable, for error messages the user can act on. */
@@ -263,6 +336,9 @@ export function setUserEnvVar(name, value) {
 export function keyRefProblem(apiKey) {
   const r = resolveKeyRef(apiKey);
   if (r.isRef && !r.resolved) {
+    if (r.filePath) {
+      return `файл с ключом ${r.filePath} не читается — opencode подставит пустую строку и провайдер ответит 401`;
+    }
     return (
       `переменная ${r.envVarName} не задана — opencode подставит пустую строку ` +
       `и провайдер ответит 401. Задай её: ${setEnvCommand(r.envVarName)}`

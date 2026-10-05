@@ -1,11 +1,11 @@
 import http from "node:http";
 import path from "node:path";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import { exec } from "node:child_process";
 import {
   readConfig, readConfigAtPath, upsertProviderAsDefault, opencodeSummary, setDefaultModel,
-  planProviderChange, planProviderRemoval, removeProvider, renameProvider,
-  listOpencodeConfigs, writeConfigText, commitPlan,
+  planProviderChange, planProviderRemoval, planProvidersRemoval, removeProvider, removeProviders, renameProvider,
+  listOpencodeConfigs, writeConfigText, commitPlan, SCHEMA_URL,
 } from "./src/opencode.mjs";
 import { buildPreview } from "./src/diff.mjs";
 import { applyChangesVerified } from "./src/jsonc-edit.mjs";
@@ -13,7 +13,12 @@ import { buildAutoFixChanges, planRefresh, runSelfCheck, isFreeEntry, buildRefre
 import { smartAudit } from "./src/smart-audit.mjs";
 import { loadDigest } from "./src/digest.mjs";
 import { buildManifest, buildGuide, TARGETS } from "./src/targets.mjs";
-import { FORMATS, slugify, decodeApiKey, detectApiFormat, isCustomProviderBlock, looksLikePackage, modelEntryToForm } from "./src/formats.mjs";
+import { FORMATS, slugify, decodeApiKey, detectApiFormat, isCustomProviderBlock, looksLikePackage, modelEntryToForm, buildProviderChanges } from "./src/formats.mjs";
+import {
+  parseKeyPool, maskKey, poolEnvNames, poolEnvBaseFor, validateKeyPool, fetchKeyBalance,
+  buildPoolShards, buildKeypoolPlugin, poolPluginFileName, mergePluginEntry,
+  MAX_POOL_KEYS,
+} from "./src/keypool.mjs";
 import { PRESETS } from "./src/presets.mjs";
 import {
   backupConfig, listBackups, restoreBackup, validateConfig, testConnection,
@@ -32,7 +37,11 @@ import { proxyForUrl, describeProxy } from "./src/proxy.mjs";
 // The store lives in the per-user data dir, not next to the source: a packaged
 // exe sits in a read-only directory.
 const STORE = () => path.join(dataDir(), "providers.json");
-const WANTED = Number(process.env.PORT || 5173);
+const PORT_VALUE = process.env.PORT;
+const WANTED = PORT_VALUE === undefined ? 5173 : Number(PORT_VALUE);
+if (!Number.isInteger(WANTED) || WANTED < 1 || WANTED > 65535) {
+  throw new Error("PORT должен быть целым числом от 1 до 65535");
+}
 // Bind to loopback by default: the API is unauthenticated and can read the
 // opencode config, so exposing it on the LAN would leak credentials.
 const HOST = process.env.PS_HOST || "127.0.0.1";
@@ -54,22 +63,40 @@ const MIME = {
 // normalise so a legacy file can't take the whole server down.
 function loadStore() {
   const file = STORE();
-  if (!existsSync(file)) return [];
+  let text;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (e) {
+    if (e?.code === "ENOENT") return [];
+    throw Object.assign(new Error(`Не удалось прочитать store провайдеров: ${e?.message || e}`), { statusCode: 500 });
+  }
   let parsed;
-  try { parsed = JSON.parse(readFileSync(file, "utf8")); } catch { return []; }
-  if (Array.isArray(parsed)) return parsed.filter((p) => p && typeof p === "object");
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    throw Object.assign(new Error(`Store провайдеров повреждён: ${e?.message || e}`), { statusCode: 500 });
+  }
+  if (Array.isArray(parsed)) {
+    if (parsed.some((p) => !p || typeof p !== "object" || Array.isArray(p))) {
+      throw Object.assign(new Error("Store провайдеров повреждён: массив содержит невалидную запись"), { statusCode: 500 });
+    }
+    return parsed;
+  }
   if (parsed && typeof parsed === "object") return [parsed];
-  return [];
+  throw Object.assign(new Error("Store провайдеров повреждён: ожидался массив или legacy-объект"), { statusCode: 500 });
 }
 
 // API keys are never persisted here: the file sits inside the repo and would be
-// trivially committed. Only the env-var reference is kept.
+// trivially committed. Only the env-var reference is kept. Pool raw keys
+// (poolKeys/poolRaw) are stripped for the same reason — only pool metadata
+// (env base + size, no secrets) is kept.
 function stripSecrets(provider) {
-  const { apiKey, ...rest } = provider || {};
+  const { apiKey, poolKeys, poolRaw, ...rest } = provider || {};
   return { ...rest, apiKey: "" };
 }
 
 function saveStore(list) {
+  loadStore();
   ensureDir(dataDir());
   const safe = (Array.isArray(list) ? list : []).map(stripSecrets);
   // Atomic: a crash mid-write would otherwise leave a truncated store that
@@ -79,8 +106,54 @@ function saveStore(list) {
 
 // Providers are identified by their opencode key so that Apply followed by
 // Import doesn't create a near-duplicate entry for the same provider.
+// The explicit key wins: an imported provider keeps `key` distinct from the
+// display `name`, and slugifying only the name would miss it and duplicate.
 function providerKeyOf(p) {
+  if (p && typeof p.key === "string" && slugify(p.key)) return slugify(p.key);
   return slugify(p && p.name);
+}
+
+/**
+ * Expands a removal request to every config key it really owns. A pool head
+ * owns its shards (recorded in the store at pool-apply time); a plain provider
+ * owns just itself. Also resolves the rotation plugin file, if the pool had
+ * one. Deleting via a shard key ("slug-2") still resolves the whole pool.
+ */
+function resolveRemoval(wanted) {
+  const slug = slugify(wanted || "");
+  // A corrupt store must not block the removal itself: fall back to the single
+  // key and let the endpoints report the store problem where they always did.
+  let store = null;
+  try { store = loadStore(); } catch { store = null; }
+  const record = (store || []).find((p) => {
+    if (providerKeyOf(p) === slug) return true;
+    const shards = p && p.pool && Array.isArray(p.pool.shards) ? p.pool.shards : null;
+    return !!(shards && shards.includes(slug));
+  });
+  const shards = record && record.pool && Array.isArray(record.pool.shards) && record.pool.shards.length
+    ? record.pool.shards.map((s) => String(s)).filter(Boolean)
+    : [slug];
+  const pluginFile = record && record.pool && typeof record.pool.pluginFile === "string"
+    ? record.pool.pluginFile : "";
+  return { keys: shards, pluginFile, pluginFileName: pluginFile ? pluginFile.split(/[\\/]/).pop() : "" };
+}
+
+/**
+ * Best-effort deletion of the generated rotation plugin next to the config.
+ * Guarded to our own file shape inside the config directory: never an
+ * arbitrary path, even if the store record was hand-edited.
+ */
+function removePoolPluginFile(configPath, pluginFile) {
+  if (!pluginFile) return false;
+  const base = String(pluginFile).split(/[\\/]/).pop() || "";
+  if (!/^keypool-[a-z0-9-]+\.mjs$/.test(base)) return false;
+  try {
+    const dir = path.dirname(path.resolve(configPath));
+    const target = path.resolve(dir, base);
+    if (path.dirname(target) !== dir) return false;
+    unlinkSync(target);
+    return true;
+  } catch { return false; }
 }
 
 // ---------- undo (single-level rollback of the last write) ----------
@@ -157,6 +230,126 @@ function probeCredentials(p) {
   return { apiKey: resolved.value, blocker: "" };
 }
 
+/**
+ * Normalises a pool payload from the UI into raw keys + env base.
+ * Accepts either an explicit array or multiline text. Never throws:
+ * validation problems come back as { ok:false }.
+ */
+function readPoolInput(body) {
+  const b = body && typeof body === "object" ? body : {};
+  let parsed;
+  if (Array.isArray(b.keys)) {
+    const keys = b.keys.map((k) => String(k ?? "").trim()).filter(Boolean);
+    const seen = new Set();
+    const deduped = [];
+    let droppedDuplicates = 0;
+    for (const k of keys) {
+      if (seen.has(k)) { droppedDuplicates++; continue; }
+      seen.add(k);
+      deduped.push(k);
+    }
+    parsed = {
+      keys: deduped.slice(0, MAX_POOL_KEYS),
+      emptyLines: 0,
+      droppedDuplicates,
+      truncated: Math.max(0, deduped.length - MAX_POOL_KEYS),
+    };
+  } else {
+    parsed = parseKeyPool(b.keysText ?? b.poolKeys ?? b.poolRaw ?? "");
+  }
+  const provider = b.provider && typeof b.provider === "object" ? b.provider : {};
+  const envBase = String(
+    b.envBase || b.envVarName || provider.envVarName || poolEnvBaseFor(provider.name),
+  ).trim();
+  return { provider, envBase, ...parsed };
+}
+
+/**
+ * Computes the patched text for a whole key pool without writing anything.
+ * The first shard keeps the provider's own key (so an existing
+ * `model: slug/...` keeps working); shards 2..N become `slug-2..N`.
+ * With withPlugin a fetch-patching opencode plugin is staged next to the
+ * config and registered in top-level `plugin`.
+ */
+function planPoolChange({ provider, envBase, keys, configPath, setAsDefault = true, defaultModelId = "", previousKey = "", withPlugin = true }) {
+  const cfg = readConfig(configPath);
+  if (!cfg.config && !cfg.missing) {
+    return { ok: false, error: "opencode config не разобран: " + (cfg.error || "неизвестная ошибка"), configPath: cfg.path };
+  }
+  const err = validateKeyPool(keys);
+  if (err) return { ok: false, error: err, configPath: cfg.path };
+  if (!ENV_NAME_RE.test(envBase)) {
+    return { ok: false, error: `Недопустимое имя переменной пула: «${envBase || "(пусто)"}»`, configPath: cfg.path };
+  }
+  const baseText = cfg.missing ? `{\n  "$schema": "${SCHEMA_URL}"\n}\n` : cfg.raw;
+  const existingConfig = cfg.config || { $schema: SCHEMA_URL };
+  const shards = buildPoolShards(provider, envBase, keys);
+  if (!shards.length) return { ok: false, error: "Пустой пул — нечего применять", configPath: cfg.path };
+
+  const changes = [];
+  if (!Object.prototype.hasOwnProperty.call(existingConfig, "$schema")) {
+    changes.push({ op: "set", path: ["$schema"], value: SCHEMA_URL });
+  }
+  const shardKeys = [];
+  for (let i = 0; i < shards.length; i++) {
+    const built = buildProviderChanges(shards[i], {
+      existingConfig,
+      previousKey: i === 0 ? previousKey : "",
+      setAsDefault: false,
+      defaultModelId: "",
+    });
+    if (!built.ok) return { ok: false, error: built.error, configPath: cfg.path };
+    shardKeys.push(built.providerKey);
+    changes.push(...built.changes);
+  }
+  // One default pointer for the whole pool: the explicitly chosen model when
+  // it belongs to the first shard, otherwise the first shard's first model.
+  const firstModels = (Array.isArray(provider.models) ? provider.models : [])
+    .map((m) => (typeof m === "string" ? m : m?.id)).map((s) => String(s || "").trim()).filter(Boolean);
+  const wanted = String(defaultModelId || "").trim();
+  const fallback = firstModels[0] || "";
+  const chosenModel = (wanted && firstModels.includes(wanted)) ? wanted : fallback;
+  let defaultModel = "";
+  if (setAsDefault && shardKeys[0] && chosenModel) {
+    defaultModel = `${shardKeys[0]}/${chosenModel}`;
+    changes.push({ op: "set", path: ["model"], value: defaultModel });
+  }
+
+  let plugin = null;
+  if (withPlugin) {
+    const envNames = poolEnvNames(envBase, keys.length);
+    const built = buildKeypoolPlugin({
+      providerKey: shardKeys[0],
+      displayName: shards[0].displayName,
+      baseURL: shards[0].baseURL,
+      apiFormat: provider.apiFormat || "openai-chat",
+      envNames,
+    });
+    const dir = path.dirname(cfg.path);
+    const pluginPath = path.join(dir, built.fileName);
+    const merged = mergePluginEntry(cfg.config?.plugin, pluginPath);
+    changes.push({ op: "set", path: ["plugin"], value: merged });
+    plugin = { fileName: built.fileName, path: pluginPath, entry: pluginPath, source: built.source, envNames };
+  }
+
+  const applied = applyChangesVerified(baseText, changes);
+  if (!applied.ok) return { ok: false, error: applied.error, configPath: cfg.path };
+  return {
+    ok: true,
+    configPath: cfg.path,
+    before: baseText,
+    after: applied.text,
+    changes,
+    shardKeys,
+    shards: shards.map((s, i) => ({ key: shardKeys[i], envVar: i === 0 ? envBase : `${envBase}_${i + 1}` })),
+    envNames: poolEnvNames(envBase, keys.length),
+    defaultModel,
+    plugin,
+    created: !!cfg.missing,
+    hash: cfg.missing ? "" : cfg.hash || "",
+  };
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     // Buffers are collected and decoded once at the end. Concatenating chunks as
@@ -195,15 +388,27 @@ function readBody(req) {
         return;
       }
       const text = Buffer.concat(chunks).toString("utf8");
-      try { resolve(text ? JSON.parse(text) : {}); } catch (e) { reject(e); }
+      try {
+        const value = text ? JSON.parse(text) : {};
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          reject(Object.assign(new Error("JSON body должен быть объектом"), { statusCode: 400 }));
+          return;
+        }
+        resolve(value);
+      } catch (e) {
+        // A malformed body is the client's mistake, not a server crash:
+        // without a status the generic catch below would answer 500.
+        reject(Object.assign(new Error("Некорректный JSON в теле запроса"), { statusCode: 400 }));
+      }
     });
     req.on("error", (e) => { if (!done) { done = true; reject(e); } });
   });
 }
 
 function json(res, code, obj) {
-  res.writeHead(code, { "Content-Type": MIME[".json"] });
-  res.end(JSON.stringify(obj, null, 2));
+  const body = JSON.stringify(obj, null, 2);
+  res.writeHead(code, { "Content-Type": MIME[".json"], "Content-Length": Buffer.byteLength(body) });
+  res.end(res.req?.method === "HEAD" ? undefined : body);
 }
 
 // ---------- request guards ----------
@@ -241,7 +446,7 @@ function originAllowed(req) {
 // never enough here: on Windows a percent-encoded backslash (%5c) survives URL
 // parsing and acts as a separator, so `/..%5c..%5cserver.mjs` escapes the
 // directory. normaliseRel() rejects those outright.
-function serveStatic(res, urlPath) {
+function serveStatic(res, urlPath, req) {
   const rel = normaliseRel(urlPath);
   if (rel === null) {
     res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
@@ -252,7 +457,7 @@ function serveStatic(res, urlPath) {
   if (body) {
     const ext = path.extname(rel).toLowerCase();
     res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream" });
-    res.end(body);
+    res.end(req.method === "HEAD" ? undefined : body);
     return;
   }
   res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
@@ -260,7 +465,12 @@ function serveStatic(res, urlPath) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  let url;
+  try {
+    url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  } catch {
+    return json(res, 400, { ok: false, error: "Некорректный URL запроса" });
+  }
   try {
     if (!hostAllowed(req)) {
       return json(res, 403, { ok: false, error: "Недопустимый Host — открой интерфейс по адресу http://localhost:" + PORT_ACTIVE });
@@ -281,6 +491,8 @@ const server = http.createServer(async (req, res) => {
         // Ready-made endpoints for the wizard: the base URL is the one field a
         // newcomer cannot guess, and a wrong guess only fails much later.
         presets: PRESETS,
+        // Key-pool ceiling so the UI and the server cannot drift apart.
+        poolMax: MAX_POOL_KEYS,
         port: PORT_ACTIVE,
         backups: listBackups(),
         undo: currentUndo(cfg.path),
@@ -297,6 +509,15 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (url.pathname === "/api/watch" && req.method === "GET") {
+      // Lightweight poll for the external-edit watcher and the undo button.
+      // The full /api/state carries presets, formats, targets and the backup
+      // listing on every call — kilobytes of immutable data every 5 seconds
+      // for a hash that fits in 64 chars. This answers in one file read.
+      const cfg = readConfig(url.searchParams.get("configPath") || "");
+      return json(res, 200, { ok: true, path: cfg.path, hash: cfg.hash || "", undo: currentUndo(cfg.path) });
+    }
+
     if (url.pathname === "/api/apply" && req.method === "POST") {
       const body = await readBody(req);
       const provider = body.provider || {};
@@ -309,15 +530,16 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { ok: false, error: "Поле Name обязательно" });
       }
 
-      // 1. Persist to our own store (so it survives & can be reused), without secrets.
       const store = loadStore();
       const key = providerKeyOf(provider);
       const existingIdx = store.findIndex((p) => providerKeyOf(p) === key);
-      const record = { id: provider.id || Date.now(), ...provider };
+      // Spread first so a falsy id from the form ("" / 0 / missing) cannot
+      // overwrite the generated one: the old order put the default first and
+      // let the spread clobber it back to empty.
+      const record = { ...provider, id: provider.id || Date.now() };
       if (existingIdx >= 0) store[existingIdx] = record; else store.push(record);
-      saveStore(store);
 
-      // 2. Apply to each target.
+      // Apply to each target.
       for (const t of targets) {
         if (t === "opencode") {
           // The backup is taken by the writer, immediately before the write, so
@@ -331,8 +553,8 @@ const server = http.createServer(async (req, res) => {
             backup: (p) => backupConfig(p, "before-" + (provider.name || "apply")),
           });
           if (r.backupFile) backupFile = r.backupFile;
-          if (!r.ok && r.conflict) {
-            return json(res, 409, { ok: false, error: r.error, conflict: true, path: r.configPath });
+          if (!r.ok) {
+            return json(res, r.conflict ? 409 : 400, { ok: false, error: r.error, conflict: !!r.conflict, path: r.configPath });
           }
           results.opencode = {
             ok: r.ok,
@@ -359,12 +581,20 @@ const server = http.createServer(async (req, res) => {
       if (oc && oc.ok) {
         recordUndo(oc.path || "", backupFile, `Применение провайдера «${provider.name || ""}»`, oc.hash || "");
       }
+      // The config write above is the real result; the sidebar store is a
+      // convenience. A store failure (disk, permissions) must not turn a
+      // completed write into a 500 — the UI updates optimistically instead.
+      let storeSynced = true;
+      try {
+        saveStore(store);
+      } catch { storeSynced = false; }
       return json(res, 200, {
         ok: true,
         results,
         providerKey: opencodeSummary(provider),
         backupFile,
-        providers: loadStore(),
+        storeSynced,
+        providers: storeSynced ? loadStore() : store.map(stripSecrets),
       });
     }
 
@@ -394,10 +624,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Preview of a removal, so the user sees the block disappear plus whatever
-    // repointing that forces on `model` / `small_model`.
+    // repointing that forces on `model` / `small_model`. A pool head expands
+    // to all its shards, or the diff would promise a removal it does not do.
     if (url.pathname === "/api/preview-remove" && req.method === "POST") {
       const body = await readBody(req);
-      const plan = planProviderRemoval(body.key || body.name, { configPath: body.configPath });
+      const target = resolveRemoval(body.key || body.name);
+      const plan = planProvidersRemoval(target.keys, {
+        configPath: body.configPath,
+        pluginFileName: target.pluginFileName,
+      });
       if (!plan.ok) {
         return json(res, 400, {
           ok: false, error: plan.error, path: plan.configPath,
@@ -407,7 +642,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         ok: true,
         path: plan.configPath,
-        providerKey: plan.providerKey,
+        providerKey: plan.providerKeys[0],
+        removedKeys: plan.providerKeys,
+        missingKeys: plan.missing,
+        pluginEntry: plan.pluginEntry,
         orphaned: plan.orphaned,
         hash: plan.hash,
         diff: buildPreview(plan.before, plan.after),
@@ -415,19 +653,43 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Removes a provider from the opencode config, not just from our own store.
+    // A pool head takes its shards, the rotation plugin entry and the plugin
+    // file with it — otherwise every pool removal orphaned N-1 blocks.
     if (url.pathname === "/api/remove-provider" && req.method === "POST") {
       const body = await readBody(req);
-      const r = removeProvider(body.key || body.name, {
+      const target = resolveRemoval(body.key || body.name);
+      const r = removeProviders(target.keys, {
         configPath: body.configPath,
         expectedHash: body.hash,
+        pluginFileName: target.pluginFileName,
         backup: (p) => backupConfig(p, "before-remove"),
       });
       if (!r.ok) return json(res, r.conflict ? 409 : 400, r);
-      recordUndo(r.configPath || "", r.backupFile, `Удаление провайдера «${r.providerKey || ""}»`, r.hash || "");
+      const removedKeys = r.providerKeys || [r.providerKey].filter(Boolean);
+      const head = removedKeys[0] || "";
+      const pluginRemoved = removePoolPluginFile(r.configPath, target.pluginFile);
+      recordUndo(r.configPath || "", r.backupFile,
+        removedKeys.length > 1 ? `Удаление пула «${head}» (${removedKeys.length} шардов)` : `Удаление провайдера «${head}»`,
+        r.hash || "");
       // Keep our store in step so the UI does not show a provider that is gone.
-      const store = loadStore().filter((p) => providerKeyOf(p) !== r.providerKey);
-      saveStore(store);
-      return json(res, 200, { ...r, providers: loadStore(), backups: listBackups() });
+      // Matched by head or by any shard, so deleting via "slug-2" still drops
+      // the whole pool record. A corrupt store must not turn a completed config
+      // removal into a 500: the write already landed, sync is best-effort here.
+      let storeSynced = true;
+      try {
+        const store = loadStore().filter((p) => {
+          const k = providerKeyOf(p);
+          if (removedKeys.includes(k)) return false;
+          const shards = Array.isArray(p?.pool?.shards) ? p.pool.shards : null;
+          return !(shards && removedKeys.some((x) => shards.includes(x)));
+        });
+        saveStore(store);
+      } catch { storeSynced = false; }
+      return json(res, 200, {
+        ...r, providerKey: head, removedKeys, pluginRemoved, storeSynced,
+        providers: storeSynced ? loadStore() : [],
+        backups: listBackups(),
+      });
     }
 
     if (url.pathname === "/api/set-default-model" && req.method === "POST") {
@@ -515,6 +777,196 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         ok: true, name: r.name, length: r.length, scope: r.scope,
         note: "Переменная задана для текущего пользователя. Уже открытые терминалы её не увидят — opencode запускай из нового окна.",
+      });
+    }
+
+    // Bulk-write of a key pool: one env var per key (BASE, BASE_2, ...).
+    // Values cross loopback once and are never echoed back, not even on success.
+    if (url.pathname === "/api/setenv-pool" && req.method === "POST") {
+      const body = await readBody(req);
+      const { envBase, keys } = readPoolInput(body);
+      const err = validateKeyPool(keys);
+      if (err) return json(res, 200, { ok: false, error: err });
+      if (!ENV_NAME_RE.test(envBase)) {
+        return json(res, 200, { ok: false, error: `Недопустимое имя переменной пула: «${envBase || "(пусто)"}»` });
+      }
+      const names = poolEnvNames(envBase, keys.length);
+      const results = [];
+      for (let i = 0; i < keys.length; i++) {
+        const r = setUserEnvVar(names[i], keys[i]);
+        results.push(r.ok
+          ? { name: r.name, ok: true, length: r.length, scope: r.scope }
+          : { name: names[i], ok: false, error: r.error, command: r.command || null, manual: !!r.manual });
+      }
+      clearEnvCache();
+      const failed = results.filter((x) => !x.ok);
+      return json(res, 200, {
+        ok: failed.length === 0,
+        results,
+        note: failed.length
+          ? `Записано ${results.length - failed.length} из ${results.length}. opencode запускай из нового окна терминала.`
+          : "Пул записан для текущего пользователя. Уже открытые терминалы его не увидят — opencode запускай из нового окна.",
+      });
+    }
+
+    // Live check of every key in a pool: one cheap probe per key (completion
+    // when a model id is given, otherwise a connection check) plus a
+    // best-effort balance lookup. Keys are never echoed back — only masks.
+    // Deliberately NOT runBatch: one dead key must not abort the rest.
+    if (url.pathname === "/api/pool-check" && req.method === "POST") {
+      const body = await readBody(req);
+      const { provider, keys } = readPoolInput(body);
+      const err = validateKeyPool(keys);
+      if (err) return json(res, 200, { ok: false, error: err });
+      const baseURL = String(body.baseURL || provider.baseURL || "").trim();
+      if (!baseURL) return json(res, 200, { ok: false, error: "Укажи Base URL" });
+      const apiFormat = String(body.apiFormat || provider.apiFormat || "openai-chat");
+      const modelId = String(body.modelId || body.model || "").trim()
+        || (Array.isArray(provider.models) && provider.models.length
+          ? String(provider.models[0].id || provider.models[0] || "").trim() : "");
+      const CONC = 3;
+      const results = new Array(keys.length);
+      let next = 0;
+      const worker = async () => {
+        for (;;) {
+          const i = next++;
+          if (i >= keys.length) return;
+          const key = keys[i];
+          let probe;
+          try {
+            probe = modelId
+              ? await testCompletion({ baseURL, apiKey: key, apiFormat, modelId })
+              : await testConnection({ baseURL, apiFormat, apiKey: key });
+          } catch (e) {
+            probe = { ok: false, message: String(e?.message || e) };
+          }
+          let balance;
+          try {
+            balance = await fetchKeyBalance({ baseURL, apiKey: key });
+          } catch (e) {
+            balance = { supported: false, ok: false, note: String(e?.message || e) };
+          }
+          results[i] = {
+            index: i,
+            mask: maskKey(key),
+            ok: !!probe.ok,
+            fault: probe.fault || null,
+            status: probe.status ?? null,
+            message: probe.message || "",
+            balance,
+          };
+          await new Promise((r) => setTimeout(r, 150));
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(CONC, keys.length) }, worker));
+      const passed = results.filter((x) => x.ok).length;
+      return json(res, 200, { ok: true, results, passed, failed: results.length - passed, total: results.length });
+    }
+
+    // Preview of a pool write: N provider shards + optional runtime plugin,
+    // without touching the disk.
+    if (url.pathname === "/api/pool-preview" && req.method === "POST") {
+      const body = await readBody(req);
+      const { provider, envBase, keys } = readPoolInput(body);
+      const plan = planPoolChange({
+        provider,
+        envBase,
+        keys,
+        configPath: body.configPath,
+        setAsDefault: provider.setAsDefault !== false,
+        defaultModelId: body.defaultModelId || provider.defaultModelId || "",
+        previousKey: body.previousKey || "",
+        withPlugin: body.withPlugin !== false,
+      });
+      if (!plan.ok) return json(res, 400, { ok: false, error: plan.error, path: plan.configPath });
+      return json(res, 200, {
+        ok: true,
+        path: plan.configPath,
+        shardKeys: plan.shardKeys,
+        shards: plan.shards,
+        envNames: plan.envNames,
+        defaultModel: plan.defaultModel,
+        created: plan.created,
+        hash: plan.hash,
+        plugin: plan.plugin ? {
+          fileName: plan.plugin.fileName, path: plan.plugin.path,
+          entry: plan.plugin.entry, envNames: plan.plugin.envNames,
+        } : null,
+        diff: buildPreview(plan.before, plan.after),
+      });
+    }
+
+    // Commits a pool planned above: shards + plugin registration in one write
+    // (single backup, single undo entry), then the plugin file next to it.
+    if (url.pathname === "/api/pool-apply" && req.method === "POST") {
+      const body = await readBody(req);
+      const { provider, envBase, keys } = readPoolInput(body);
+      const withPlugin = body.withPlugin !== false;
+      const plan = planPoolChange({
+        provider,
+        envBase,
+        keys,
+        configPath: body.configPath,
+        setAsDefault: provider.setAsDefault !== false,
+        defaultModelId: body.defaultModelId || provider.defaultModelId || "",
+        previousKey: body.previousKey || "",
+        withPlugin,
+      });
+      if (!plan.ok) return json(res, 400, { ok: false, error: plan.error, path: plan.configPath });
+      const committed = commitPlan(plan, {
+        expectedHash: body.hash,
+        backup: (p) => backupConfig(p, "before-pool-" + (slugify(provider.name) || "pool")),
+      });
+      if (!committed.ok) return json(res, committed.conflict ? 409 : 400, committed);
+      let pluginFile = null;
+      let pluginError = null;
+      if (withPlugin && plan.plugin) {
+        try {
+          ensureDir(path.dirname(plan.plugin.path));
+          writeFileAtomic(plan.plugin.path, plan.plugin.source);
+          pluginFile = plan.plugin.path;
+        } catch (e) {
+          pluginError = String(e?.message || e);
+        }
+      }
+      recordUndo(committed.configPath || "", committed.backupFile, `Пул ключей «${provider.name || ""}» (${keys.length})`, committed.hash || "");
+      // Best-effort like /api/apply: the shards are already in the config,
+      // a store failure must not rewrite that success as a 500.
+      let storeSynced = true;
+      try {
+        const store = loadStore();      const record = {
+          ...provider,
+          id: provider.id || Date.now(),
+          apiKey: "",
+          poolKeys: undefined,
+          poolRaw: undefined,
+          pool: { envBase, size: keys.length, shards: plan.shardKeys, pluginFile },
+        };
+        delete record.poolKeys;
+        delete record.poolRaw;
+        const key = providerKeyOf(record);
+        const existingIdx = store.findIndex((p) => providerKeyOf(p) === key);
+        if (existingIdx >= 0) store[existingIdx] = record; else store.push(record);
+        saveStore(store);
+      } catch { storeSynced = false; }
+      // Which pool variables still have no value: opencode would substitute ""
+      // for them, so the UI must say so instead of reporting a silent success.
+      clearEnvCache();
+      const missingEnv = plan.envNames.filter((n) => !lookupEnv(n, { useCache: false }).set);
+      return json(res, 200, {
+        ok: true,
+        path: committed.configPath,
+        shardKeys: plan.shardKeys,
+        shards: plan.shards,
+        envNames: plan.envNames,
+        missingEnv,
+        defaultModel: plan.defaultModel,
+        hash: committed.hash || "",
+        backupFile: committed.backupFile || null,
+        pluginFile,
+        pluginError,
+        storeSynced,
+        providers: storeSynced ? loadStore() : [],
       });
     }
 
@@ -616,12 +1068,14 @@ const server = http.createServer(async (req, res) => {
       // Full health check: config issues + connectivity of every provider.
       const cfg = readConfig(url.searchParams.get("configPath") || "");
       const issues = cfg.config ? validateConfig(cfg.config) : [{ severity: "error", id: "parse", message: cfg.error || "не удалось прочитать конфиг" }];
-      // Probed in parallel: each endpoint can take up to 8s, so a serial loop
-      // over a dozen providers meant a two-minute request that usually timed out
-      // in the browser before it ever returned.
+      // Probed with a bounded worker pool: each endpoint can take up to 8s, so
+      // a serial loop over a dozen providers meant a two-minute request that
+      // usually timed out in the browser — but unbounded parallelism at 30+
+      // providers exhausts local ports and hammers the network. Order of the
+      // result follows the config, not finish order.
       const entries = Object.entries(cfg.config?.provider || {})
         .filter(([, p]) => p && typeof p === "object" && p.type !== "local");
-      const providers = await Promise.all(entries.map(async ([key, p]) => {
+      const probeOne = async ([key, p]) => {
         const base = p.options?.baseURL || p.baseURL || "";
         // An unresolved {env:VAR} would be sent as the literal key; resolve it
         // so the probe reflects what opencode itself would send.
@@ -653,10 +1107,22 @@ const server = http.createServer(async (req, res) => {
           reach: conn.reach || null,
           fault: conn.fault || null,
           kind: conn.kind || null,
+          ms: typeof conn.ms === "number" ? conn.ms : null,
           viaProxy: Boolean(conn.viaProxy),
           models: Object.keys(p.models || {}),
         };
+      };
+      const DIAG_CONCURRENCY = 5;
+      const queue = entries.slice();
+      const byKey = new Map();
+      await Promise.all(Array.from({ length: Math.min(DIAG_CONCURRENCY, Math.max(queue.length, 1)) }, async () => {
+        for (;;) {
+          const next = queue.shift();
+          if (!next) return;
+          byKey.set(next[0], await probeOne(next));
+        }
       }));
+      const providers = entries.map(([key]) => byKey.get(key));
       // Naming the proxy once, at the top level, saves the user from guessing
       // whether the probes went out directly or through a tunnel.
       const proxyUsed = describeProxy(proxyForUrl("https://example.com"));
@@ -896,13 +1362,16 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === "/api/delete" && req.method === "POST") {
       const body = await readBody(req);
-      const key = slugify(body.name);
+      // Accept the real config key as well as the display name: an imported
+      // provider keeps `key` distinct from `name`, and deleting by name alone
+      // slugified to a different string silently deleted nothing.
+      const key = slugify(body.key || body.name);
       const store = loadStore().filter((p) => providerKeyOf(p) !== key);
       saveStore(store);
       return json(res, 200, { ok: true, providers: loadStore() });
     }
 
-    return serveStatic(res, url.pathname);
+    return serveStatic(res, url.pathname, req);
   } catch (e) {
     const code = Number(e?.statusCode) >= 400 && Number(e?.statusCode) < 600 ? Number(e.statusCode) : 500;
     return json(res, code, { ok: false, error: String(e && e.message || e) });
@@ -1054,7 +1523,8 @@ function decodeOpenProvider(key, p) {
     // form never submitted one", which is what stops buildProviderChanges from
     // treating an ordinary save as a request to delete them.
     ...(p.options?.headers ? { headers: p.options.headers } : {}),
-    ...(p.options?.timeout ? { timeout: p.options.timeout } : {}),
+    // timeout:false — валидное «без таймаута», а не отсутствие значения.
+    ...(p.options?.timeout === false ? { timeout: false } : (p.options?.timeout ? { timeout: p.options.timeout } : {})),
     models,
   };
 }

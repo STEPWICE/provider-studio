@@ -67,7 +67,10 @@ eq("slugify trims dashes", slugify("--x--"), "x");
 eq("slugify falls back", slugify(""), "provider");
 eq("slugify transliterates cyrillic", slugify("БайТест"), "baytest");
 eq("two cyrillic names stay distinct", slugify("Бай") !== slugify("Тест"), true);
-eq("slugify still falls back on depletion", slugify("上海"), "provider");
+eq("slugify still falls back on ascii depletion", slugify("!!!"), "provider");
+eq("non-latin names get distinct stable keys instead of colliding on provider",
+  slugify("上海") !== slugify("北京") && slugify("上海").startsWith("provider-"), true);
+eq("same non-latin name maps to the same key", slugify("上海") === slugify("上海"), true);
 eq("slugify keeps digits", slugify("gpt 4o"), "gpt-4o");
 
 // ------------------------------------------------------- import round-trip keeps specs
@@ -442,6 +445,22 @@ check("plaintext key detected", isPlaintextKey("gsk-abcdef"));
 check("env reference is not plaintext", !isPlaintextKey("{env:A}"));
 check("legacy $VAR is not plaintext", !isPlaintextKey("$A"));
 check("empty is not plaintext", !isPlaintextKey(""));
+check("{file:} is not plaintext", !isPlaintextKey("{file:~/.secrets/key}"));
+eq("decode {file:}", decodeApiKey("{file:~/.secrets/key}"),
+  { useEnvVar: false, envVarName: "", apiKey: "", useFile: true, filePath: "~/.secrets/key" });
+
+// ------------------------------------------------------- timeout:false survives
+// The live schema allows timeout:false ("no timeout"); a re-save must carry it
+// through instead of dropping it as "empty".
+{
+  const kept = buildOpencodeProvider({ name: "T", models: [{ id: "m" }], timeout: false });
+  eq("fresh blocks keep timeout:false", kept.options?.timeout, false);
+  const prior = { provider: { t: { npm: "x", options: { timeout: false }, models: { m: { name: "m" } } } } };
+  const rebuilt = buildProviderChanges({ key: "t", name: "T", models: [{ id: "m", name: "m" }], timeout: false },
+    { existingConfig: prior, setAsDefault: false });
+  const out = applyChangesVerified(JSON.stringify(prior, null, 2), rebuilt.changes);
+  eq("re-save keeps timeout:false", out.value?.provider?.t?.options?.timeout, false);
+}
 
 eq("env var suggestion", suggestEnvVarName("baitestik"), "BAITESTIK_API_KEY");
 eq("env var suggestion sanitises", suggestEnvVarName("go-router.v2"), "GO_ROUTER_V2_API_KEY");

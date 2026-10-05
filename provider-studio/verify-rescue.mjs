@@ -208,12 +208,29 @@ check("a zero timeout is an error",
   has({ provider: { a: { npm: "x", options: { timeout: 0 }, models: {} } } }, "bad-timeout"));
 check("a positive timeout is accepted",
   !has({ provider: { a: { npm: "x", options: { timeout: 30000 }, models: {} } } }, "bad-timeout"));
+check("timeout:false is accepted (schema allows disabling)",
+  !has({ provider: { a: { npm: "x", options: { timeout: false }, models: {} } } }, "bad-timeout"));
+check("headerTimeout/chunkTimeout are validated like timeout",
+  has({ provider: { a: { npm: "x", options: { headerTimeout: 0 }, models: {} } } }, "bad-timeout")
+  && !has({ provider: { a: { npm: "x", options: { chunkTimeout: false }, models: {} } } }, "bad-timeout"));
+check("a {file:} key is not flagged as plaintext",
+  !has({ provider: { a: { npm: "x", options: { apiKey: "{file:/tmp/ps-test-key}" }, models: {} } } }, "plaintext-key"));
+check("an unreadable key file is an error",
+  has({ provider: { a: { npm: "x", options: { apiKey: "{file:/tmp/ps-no-such-key-xyz}" }, models: {} } } }, "file-missing"));
+check("a bad model.provider field is an error",
+  has({ provider: { a: { npm: "x", models: { m: { provider: { npm: "x", oops: 1 } } } } } }, "unknown-model-provider-field"));
 check("a non-array env is an error",
   has({ provider: { a: { npm: "x", env: "FOO", models: {} } } }, "bad-env"));
 check("an invalid env entry is an error",
   has({ provider: { a: { npm: "x", env: ["GOOD_KEY", "has-dash"], models: {} } } }, "bad-env-name"));
 check("valid env entries are accepted",
   !has({ provider: { a: { npm: "x", env: ["GOOD_KEY"], models: {} } } }, "bad-env-name"));
+check("a remote http endpoint warns about cleartext keys",
+  has({ provider: { a: { npm: "x", options: { baseURL: "http://api.example.com/v1" }, models: {} } } }, "insecure-http"));
+check("https does not warn",
+  !has({ provider: { a: { npm: "x", options: { baseURL: "https://api.example.com/v1" }, models: {} } } }, "insecure-http"));
+check("loopback http does not warn",
+  !has({ provider: { a: { npm: "x", options: { baseURL: "http://localhost:11434/v1" }, models: {} } } }, "insecure-http"));
 // Two providers on one address are almost always a copy-paste. A warning, not
 // an error: mirrors of one gateway exist on purpose.
 {

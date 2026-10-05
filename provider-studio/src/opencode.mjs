@@ -24,7 +24,7 @@ import {
   fileStamp, sha256, writeFileAtomic,
 } from "./paths.mjs";
 import {
-  slugify, buildOpencodeProvider, buildProviderChanges, buildRemovalChanges,
+  slugify, buildOpencodeProvider, buildProviderChanges, buildRemovals,
   FORMATS, decodeApiKey, detectApiFormat, isCustomProviderBlock, looksLikePackage,
   modelEntryToForm,
 } from "./formats.mjs";
@@ -164,12 +164,19 @@ export function planProviderChange(provider, opts = {}) {
 
 /** Same as planProviderChange, for a removal. */
 export function planProviderRemoval(key, opts = {}) {
-  const { configPath } = opts;
+  const r = planProvidersRemoval([key], opts);
+  if (!r.ok) return r;
+  return { ...r, providerKey: r.providerKeys[0] };
+}
+
+/** Removal of several providers (e.g. all shards of a key pool) in one plan. */
+export function planProvidersRemoval(keys, opts = {}) {
+  const { configPath, pluginFileName } = opts;
   const loaded = loadForEdit(configPath);
   if (!loaded.ok) return { ok: false, error: loaded.error, configPath: loaded.path };
   if (loaded.created) return { ok: false, error: "Конфиг не найден", configPath: loaded.path };
 
-  const built = buildRemovalChanges(key, loaded.config);
+  const built = buildRemovals(keys, loaded.config, { pluginFileName });
   if (!built.ok) {
     return { ok: false, error: built.error, configPath: loaded.path, notFound: built.notFound === true };
   }
@@ -183,8 +190,10 @@ export function planProviderRemoval(key, opts = {}) {
     before: loaded.text,
     after: applied.text,
     changes: built.changes,
-    providerKey: built.providerKey,
+    providerKeys: built.providerKeys,
+    missing: built.missing,
     orphaned: built.orphaned,
+    pluginEntry: built.pluginEntry,
     hash: loaded.current.hash,
   };
 }
@@ -279,8 +288,16 @@ export function commitPlan(plan, { expectedHash, backup } = {}) {
   }
 
   let backupFile = null;
-  if (typeof backup === "function" && !current.missing) {
-    try { backupFile = backup(plan.configPath); } catch { backupFile = null; }
+  if (!current.missing) {
+    if (typeof backup !== "function") {
+      return { ok: false, error: "Не удалось создать обязательный бэкап перед изменением конфига" };
+    }
+    try { backupFile = backup(plan.configPath); } catch (e) {
+      return { ok: false, error: "Не удалось создать обязательный бэкап: " + (e?.message || "ошибка backup") };
+    }
+    if (!backupFile) {
+      return { ok: false, error: "Не удалось создать обязательный бэкап перед изменением конфига" };
+    }
   }
 
   // Final safety net: never write something that does not parse.
@@ -293,6 +310,8 @@ export function commitPlan(plan, { expectedHash, backup } = {}) {
     ok: true,
     configPath: plan.configPath,
     providerKey: plan.providerKey,
+    // Multi-removals carry the whole set; single plans keep providerKey only.
+    providerKeys: plan.providerKeys || (plan.providerKey ? [plan.providerKey] : []),
     previousKey: plan.previousKey || "",
     defaultModel: plan.defaultModel,
     created: !!plan.created,
@@ -321,6 +340,14 @@ export function upsertProviderAsDefault(provider, opts = {}) {
 export function removeProvider(key, opts = {}) {
   const { configPath, expectedHash, backup } = opts;
   const plan = planProviderRemoval(key, { configPath });
+  if (!plan.ok) return plan;
+  return commitPlan(plan, { expectedHash, backup });
+}
+
+/** Removes several providers (pool shards + head) with one backup and repoint. */
+export function removeProviders(keys, opts = {}) {
+  const { configPath, expectedHash, backup, pluginFileName } = opts;
+  const plan = planProvidersRemoval(keys, { configPath, pluginFileName });
   if (!plan.ok) return plan;
   return commitPlan(plan, { expectedHash, backup });
 }
@@ -390,7 +417,8 @@ export function providerBlockToForm(key, block) {
     envVarName,
     apiKey,
     headers: p.options?.headers && typeof p.options.headers === "object" ? { ...p.options.headers } : {},
-    timeout: typeof p.options?.timeout === "number" ? p.options.timeout : "",
+    // false — валидное «без таймаута», а не отсутствие значения.
+    timeout: p.options?.timeout === false ? false : (typeof p.options?.timeout === "number" ? p.options.timeout : ""),
     models: Object.entries(p.models || {}).map(([id, m]) => modelEntryToForm(id, m)),
   };
 }

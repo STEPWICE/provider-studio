@@ -92,14 +92,16 @@ export function isAccountWideFailure(result) {
  * @param {(ms:number)=>Promise<void>} [opts.wait]  injectable for tests
  */
 export async function runBatch(ids, probe, opts = {}) {
-  const list = (Array.isArray(ids) ? ids : []).map((x) => String(x || "").trim()).filter(Boolean);
-  const concurrency = Math.max(1, Math.min(8, Number(opts.concurrency) || DEFAULT_CONCURRENCY));
+  const list = (Array.isArray(ids) ? ids : []).map((x) => String(x ?? "").trim()).filter(Boolean);
+  const concurrencyValue = Number(opts.concurrency);
+  const concurrency = Math.max(1, Math.min(8, Number.isFinite(concurrencyValue) ? Math.trunc(concurrencyValue) : DEFAULT_CONCURRENCY));
   const wait = opts.wait || sleep;
   const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
 
   const results = [];
   let next = 0;
-  let gap = Math.max(0, Number.isFinite(Number(opts.gapMs)) ? Number(opts.gapMs) : DEFAULT_GAP_MS);
+  const gapValue = Number(opts.gapMs);
+  let gap = Math.max(0, Number.isFinite(gapValue) ? Math.trunc(gapValue) : DEFAULT_GAP_MS);
   let streak = 0;
   let stopped = null;          // reason the run ended early, if it did
   let rateLimited = 0;
@@ -166,7 +168,7 @@ export async function runBatch(ids, probe, opts = {}) {
         };
       }
 
-      results.push({ id, ok: !!r.ok, rateLimited: limited, ...r });
+      results.push({ ...r, id, ok: !!r.ok, rateLimited: limited });
       if (onProgress) onProgress({ ...state(), last: { id, ok: !!r.ok, rateLimited: limited } });
       if (stopped) return;
       if (gap) await wait(gap);

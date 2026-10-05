@@ -23,7 +23,7 @@
  * their evidence attached so the caller can show where each number came from.
  */
 
-import { proxyForUrl, proxyFetch, describeProxy } from "./proxy.mjs";
+import { proxyForUrl, proxyFetch, describeProxy, readLimitedResponseText } from "./proxy.mjs";
 
 export const CATALOG_URL = "https://models.dev/api.json";
 
@@ -107,7 +107,7 @@ export async function loadCatalog({ timeoutMs = 20000, fetchImpl } = {}) {
     if (!r.ok) {
       return { ok: false, error: `models.dev ответил ${r.status}`, byId: new Map(), providers: new Map() };
     }
-    db = JSON.parse(await r.text());
+    db = JSON.parse(await readLimitedResponseText(r, 16_000_000));
   } catch (e) {
     const why = e && e.message ? e.message : String(e);
     return {

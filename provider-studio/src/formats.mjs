@@ -96,13 +96,24 @@ const CYRILLIC_MAP = {
 };
 
 export function slugify(name) {
-  const s = String(name || "provider")
-    .trim()
+  const raw = String(name || "provider").trim();
+  const s = raw
     .toLowerCase()
     .replace(/[а-яёґєії]/g, (c) => CYRILLIC_MAP[c] ?? "")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return s || "provider";
+  if (s) return s;
+  // Non-latin names (CJK, Arabic, …) transliterate to nothing: without a
+  // fallback every such provider collapses to the same key "provider" and the
+  // second silently overwrites the first. Hash the original so distinct names
+  // stay distinct. ASCII-only depletion (e.g. "??") keeps the plain "provider"
+  // fallback pinned by verify-formats.
+  if (/[^\x00-\x7F]/.test(raw)) {
+    let h = 0;
+    for (let i = 0; i < raw.length; i++) h = (Math.imul(h, 31) + raw.charCodeAt(i)) | 0;
+    return `provider-${(h >>> 0).toString(36)}`;
+  }
+  return "provider";
 }
 
 /** Modalities that require `attachment: true` before opencode allows file input. */
@@ -230,7 +241,10 @@ export function buildOpencodeProvider(provider) {
   const headers = normaliseHeaders(provider.headers);
   if (Object.keys(headers).length) options.headers = headers;
   const timeout = num(provider.timeout);
-  if (timeout > 0) options.timeout = timeout;
+  // false — валидное «без таймаута» по схеме: num(false) даёт 0, поэтому ветка
+  // отдельная, иначе ручной false тихо потерялся бы при пересохранении.
+  if (provider.timeout === false) options.timeout = false;
+  else if (timeout > 0) options.timeout = timeout;
   if (Object.keys(options).length) block.options = options;
 
   block.models = models;
@@ -307,8 +321,12 @@ export function buildProviderChanges(provider, opts = {}) {
   const headersSubmitted = provider.headers !== undefined && provider.headers !== null;
   const headers = headersSubmitted ? normaliseHeaders(provider.headers) : {};
   if (Object.keys(headers).length) options.headers = headers;
-  const timeout = num(provider.timeout);
-  if (timeout > 0) options.timeout = timeout;
+  // timeout:false — осознанное «без таймаута», а не пустое поле: пишется как
+  // есть и никогда не чистится ниже как «не задано».
+  const timeoutOff = provider.timeout === false;
+  const timeout = timeoutOff ? 0 : num(provider.timeout);
+  if (timeoutOff) options.timeout = false;
+  else if (timeout > 0) options.timeout = timeout;
 
   if (Object.keys(options).length) merge.options = options;
   changes.push({ op: "merge", path: base, value: merge });
@@ -326,7 +344,7 @@ export function buildProviderChanges(provider, opts = {}) {
   if (!options.baseURL && prior?.options?.baseURL !== undefined) {
     changes.push({ op: "delete", path: [...base, "options", "baseURL"] });
   }
-  if (!(timeout > 0) && prior?.options?.timeout !== undefined) {
+  if (!(timeoutOff || timeout > 0) && prior?.options?.timeout !== undefined) {
     changes.push({ op: "delete", path: [...base, "options", "timeout"] });
   }
   if (headersSubmitted && !options.headers && prior?.options?.headers !== undefined) {
@@ -394,38 +412,84 @@ export function buildProviderChanges(provider, opts = {}) {
  * Leaving `model` pointing at a deleted provider would break opencode on start.
  */
 export function buildRemovalChanges(key, existingConfig) {
-  const providerKey = slugify(key || "");
-  if (!providerKey) return { ok: false, error: "Не указан провайдер" };
-  if (!existingConfig?.provider?.[providerKey]) {
+  const r = buildRemovals([key], existingConfig);
+  if (!r.ok) return r;
+  return { ok: true, providerKey: r.providerKeys[0], orphaned: r.orphaned, changes: r.changes };
+}
+
+/**
+ * Removes several providers at once (a key pool unfolds into N shards sharing
+ * one base name — deleting only the head orphans the rest, plus the rotation
+ * plugin entry). The default-model fallback is computed once against the
+ * survivors, so a chained single removal cannot repoint at a shard that the
+ * next step deletes. `pluginFileName` (e.g. keypool-x.mjs) also drops the
+ * matching top-level `plugin` entry; the file itself is deleted by the caller,
+ * which owns the filesystem.
+ */
+export function buildRemovals(keys, existingConfig, { pluginFileName } = {}) {
+  const list = (Array.isArray(keys) ? keys : [keys]).map((k) => slugify(k || "")).filter(Boolean);
+  if (!list.length) return { ok: false, error: "Не указан провайдер" };
+  const providers = existingConfig?.provider || {};
+  const found = list.filter((k) => providers[k]);
+  const missing = list.filter((k) => !providers[k]);
+  if (!found.length) {
     // notFound travels to the UI so "delete everywhere" can fall back to
     // removing a store-only row instead of string-matching the message.
-    return { ok: false, notFound: true, error: `Провайдер «${providerKey}» не найден` };
+    return { ok: false, notFound: true, error: `Провайдер «${list[0]}» не найден` };
   }
-  const changes = [{ op: "delete", path: ["provider", providerKey] }];
+  const changes = found.map((k) => ({ op: "delete", path: ["provider", k] }));
   const orphaned = [];
 
-  const others = Object.keys(existingConfig.provider).filter((k) => k !== providerKey);
-  const fallbackFrom = (list) => {
-    for (const k of list) {
-      const first = Object.keys(existingConfig.provider[k]?.models || {})[0];
+  const remaining = Object.keys(providers).filter((k) => !found.includes(k));
+  const fallbackFrom = (keys) => {
+    for (const k of keys) {
+      const first = Object.keys(providers[k]?.models || {})[0];
       if (first) return `${k}/${first}`;
     }
     return "";
   };
 
   for (const field of ["model", "small_model"]) {
-    const cur = trimmed(existingConfig[field]);
-    if (!cur.startsWith(providerKey + "/")) continue;
-    const replacement = fallbackFrom(others);
+    const cur = trimmed(existingConfig?.[field]);
+    if (!found.some((k) => cur.startsWith(k + "/"))) continue;
+    const replacement = fallbackFrom(remaining);
     if (replacement) changes.push({ op: "set", path: [field], value: replacement });
     else changes.push({ op: "delete", path: [field] });
     orphaned.push(field);
   }
 
-  return { ok: true, providerKey, orphaned, changes };
+  // A removed name must not linger in the enable/disable lists as a dangling
+  // entry. Only exact matches are touched: built-in providers legitimately
+  // appear here without a custom block, and those rows are not ours to clean.
+  for (const listField of ["disabled_providers", "enabled_providers"]) {
+    const arr = existingConfig?.[listField];
+    if (!Array.isArray(arr) || !arr.some((d) => found.includes(d))) continue;
+    const next = arr.filter((d) => !found.includes(d));
+    if (next.length) changes.push({ op: "set", path: [listField], value: next });
+    else changes.push({ op: "delete", path: [listField] });
+  }
+
+  // The pool's rotation plugin entry points at shards that no longer exist.
+  let pluginEntry = null;
+  if (pluginFileName && Array.isArray(existingConfig?.plugin)) {
+    const keep = existingConfig.plugin.filter((v) => pluginBase(v) !== pluginFileName);
+    if (keep.length !== existingConfig.plugin.length) {
+      pluginEntry = pluginFileName;
+      if (keep.length) changes.push({ op: "set", path: ["plugin"], value: keep });
+      else changes.push({ op: "delete", path: ["plugin"] });
+    }
+  }
+
+  return { ok: true, providerKeys: found, missing, orphaned, changes, pluginEntry };
 }
 
-/** Recognises both the current {env:VAR} form and the legacy $VAR one. */
+/** Basename of a plugin entry, which may be a string or a [name, options] pair. */
+function pluginBase(v) {
+  const s = Array.isArray(v) ? String(v[0] || "") : String(v || "");
+  return s.split(/[\\/]/).pop() || "";
+}
+
+/** Recognises the current {env:VAR} form, the legacy $VAR one and {file:...}. */
 export function decodeApiKey(apiKey) {
   const raw = typeof apiKey === "string" ? apiKey.trim() : "";
   const curly = raw.match(/^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/);
@@ -434,13 +498,19 @@ export function decodeApiKey(apiKey) {
   if (dollar) return { useEnvVar: true, envVarName: dollar[1], apiKey: "" };
   const braced = raw.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/);
   if (braced) return { useEnvVar: true, envVarName: braced[1], apiKey: "" };
+  // opencode also reads the key from a file ({file:~/.secrets/key}). A path is
+  // not a secret, so it must not be treated as a plaintext leak — otherwise
+  // the validator flags it and the autofix "repairs" a working reference into
+  // an {env:} one pointing nowhere.
+  const file = raw.match(/^\{file:([^}]+)\}$/);
+  if (file) return { useEnvVar: false, envVarName: "", apiKey: "", useFile: true, filePath: file[1].trim() };
   return { useEnvVar: false, envVarName: "", apiKey: raw };
 }
 
-/** True when the value looks like a plaintext secret rather than an env reference. */
+/** True when the value looks like a plaintext secret rather than a reference. */
 export function isPlaintextKey(apiKey) {
   const decoded = decodeApiKey(apiKey);
-  return !decoded.useEnvVar && decoded.apiKey.length > 0;
+  return !decoded.useEnvVar && !decoded.useFile && decoded.apiKey.length > 0;
 }
 
 /** Suggests an env var name for a provider key: `baitestik` -> `BAITESTIK_API_KEY`. */

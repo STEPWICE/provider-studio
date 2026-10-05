@@ -193,21 +193,25 @@ export function toUnifiedText(diff, context = 3) {
 
 // Anything that looks like a credential is masked before a diff reaches the
 // browser or a log. The diff of a config full of keys is otherwise a neat way to
-// leak every one of them at once.
-const SECRET_KEYS = /"(apiKey|api_key|token|secret|password|authorization)"\s*:\s*"/i;
+// leak every one of them at once. Both quote styles are covered: the JSONC
+// parser accepts single-quoted strings, so a hand-written
+// 'apiKey': 'sk-…' would otherwise sail through unmasked.
+const SECRET_KEYS = /["'](apiKey|api_key|token|secret|password|authorization)["']\s*:\s*["']/i;
 
 /** Masks secret values in a single line, keeping enough to recognise the key. */
 export function maskSecretsInLine(line) {
   const s = String(line ?? "");
   const m = s.match(SECRET_KEYS);
   if (!m) return s;
-  const valueStart = s.indexOf('"', s.indexOf(":", s.indexOf(m[1]))) + 1;
+  const quote = m[0].slice(-1);
+  const valueStart = s.indexOf(quote, s.indexOf(":", s.indexOf(m[1]))) + 1;
   if (valueStart <= 0) return s;
-  const valueEnd = s.indexOf('"', valueStart);
+  const valueEnd = s.indexOf(quote, valueStart);
   if (valueEnd < 0) return s;
   const value = s.slice(valueStart, valueEnd);
-  // An env reference is not a secret and is the thing we want the user to see.
-  if (/^\{env:[A-Za-z_][A-Za-z0-9_]*\}$/.test(value) || /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(value)) return s;
+  // Ссылки — не секреты, а то, что пользователь хочет видеть: env-переменная
+  // или путь к файлу с ключом.
+  if (/^\{env:[A-Za-z_][A-Za-z0-9_]*\}$/.test(value) || /^\{file:[^}]+\}$/.test(value) || /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(value)) return s;
   if (!value) return s;
   const keep = value.length > 12 ? 4 : 0;
   const masked = keep

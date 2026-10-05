@@ -43,6 +43,11 @@ const D = await import("./src/digest.mjs");
   eq("claim тоже с fallback", p.claim, "申请");
   eq("статус и источник целы", [p.status, p.source], ["active", "https://example.com/src"]);
 
+  // Поля для actionable-халявы: модель, режим получения, класс перка.
+  const ap = D.normalisePerk({ id: "y", related_model: "GLM-5.3-Flash", grant_mode: "claim", perk_class: "oneshot" });
+  eq("модель и режим переживают нормализацию", [ap.relatedModel, ap.grantMode, ap.perkClass], ["GLM-5.3-Flash", "claim", "oneshot"]);
+  eq("пустые режимы — unknown, а не мусор", [D.normalisePerk({ id: "z" }).grantMode, D.normalisePerk(null).perkClass], ["unknown", "unknown"]);
+
   const n = D.normaliseNews({ id: "n", title: "t", title_en: "", impact: "launch", status: "active" });
   eq("новость без EN берёт исходный заголовок", n.title, "t");
 

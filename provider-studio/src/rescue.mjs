@@ -18,7 +18,7 @@ import {
   backupDir, dataDir, ensureDir, writeFileAtomic, isInside, IS_WINDOWS,
 } from "./paths.mjs";
 import { parseJsonc } from "./jsonc-edit.mjs";
-import { proxyForUrl, proxyFetch, describeProxy, isLocalTarget } from "./proxy.mjs";
+import { proxyForUrl, proxyFetch, describeProxy, isLocalTarget, readLimitedResponseText } from "./proxy.mjs";
 import {
   looksLikePackage, isCustomProviderBlock, decodeApiKey, isPlaintextKey,
   suggestEnvVarName, MODALITIES, MODEL_STATUSES, PROVIDER_FIELDS, MODEL_FIELDS,
@@ -85,8 +85,9 @@ function readBackupIndex() {
 }
 
 /** Where a backup came from, or null when it predates the index. Exported for tests. */
-export function backupOrigin(file) {
-  const e = readBackupIndex()[String(file || "")];
+export function backupOrigin(file, index) {
+  const idx = index || readBackupIndex();
+  const e = idx[String(file || "")];
   return e && typeof e.config === "string" && e.config ? e.config : null;
 }
 
@@ -95,13 +96,16 @@ export function listBackups() {
   if (!existsSync(dir)) return [];
   let names;
   try { names = readdirSync(dir); } catch { return []; }
+  // One read for the whole listing: per-file lookup re-read and re-parsed the
+  // index for every snapshot, so each /api/state poll cost 30+ file reads.
+  const index = readBackupIndex();
   const out = [];
   for (const f of names) {
     if (!f.endsWith(".jsonc")) continue;
     try {
       const st = statSync(join(dir, f));
       if (!st.isFile()) continue;
-      out.push({ file: f, size: st.size, mtime: st.mtimeMs, origin: backupOrigin(f) });
+      out.push({ file: f, size: st.size, mtime: st.mtimeMs, origin: backupOrigin(f, index) });
     } catch { /* vanished between readdir and stat */ }
   }
   // Ties on mtime are broken by name, which embeds the counter, so the order is
@@ -143,19 +147,22 @@ export function restoreBackup(file) {
 
 /** Keeps the newest N snapshots; older ones are dropped. */
 function prune(max = 30) {
-  const dropped = [];
-  for (const b of listBackups().slice(max)) {
-    try { unlinkSync(join(backupDir(), b.file)); dropped.push(b.file); } catch { /* already gone */ }
+  const all = listBackups();
+  const onDisk = new Set(all.map((b) => b.file));
+  for (const b of all.slice(max)) {
+    try { unlinkSync(join(backupDir(), b.file)); onDisk.delete(b.file); } catch { /* already gone */ }
   }
   // Whatever is gone from disk must go from the index too, or restores keep
-  // offering snapshots that no longer exist.
-  if (dropped.length) {
-    try {
-      const idx = readBackupIndex();
-      for (const f of dropped) delete idx[f];
-      writeFileAtomic(join(backupDir(), "backup-index.json"), JSON.stringify(idx, null, 2));
-    } catch { /* index is a convenience */ }
-  }
+  // offering snapshots that no longer exist. That includes files the user
+  // deleted by hand — otherwise the index grows dead entries forever.
+  try {
+    const idx = readBackupIndex();
+    let dirty = false;
+    for (const f of Object.keys(idx)) {
+      if (!onDisk.has(f)) { delete idx[f]; dirty = true; }
+    }
+    if (dirty) writeFileAtomic(join(backupDir(), "backup-index.json"), JSON.stringify(idx, null, 2));
+  } catch { /* index is a convenience */ }
 }
 
 /** Comment stripper kept for callers that still want plain JSON text. */
@@ -260,6 +267,7 @@ export function validateConfig(config) {
     validateHeaders(key, p, issues);
     validateOptions(key, p, issues);
     warnMissingCredentials(key, p, isCustom, issues);
+    warnInsecureTransport(key, p, issues);
 
     const models = p.models && typeof p.models === "object" && !Array.isArray(p.models)
       ? Object.entries(p.models) : [];
@@ -296,17 +304,24 @@ export function validateConfig(config) {
 
 // Таймаут и env-массив руками пишут редко, но когда пишут — пишут как попало:
 // строкой, нулём или отрицательным. Нулевой таймаут означает «не ждать вообще»,
-// и первый же запрос умирает, а чинится это удалением поля.
+// и первый же запрос умирает, а чинится это удалением поля. `false` —
+// исключение: схема разрешает его явно (таймаут выключен), так что это не баг.
+function isTimeoutValue(v) {
+  return v === false || (typeof v === "number" && Number.isFinite(v) && v > 0);
+}
+
 function validateOptions(key, p, issues) {
   const opts = p.options;
   // timeout живёт в options, а env — на верхнем уровне: проверять одно только
   // при наличии другого — значит пропускать половину битого.
   if (opts !== undefined && opts && typeof opts === "object" && !Array.isArray(opts)) {
-    const t = opts.timeout;
-    if (t !== undefined && !(typeof t === "number" && Number.isFinite(t) && t > 0)) {
-      issues.push(issue("error", "bad-timeout",
-        `Провайдер «${key}»: options.timeout должен быть положительным числом, сейчас: ${JSON.stringify(t)}`,
-        { provider: key, fixable: true }));
+    for (const field of ["timeout", "headerTimeout", "chunkTimeout"]) {
+      const t = opts[field];
+      if (t !== undefined && !isTimeoutValue(t)) {
+        issues.push(issue("error", "bad-timeout",
+          `Провайдер «${key}»: options.${field} должен быть положительным числом или false, сейчас: ${JSON.stringify(t)}`,
+          { provider: key, fixable: true }));
+      }
     }
   }
   const env = p.env;
@@ -339,6 +354,16 @@ function validateApiKey(key, p, issues) {
   }
 
   const decoded = decodeApiKey(apiKey);
+  // A {file:...} reference holds a path, not a secret: readable here means
+  // opencode will substitute the contents, unreadable means an empty key.
+  if (decoded.useFile) {
+    if (!resolveKeyRef(apiKey).resolved) {
+      issues.push(issue("error", "file-missing",
+        `Провайдер «${key}»: файл с ключом ${decoded.filePath} не читается — opencode отправит пустой ключ и получит 401`,
+        { provider: key }));
+    }
+    return;
+  }
   if (decoded.useEnvVar) {
     // Checked against the persistent stores too, not just process.env: a
     // variable created with setx after this process started is real but not
@@ -407,6 +432,24 @@ function warnMissingCredentials(key, p, isCustom, issues) {
     { provider: key }));
 }
 
+// Ключ по открытому HTTP за пределы локалки: каждый запрос несёт его
+// открытым текстом через чужую сеть. Локальные адреса (ollama, LM Studio)
+// не трогаем; CGNAT вроде Tailscale формально тоже сработает — там шифрует сам
+// WireGuard, так что это warn, который можно проигнорировать, а не ошибка.
+// Только warn без автофикса: молча дописывать "s" в чужой адрес нельзя —
+// сервер может быть http-only и лежать после такой "починки".
+function warnInsecureTransport(key, p, issues) {
+  const base = typeof p.options?.baseURL === "string" ? p.options.baseURL.trim() : "";
+  if (!base) return;
+  let u;
+  try { u = new URL(base); } catch { return; }
+  if (u.protocol !== "http:") return;
+  if (isLocalTarget(u.hostname)) return;
+  issues.push(issue("warn", "insecure-http",
+    `Провайдер «${key}»: адрес по http без шифрования — ключ полетит открытым текстом. Если сервер умеет https, переключи Base URL`,
+    { provider: key }));
+}
+
 // Anthropic-compatible endpoints authenticate with `x-api-key` plus a version
 // header. Without them the server answers 401 even though the key is correct.
 function validateHeaders(key, p, issues) {
@@ -441,6 +484,22 @@ function validateModel(key, mid, m, issues) {
       issues.push(issue("error", "unknown-model-field",
         `Модель «${key}/${mid}»: поле «${field}» не входит в схему — opencode отклонит конфиг`,
         { provider: key, model: mid, field, fixable: true }));
+    }
+  }
+  // model.provider повторяет маленький словарь {npm, api} — остальное схема
+  // режет вместе со всей моделью.
+  if (m.provider !== undefined) {
+    if (!m.provider || typeof m.provider !== "object" || Array.isArray(m.provider)) {
+      issues.push(issue("error", "bad-model-provider",
+        `Модель «${key}/${mid}»: provider должен быть объектом {npm, api}`, { provider: key, model: mid }));
+    } else {
+      for (const field of Object.keys(m.provider)) {
+        if (field !== "npm" && field !== "api") {
+          issues.push(issue("error", "unknown-model-provider-field",
+            `Модель «${key}/${mid}»: поле provider.${field} не входит в схему`,
+            { provider: key, model: mid, field, fixable: true }));
+        }
+      }
     }
   }
 
@@ -786,8 +845,11 @@ function probeCandidates(url) {
  * itself, so DNS-rebinding cannot be prevented locally in that path — the guard
  * still rejects the metadata range by name and by our own resolution, which is
  * what it can honestly promise.
+ *
+ * A single function for GET and POST: the two used to be copies that differed
+ * only in method/body, and the copies had already drifted once.
  */
-async function guardedFetch(target, headers, timeoutMs, blockLocal) {
+async function guardedRequest(target, { headers, method = "GET", body = null, timeoutMs, blockLocal } = {}) {
   const u = new URL(target);
   const risk = await resolvedHostRisk(u.hostname, blockLocal);
   if (risk) throw new Error(risk);
@@ -795,7 +857,7 @@ async function guardedFetch(target, headers, timeoutMs, blockLocal) {
   const proxy = proxyForUrl(target);
   if (proxy) {
     try {
-      return await proxyFetch(target, { headers, timeoutMs, proxy });
+      return await proxyFetch(target, { headers, timeoutMs, proxy, method, body });
     } catch (e) {
       // Name the proxy explicitly. Otherwise a broken proxy reads as a dead
       // provider, and the user goes looking for the fault in the wrong place.
@@ -807,8 +869,9 @@ async function guardedFetch(target, headers, timeoutMs, blockLocal) {
   }
 
   return fetch(target, {
-    method: "GET",
+    method,
     headers,
+    ...(body != null ? { body } : {}),
     redirect: "manual", // a redirect to 127.0.0.1 would bypass every check above
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -818,20 +881,25 @@ async function guardedFetch(target, headers, timeoutMs, blockLocal) {
 export async function testConnection({ baseURL, apiFormat, apiKey } = {}) {
   const guard = validateProbeUrl(baseURL);
   if (!guard.ok) return { ok: false, message: guard.error };
+  const t0 = Date.now();
+  const ms = () => Date.now() - t0;
 
   const auth = probeHeaders(apiKey, apiFormat);
   // A reference to a variable that does not exist can only ever produce an
   // empty bearer token, so say that instead of probing and blaming the key.
   if (auth.problem) return { ok: false, message: auth.problem };
   const headers = auth.headers;
-  const candidates = [...probeCandidates(guard.url.toString()), guard.url.toString().replace(/\/+$/, "")];
+  // Only /models paths are probed. The base root used to be a third candidate,
+  // but any homepage answers 200 there — so google.com passed as an "API
+  // endpoint". A 200 on "/" proves a web server, not an API.
+  const candidates = [...probeCandidates(guard.url.toString())];
   let lastErr = "";
   let lastClass = null;
 
   for (const c of candidates) {
     let r;
     try {
-      r = await guardedFetch(c, headers, 8000, guard.blockLocal);
+      r = await guardedRequest(c, { headers, timeoutMs: 8000, blockLocal: guard.blockLocal });
     } catch (e) {
       lastClass = classifyProbeError(e);
       lastErr = lastClass.label;
@@ -839,7 +907,7 @@ export async function testConnection({ baseURL, apiFormat, apiKey } = {}) {
     }
     if (r.ok) {
       const via = r.viaProxy ? " (через прокси)" : "";
-      return { ok: true, status: r.status, url: c, reach: "up", viaProxy: Boolean(r.viaProxy), message: `✓ Ответ ${r.status} — эндпоинт доступен${via}` };
+      return { ok: true, status: r.status, url: c, reach: "up", ms: ms(), viaProxy: Boolean(r.viaProxy), message: `✓ Ответ ${r.status} — эндпоинт доступен${via}` };
     }
     // Reachable but unauthorised still proves the endpoint exists.
     if (r.status === 401 || r.status === 403) {
@@ -852,7 +920,7 @@ export async function testConnection({ baseURL, apiFormat, apiKey } = {}) {
       const hint = sentKey ? "проверь API key" : "ключ не отправлен — заполни API key";
       return {
         ok: true, status: r.status, url: c, reach: "up",
-        fault: sentKey ? "key" : "nokey", viaProxy: Boolean(r.viaProxy),
+        fault: sentKey ? "key" : "nokey", ms: ms(), viaProxy: Boolean(r.viaProxy),
         message: `⚠ Нет доступа (${r.status}) — сервер жив, ${hint}`,
       };
     }
@@ -867,7 +935,7 @@ export async function testConnection({ baseURL, apiFormat, apiKey } = {}) {
   const fault = kind === "proxy" ? "proxy" : "endpoint";
   const tail = lastClass?.hint ? ` — ${lastClass.hint}` : "";
   return {
-    ok: false, reach: "down", fault, kind,
+    ok: false, reach: "down", fault, kind, ms: ms(),
     message: `Не удалось достучаться до Base URL: ${lastErr || "нет ответа"}${tail}`,
   };
 }
@@ -899,7 +967,7 @@ export async function testCompletion({ baseURL, apiKey, apiFormat, modelId } = {
   const headers = { ...auth.headers, "Content-Type": "application/json" };
   let r;
   try {
-    r = await guardedSend(target, headers, JSON.stringify(body), 20000, guard.blockLocal);
+    r = await guardedRequest(target, { headers, method: "POST", body: JSON.stringify(body), timeoutMs: 20000, blockLocal: guard.blockLocal });
   } catch (e) {
     const c = classifyProbeError(e);
     return {
@@ -908,7 +976,7 @@ export async function testCompletion({ baseURL, apiKey, apiFormat, modelId } = {
     };
   }
 
-  const raw = await r.text().catch(() => "");
+  const raw = await readLimitedResponseText(r, 2_000_000).catch(() => "");
   if (r.ok) {
     return { ok: true, reach: "up", status: r.status, viaProxy: Boolean(r.viaProxy), message: `✓ Модель ответила (HTTP ${r.status}) — связка рабочая` };
   }
@@ -916,6 +984,16 @@ export async function testCompletion({ baseURL, apiKey, apiFormat, modelId } = {
   // short excerpt is worth more than the status alone.
   const detail = providerErrorMessage(raw);
   const tail = detail ? ` — ${detail}` : "";
+  // У провайдера нет свободных мощностей под эту модель. Проверено live:
+  // dacall.ai отдаёт так 503, хотя модель есть в /models. Ключ рабочий,
+  // модель существует — нет смысла гнать пользователя перевыпускать ключ
+  // или удалять модель; помогает другая модель или повтор позже.
+  if (NO_ACCOUNTS_PATTERN.test(detail) || NO_CHANNEL_PATTERN.test(detail)) {
+    return {
+      ok: false, reach: "up", fault: "quota", status: r.status, transient: true,
+      message: `У провайдера нет свободных мощностей под модель «${model}» (${r.status}) — попробуй другую модель или повтори позже${tail}`,
+    };
+  }
   if (r.status === 401 || r.status === 403) {
     if (!headersCarryKey(auth.headers)) {
       return { ok: false, reach: "up", fault: "nokey", status: r.status, message: `Ключ не отправлен (${r.status}) — заполни API key${tail}` };
@@ -944,9 +1022,29 @@ export async function testCompletion({ baseURL, apiKey, apiFormat, modelId } = {
         message: `Модель недоступна на твоём тарифе (403) — ключ рабочий${tail}`,
       };
     }
+    // Троттлинг не тем статусом: китайские шлюзы отвечают 403 «запросы слишком
+    // частые» вместо 429. Это квота, а не ключ: батч не останавливаем, в
+    // ротации пула — кулдаун.
+    if (r.status === 403 && RATE_PATTERN.test(detail)) {
+      return {
+        ok: false, reach: "up", fault: "quota", status: r.status, transient: true,
+        message: `Слишком частые запросы (403) — ключ рабочий, сбавь темп или повтори позже${tail}`,
+      };
+    }
     return { ok: false, reach: "up", fault: "key", status: r.status, message: `Ключ не принят (${r.status})${tail}` };
   }
   if (r.status === 404) {
+    // Модель не подключена на этой группе/тарифе — проверено live: dacall.ai
+    // отвечает 404 'not supported by any configured account in this group',
+    // хотя модель есть в общем каталоге. Ключ рабочий, это не "модель не
+    // найдена", поэтому fault "plan": батч не останавливается и UI помечает
+    // модель рублём, а не крестом.
+    if (NOT_SUPPORTED_PATTERN.test(detail)) {
+      return {
+        ok: false, reach: "up", fault: "plan", status: r.status,
+        message: `Модель «${model}» не подключена на этом ключе/группе (404) — ключ рабочий${tail}`,
+      };
+    }
     return { ok: false, reach: "up", fault: "model", status: r.status, message: `Модель «${model}» не найдена на этом эндпоинте (404)${tail}` };
   }
   if (r.status === 429) {
@@ -967,6 +1065,9 @@ export async function testCompletion({ baseURL, apiKey, apiFormat, modelId } = {
     // user to check the model name while the key sits wrong.
     if (BAD_KEY_PATTERN.test(detail)) {
       return { ok: false, reach: "up", fault: "key", status: r.status, message: `Ключ не принят (${r.status})${tail}` };
+    }
+    if (RATE_PATTERN.test(detail)) {
+      return { ok: false, reach: "up", fault: "quota", status: r.status, transient: true, message: `Слишком частые запросы (${r.status}) — ключ рабочий, повтори позже${tail}` };
     }
     return { ok: false, reach: "up", fault: "model", status: r.status, message: `Запрос отклонён (${r.status})${tail}` };
   }
@@ -1029,30 +1130,6 @@ function providerErrorMessage(raw) {
   return text.replace(/\s+/g, " ").slice(0, 160);
 }
 
-/** POST counterpart of guardedFetch: same SSRF guard, same proxy handling. */
-async function guardedSend(target, headers, body, timeoutMs, blockLocal) {
-  const u = new URL(target);
-  const risk = await resolvedHostRisk(u.hostname, blockLocal);
-  if (risk) throw new Error(risk);
-
-  const proxy = proxyForUrl(target);
-  if (proxy) {
-    try {
-      return await proxyFetch(target, { headers, timeoutMs, proxy, method: "POST", body });
-    } catch (e) {
-      if (e.proxyFault) throw Object.assign(new Error(`${describeProxy(proxy)}: ${e.message}`), { proxyFault: true });
-      throw e;
-    }
-  }
-  return fetch(target, {
-    method: "POST",
-    headers,
-    body,
-    redirect: "manual",
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-}
-
 // ----------------------------------------------------------- model discovery
 
 const VISION_PATTERN = /(vision|image|\bvl\b|gpt-4o|gpt-4\.1|gpt-5|omni|qwen.*-vl|llava|pixtral|moondream|glm-4v|internvl|minicpm-v|phi-3.*vision)/i;
@@ -1070,9 +1147,27 @@ const FREE_PATTERN = /(^|[:/\-_.\s])free([:/\-_.\s]|$)/i;
 // Google's OpenAI-compatible endpoint answers 400 "Please pass a valid API
 // key". Narrow on purpose — "invalid model" must not match.
 const BAD_KEY_PATTERN =
-  /(valid api[ _-]?key|invalid api[ _-]?key|api[ _-]?key (is )?(invalid|missing|not valid)|missing api[ _-]?key|неверный ключ|некорректный ключ)/i;
+  /(valid api[ _-]?key|invalid api[ _-]?key|api[ _-]?key (is )?(invalid|missing|not valid)|missing api[ _-]?key|неверный ключ|некорректный ключ|令牌无效|密钥无效|无效.*(密钥|令牌)|未授权|授权失败|身份验证失败)/i;
 const ENTITLEMENT_PATTERN =
-  /(deposit|top.?up|insufficient (balance|credit|funds)|no credit|out of credit|upgrade your plan|not (included|available) in your plan|premium model|subscription required|payment required|требуется (пополнен|подписк|оплат)|недостаточно средств|пополните баланс)/i;
+  /(deposit|top.?up|insufficient (balance|credit|funds)|no credit|out of credit|upgrade your plan|not (included|available) in your plan|premium model|subscription required|payment required|требуется (пополнен|подписк|оплат)|недостаточно средств|пополните баланс|余额不足|余额为0|余额不够|请充值|欠费|账户余额不足)/i;
+// Шлюзы-агрегаторы (проверено live на dacall.ai): модель числится в /models,
+// но под неё нет свободных upstream-аккаунтов — прилетает 503
+// "No available accounts: no available accounts". Это ёмкость провайдера, а не
+// ключ и не модель: ретрай осмысленен, а смена модели обычно помогает сразу.
+// Отдельным паттерном, а не частью ENTITLEMENT: там fault "plan" без ретрая,
+// здесь нужен transient.
+const NO_ACCOUNTS_PATTERN = /no available accounts/i;
+// Китайские агрегаторы говорят то же самое по-своему: «нет свободных каналов» —
+// тоже ёмкость, тоже ретраится и лечится сменой модели, а не ключа.
+const NO_CHANNEL_PATTERN = /无可用渠道|没有可用渠道|暂无可用|渠道不足/;
+// Лимит частоты, пришедший не тем статусом: 403/400 с «too fast» вместо 429.
+// Без этого китайский троттлинг читался как «ключ не принят» и останавливал
+// батч, хотя ключ рабочий.
+const RATE_PATTERN = /rate.?limit|too many requests|请求过于频繁|请求.*频繁|稍后重试|限流|请求过快|过于频繁/i;
+// Тот же класс шлюзов другим ключом отвечает 404
+// 'Model "x" is not supported by any configured account in this group':
+// модель не подключена на этой группе/тарифе, ключ при этом рабочий.
+const NOT_SUPPORTED_PATTERN = /not supported by any (configured )?account/i;
 
 function guessCapabilities(id) {
   const input = ["text"];
@@ -1296,7 +1391,7 @@ export async function fetchModels({ baseURL, apiKey, apiFormat } = {}) {
   for (const c of probeCandidates(guard.url.toString())) {
     let r;
     try {
-      r = await guardedFetch(c, headers, 12000, guard.blockLocal);
+      r = await guardedRequest(c, { headers, timeoutMs: 12000, blockLocal: guard.blockLocal });
     } catch (e) {
       lastClass = classifyProbeError(e);
       lastErr = lastClass.label;
@@ -1304,7 +1399,7 @@ export async function fetchModels({ baseURL, apiKey, apiFormat } = {}) {
     }
     if (r.ok) {
       let json;
-      try { json = await r.json(); } catch (e) {
+      try { json = JSON.parse(await readLimitedResponseText(r, 2_000_000)); } catch (e) {
         lastErr = "ответ не является JSON";
         continue;
       }

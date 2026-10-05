@@ -21,6 +21,7 @@ import https from "node:https";
 import { execFileSync } from "node:child_process";
 import { isIP } from "node:net";
 import { IS_WINDOWS } from "./paths.mjs";
+import { parseRegQuery } from "./env.mjs";
 
 /** Proxy settings are re-read at most this often. */
 const CACHE_TTL_MS = 5000;
@@ -131,10 +132,12 @@ export function readWindowsProxy() {
   try {
     out = execFileSync("reg", ["query", key], { encoding: "utf8", timeout: 4000, windowsHide: true });
   } catch { return null; }
-  const value = (name) => {
-    const m = out.match(new RegExp(`^\\s*${name}\\s+REG_\\w+\\s+(.*)$`, "mi"));
-    return m ? m[1].trim() : "";
-  };
+  // One shared parser (src/env.mjs) instead of a second inline regex: it handles
+  // empty values and case-insensitive names, which the ad-hoc match got wrong
+  // (an empty ProxyOverride read as "no override" is fine; a misread
+  // ProxyEnable is a proxy silently used or skipped). Trimmed like before:
+  // reg pads columns with spaces that must not leak into the values.
+  const value = (name) => (parseRegQuery(out, name) ?? "").trim();
   if (!/^0x1$/i.test(value("ProxyEnable"))) return null;
   const server = value("ProxyServer");
   if (!server) return null;
@@ -196,6 +199,9 @@ function openTunnel(proxy, host, port, timeoutMs) {
     const headers = { Host: `${host}:${port}` };
     const auth = proxyAuthHeader(proxy);
     if (auth) headers["Proxy-Authorization"] = auth;
+    // NB: the proxy's own certificate is verified (no rejectUnauthorized:false).
+    // A corporate proxy CA belongs in the OS store, where Node picks it up
+    // without disabling verification for everyone.
     const req = mod.request({
       host: proxy.host,
       port: proxy.port,
@@ -203,7 +209,6 @@ function openTunnel(proxy, host, port, timeoutMs) {
       path: `${host}:${port}`,
       headers,
       timeout: timeoutMs,
-      rejectUnauthorized: false, // proxies routinely use a private CA
     });
     let settled = false;
     const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
@@ -231,6 +236,35 @@ function openTunnel(proxy, host, port, timeoutMs) {
  */
 export const DEFAULT_MAX_BYTES = 2_000_000;
 
+export async function readLimitedResponseText(response, maxBytes = DEFAULT_MAX_BYTES) {
+  const limit = Number(maxBytes);
+  if (!Number.isSafeInteger(limit) || limit < 0) throw new TypeError("maxBytes must be a non-negative integer");
+  const declared = Number(response.headers?.get?.("content-length"));
+  if (Number.isFinite(declared) && declared > limit) {
+    await response.body?.cancel?.();
+    throw new Error(`Ответ обрезан на ${limit} байт — тело больше допустимого`);
+  }
+  if (!response.body?.getReader) return response.text();
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel();
+        throw new Error(`Ответ обрезан на ${limit} байт — тело больше допустимого`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks.map((c) => Buffer.from(c))));
+}
+
 export async function proxyFetch(target, { headers = {}, timeoutMs = 10000, proxy, method = "GET", body = null, maxBytes = DEFAULT_MAX_BYTES } = {}) {
   const u = new URL(target);
   const isHttps = u.protocol === "https:";
@@ -256,36 +290,44 @@ export async function proxyFetch(target, { headers = {}, timeoutMs = 10000, prox
 
     const req = mod.request(options, (res) => {
       let body = "";
-      // Truncation used to be silent: the body was capped mid-JSON and handed
-      // back as a success, so the caller saw "Unterminated string" and blamed
-      // the server for sending garbage. Stop reading, but say so.
+      let size = 0;
       let truncated = false;
-      res.setEncoding("utf8");
+      const fail = async () => {
+        throw new Error(`Ответ обрезан на ${maxBytes} байт — тело больше допустимого`);
+      };
+      const declared = Number(res.headers["content-length"]);
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        truncated = true;
+        res.destroy();
+      }
       res.on("data", (d) => {
-        if (body.length >= maxBytes) { truncated = true; return; }
+        if (truncated) return;
+        size += d.length;
+        if (size > maxBytes) {
+          truncated = true;
+          res.destroy();
+          return;
+        }
         body += d;
       });
-      res.on("end", () => {
+      const finish = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         if (socket) socket.end();
         const status = res.statusCode || 0;
-        const fail = async () => {
-          throw new Error(`Ответ обрезан на ${maxBytes} байт — тело больше допустимого`);
-        };
         resolve({
           ok: status >= 200 && status < 300,
           status,
           viaProxy: true,
           truncated,
           headers: { get: (n) => res.headers[String(n).toLowerCase()] ?? null },
-          // A truncated body is not the document that was sent. Returning it
-          // would hand the caller a half-parsed lie.
           text: truncated ? fail : async () => body,
           json: truncated ? fail : async () => JSON.parse(body),
         });
-      });
+      };
+      res.on("end", finish);
+      res.on("close", () => { if (truncated) finish(); });
     });
     req.on("error", (e) => {
       if (settled) return;

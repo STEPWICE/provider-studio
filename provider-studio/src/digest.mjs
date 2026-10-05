@@ -18,7 +18,7 @@
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { dataDir, ensureDir, writeFileAtomic } from "./paths.mjs";
-import { proxyForUrl, proxyFetch } from "./proxy.mjs";
+import { proxyForUrl, proxyFetch, readLimitedResponseText } from "./proxy.mjs";
 
 export const PERKS_URL = "https://board.ailyre.com/data/perks.json";
 export const NEWS_URL = "https://board.ailyre.com/data/news.json";
@@ -58,6 +58,11 @@ export function normalisePerk(p) {
     provider: clean(p?.provider),
     product: clean(p?.product),
     kind: clean(p?.kind),
+    // Что именно раздают и как это забирается: нужно UI, чтобы предложить
+    // кнопку «Настроить» только там, где халява превращается в конфиг.
+    relatedModel: clean(p?.related_model),
+    grantMode: clean(p?.grant_mode) || "unknown",
+    perkClass: clean(p?.perk_class) || "unknown",
     title: enFirst(p?.title_en, p?.title),
     summary: enFirst(p?.summary_en, p?.summary),
     claim: enFirst(p?.claim_en, p?.claim),
@@ -119,7 +124,7 @@ async function fetchJson(url, { timeoutMs, fetchImpl }) {
     : fetch(u, { signal: AbortSignal.timeout(timeoutMs) })));
   const r = await get(url);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const text = await r.text();
+  const text = await readLimitedResponseText(r, 2_000_000);
   return JSON.parse(text);
 }
 
