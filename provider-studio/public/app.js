@@ -826,11 +826,16 @@ async function loadConfigList() {
   if (configs.length < 2) { sel.hidden = true; return; }
   sel.hidden = false;
   // Short scope labels only: the full path is right next to it in the chip, and
-  // repeating it here forced the select to be ~500px wide.
+  // repeating it here forced the select to be ~500px wide. The basename alone
+  // is not enough either: ./opencode.jsonc and ./.opencode/opencode.jsonc
+  // would render identically, so a dotted parent dir is kept as a prefix.
   sel.innerHTML = configs.map((c) => {
     const mark = c.exists ? "" : " (нет файла)";
-    const file = String(c.path || "").split(/[\\/]/).pop();
-    return `<option value="${esc(c.path)}" title="${esc(c.path)}" ${c.active ? "selected" : ""}>${esc(c.scope)} · ${esc(file)}${mark}</option>`;
+    const parts = String(c.path || "").split(/[\\/]/).filter(Boolean);
+    const file = parts.pop() || "";
+    const parent = parts.pop() || "";
+    const shown = parent && parent.startsWith(".") ? `${parent}/${file}` : file;
+    return `<option value="${esc(c.path)}" title="${esc(c.path)}" ${c.active ? "selected" : ""}>${esc(c.scope)} · ${esc(shown)}${mark}</option>`;
   }).join("");
   // Restore the file the user picked last time, but only if it is still one of
   // the candidates — a remembered path that vanished would silently redirect
@@ -915,7 +920,7 @@ async function deleteEverywhere(name) {
       <span class="minus">-${r.diff ? r.diff.removed : 0}</span></div>`,
     diff: r.diff,
     // A dangling default model stops opencode from starting, so say so up front.
-    hint: (removed.length > 1 ? `Пул ключей: уйдут ${removed.length} шардов${r.pluginEntry ? " и плагин ротации" : ""}. ` : "")
+    hint: (removed.length > 1 ? `Пул ключей: уйдут ${removed.length} ${plural(removed.length, "шард", "шарда", "шардов")}${r.pluginEntry ? " и плагин ротации" : ""}. ` : "")
       + (orphaned.length ? `Будет переназначено: ${orphaned.join(", ")}. ` : "")
       + "Уберёт из opencode-конфига и из списка (с бэкапом и откатом).",
     confirmLabel: "Удалить полностью",
@@ -1006,7 +1011,7 @@ async function testAllModels() {
   const ids = state.models.map((m) => m.id).filter(Boolean);
   const box = $("#batchStatus");
   if (!ids.length) { toast("Сначала добавь модели", "err"); return; }
-  if (!confirm(`Отправить по одному настоящему запросу к ${ids.length} модел${plural(ids.length, "и", "ям", "ям")}?\n` +
+  if (!confirm(`Отправить по одному настоящему запросу к ${ids.length} ${plural(ids.length, "модели", "моделям", "моделям")}?\n` +
     `Это реальные запросы к провайдеру — они могут стоить денег и займут время.`)) return;
 
   box.hidden = false;
@@ -1016,8 +1021,9 @@ async function testAllModels() {
   // without pretending to know the pace.
   const started = Date.now();
   const mmss = (ms) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
-  box.textContent = `Проверяю ${ids.length} моделей\u2026`;
-  const ticker = setInterval(() => { box.textContent = `Проверяю ${ids.length} моделей\u2026 ${mmss(Date.now() - started)}`; }, 1000);
+  const checking = (extra) => `Проверяю ${ids.length} ${plural(ids.length, "модель", "модели", "моделей")}\u2026${extra}`;
+  box.textContent = checking("");
+  const ticker = setInterval(() => { box.textContent = checking(` ${mmss(Date.now() - started)}`); }, 1000);
 
   const r = await apiSafe("/api/testchat-batch", {
     method: "POST", headers: { "Content-Type": "application/json" },
@@ -1043,17 +1049,17 @@ async function testAllModels() {
   const blocked = results.filter((x) => !x.ok && x.fault === "blocked").length;
   const broken = results.filter((x) => !x.ok && x.fault !== "plan" && x.fault !== "blocked").length;
   const parts = [`Проверено ${res.tested || 0} из ${res.total || ids.length}`,
-    `рабочих ${res.passed || 0}`];
-  if (plan) parts.push(`не по тарифу ${plan}`);
-  if (blocked) parts.push(`временно отклонены ${blocked}`);
-  if (broken) parts.push(`не отвечают ${broken}`);
-  if (res.rateLimited) parts.push(`ограничений по частоте ${res.rateLimited}`);
+    `${plural(res.passed || 0, "рабочая", "рабочих", "рабочих")} ${res.passed || 0}`];
+  if (plan) parts.push(`не по тарифу: ${plan}`);
+  if (blocked) parts.push(`${plural(blocked, "временно отклонена", "временно отклонены", "временно отклонены")} ${blocked}`);
+  if (broken) parts.push(`${plural(broken, "не отвечает", "не отвечают", "не отвечают")} ${broken}`);
+  if (res.rateLimited) parts.push(`ограничений по частоте: ${res.rateLimited}`);
   // Red is reserved for something the user must fix. A model outside the plan
   // is information, not a fault in the setup.
   box.className = "batch-status " + (res.stopped ? "warn" : (res.passed ? "ok" : (broken ? "err" : "warn")));
   box.innerHTML = esc(parts.join(" \u00b7 ")) +
     (res.stopped ? `<div class="batch-stop">${esc(res.stopped.message || "")}</div>` : "") +
-    (untested.length ? `<div class="batch-stop">Не проверялись (${untested.length}): ${esc(untested.slice(0, 8).join(", "))}${untested.length > 8 ? "\u2026" : ""}</div>` : "");
+    (untested.length ? `<div class="batch-stop">${plural(untested.length, "Не проверялась", "Не проверялись", "Не проверялись")} (${untested.length}): ${esc(untested.slice(0, 8).join(", "))}${untested.length > 8 ? "\u2026" : ""}</div>` : "");
   renderModelList();
 }
 
@@ -1118,7 +1124,7 @@ function renderPoolCount() {
   if (!el) return;
   const n = poolKeys();
   const rawLines = String($("#f-pool").value || "").split(/\r?\n/).filter((l) => l.trim()).length;
-  el.textContent = n.length ? `Ключей: ${n.length}${rawLines > n.length ? ` (дубли убраны: ${rawLines - n.length})` : ""}` : "";
+  el.textContent = n.length ? `${plural(n.length, "Ключ", "Ключа", "Ключей")}: ${n.length}${rawLines > n.length ? ` (дубли убраны: ${rawLines - n.length})` : ""}` : "";
 }
 
 // Маркер построчного вердикта — те же пять состояний, что у моделей.
@@ -1153,7 +1159,8 @@ function renderPoolResults(results) {
       + (bal ? `<span class="pool-balance">${esc(bal)}</span>` : "") + `</div>`;
   }).join("");
   const passed = asArray(results).filter((x) => x.ok).length;
-  box.innerHTML = `<div class="muted">Живых ключей: ${passed} из ${asArray(results).length}</div>` + rows;
+  const total = asArray(results).length;
+  box.innerHTML = `<div class="muted">${plural(passed, "Живой", "Живых", "Живых")}: ${passed} из ${total}</div>` + rows;
 }
 
 // Write-only поле: сырые ключи никогда не возвращаются с сервера, поэтому при
@@ -1196,7 +1203,7 @@ async function checkPool() {
     `Это реальные запросы к провайдеру — они могут стоить денег.`)) return;
   const box = $("#poolStatus");
   box.hidden = false;
-  box.innerHTML = `<div class="muted">Проверяю ${keys.length} ключей…</div>`;
+  box.innerHTML = `<div class="muted">Проверяю ${keys.length} ${plural(keys.length, "ключ", "ключа", "ключей")}…</div>`;
   const r = await apiSafe("/api/pool-check", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1261,7 +1268,7 @@ async function poolPreview(provider) {
   if (!r.ok) return toast(r.error || "Не удалось построить diff пула", "err");
   state.configHash = r.hash || "";
   openDiff({
-    title: `Пул ключей: ${(r.shardKeys || []).length} шардов + плагин`,
+    title: `Пул ключей: ${(r.shardKeys || []).length} ${plural((r.shardKeys || []).length, "шард", "шарда", "шардов")} + плагин`,
     meta: `<div class="diff-path">${esc(r.path || "")}</div>
       <div class="diff-stat"><span class="plus">+${r.diff ? r.diff.added : 0}</span>
       <span class="minus">-${r.diff ? r.diff.removed : 0}</span>
@@ -1306,7 +1313,7 @@ async function poolApplyNow(provider) {
   syncSidePlaceholder();
   const shardLines = (res.shards || []).map((s) => `<div class="ok-line" style="color:var(--muted)">${esc(s.key)} → {env:${esc(s.envVar)}}</div>`).join("");
   resultsEl.innerHTML = `<div class="result-card"><h3>opencode · пул ключей</h3>`
-    + `<div class="ok-line">✓ Применено: ${(res.shardKeys || []).length} шардов. Модель по умолчанию: ${esc(res.defaultModel || "—")}</div>`
+    + `<div class="ok-line">✓ Применено: ${(res.shardKeys || []).length} ${plural((res.shardKeys || []).length, "шард", "шарда", "шардов")}. Модель по умолчанию: ${esc(res.defaultModel || "—")}</div>`
     + shardLines
     + (res.pluginFile ? `<div class="ok-line" style="color:var(--muted)">Плагин ротации: ${esc(res.pluginFile)} — перезапусти opencode</div>`
       : `<div class="err-line">✕ Плагин не записан: ${esc(res.pluginError || "ошибка")}</div>`)
@@ -2445,7 +2452,7 @@ async function offerPoolEnvSave(res) {
   const keys = poolKeys();
   const names = asArray(res.envNames);
   if (!keys.length || keys.length !== names.length) return true;
-  if (!confirm(`Записать ${keys.length} ключей пула в переменные окружения (${missing.length} из них ещё не заданы)?`)) return false;
+  if (!confirm(`Записать ${keys.length} ${plural(keys.length, "ключ", "ключа", "ключей")} пула в переменные окружения (${missing.length} из них ещё не заданы)?`)) return false;
   const r = await apiSafe("/api/setenv-pool", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ envBase: names[0], keys }),
@@ -2462,7 +2469,7 @@ async function offerPoolEnvSave(res) {
   if (state.poolDrafts) state.poolDrafts.delete(state.editingKey || "__new__");
   $("#f-pool").value = "";
   renderPoolCount();
-  toast(`Пул записан: ${keys.length} переменных. Запускай opencode из нового окна терминала.`, "ok");
+  toast(`Пул записан: ${keys.length} ${plural(keys.length, "переменная", "переменные", "переменных")}. Запускай opencode из нового окна терминала.`, "ok");
   return true;
 }
 
@@ -2594,7 +2601,7 @@ function renderWizardSummary() {
     ["Ключ в конфиге", esc(slugifyName(p.name) || "\u2014"), "mono"],
     ["Base URL", esc(p.baseURL || "\u2014"), "mono"],
     ["Формат API", esc(p.apiFormat), ""],
-    ["Моделей выбрано", String(models.length), models.length ? "" : "warn"],
+    [plural(models.length, "Модель выбрана", "Модели выбраны", "Моделей выбрано"), String(models.length), models.length ? "" : "warn"],
     ["Модель по умолчанию", esc(models[0] || "\u2014"), ""],
     ["Ключей в пуле", wizPoolN ? wizPoolN + " — запишутся шардами + плагин ротации" : "—", ""],
     p.useEnvVar
@@ -2764,7 +2771,7 @@ async function diagnose() {
     html += `<div class="diag-row">
       <span class="diag-name">${esc(p.key)}</span>
       ${p.isDefault ? `<span class="tag">по умолчанию</span>` : ""}
-      <span class="diag-meta">${p.nModels} моделей</span>
+      <span class="diag-meta">${p.nModels} ${plural(p.nModels, "модель", "модели", "моделей")}</span>
       ${reachBadge(p)}
     </div>
     <div class="diag-sub muted">${esc(p.conn || "")} · ${esc(p.baseURL || "—")}${typeof p.ms === "number" ? ` · ${p.ms} мс` : ""}</div>`;
@@ -3194,14 +3201,18 @@ function paintDigest() {
     + chip("all", "Все")
     + chip("api", "Можно подключить", "только раздачи с известным API-адресом — в один клик уходят в мастер")
     + chip("claim", "Нужно забирать", "где требуется активное действие, а не просто подписка")
-    + `</div>`
-    + `<div class="diag-sect">Раздают</div>`;
-  let shown = 0;
-  for (const p of perks) {
+    + `</div>`;
+  // Фильтр применяется до рендера, чтобы счётчик говорил правду: шапка обещает
+  // число, а feed держит десятки записей — врать нельзя ни в ту сторону.
+  const visible = perks.filter((p) => {
+    if (filter === "api" && !presetForPerk(p)) return false;
+    if (filter === "claim" && p.grantMode !== "claim") return false;
+    return true;
+  });
+  html += `<div class="diag-sect">Раздают (${visible.length})</div>`;
+  if (!visible.length) html += `<div class="ok-line" style="color:var(--muted)">— с таким фильтром ничего нет —</div>`;
+  for (const p of visible) {
     const preset = presetForPerk(p);
-    if (filter === "api" && !preset) continue;
-    if (filter === "claim" && p.grantMode !== "claim") continue;
-    shown++;
     const badge = p.status === "upcoming" ? "скоро" : p.status === "active" ? "идёт" : esc(p.status || "");
     const grant = DIGEST_GRANT_LABEL[p.grantMode] || "";
     html += `<div class="diag-row"><span class="diag-name">${esc(p.title || p.id || "?")}</span>`
@@ -3218,7 +3229,7 @@ function paintDigest() {
       + (p.source ? `<a class="digest-link" href="${esc(p.source)}" target="_blank" rel="noopener">источник ↗</a>` : "")
       + `</div>`;
   }
-  if (!shown) html += `<div class="ok-line" style="color:var(--muted)">— с таким фильтром ничего нет —</div>`;
+  if (!visible.length) html += `<div class="ok-line" style="color:var(--muted)">— с таким фильтром ничего нет —</div>`;
   html += `<div class="diag-sect">Новости (${news.length})</div>`;
   if (!news.length) html += `<div class="ok-line" style="color:var(--muted)">\u2014 пусто \u2014</div>`;
   // Rendered whole: the header promises news.length, and the feed holds

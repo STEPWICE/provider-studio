@@ -39,6 +39,42 @@ const S = await import("./src/smart-audit.mjs");
   check("оценка ниже сотни", r.score < 100 && r.score >= 0, String(r.score));
 }
 
+// ------------------------------------------------------- шарды пула — не дубли
+// Пять ключей одного шлюза — один логический источник: без схлопывания пул
+// давал бы пачку «модель у N провайдеров» и просадку счёта ни за что.
+{
+  const shard = (ref) => ({
+    npm: "@ai-sdk/openai-compatible", name: "P",
+    options: { baseURL: "https://pool.dev/v1", apiKey: `{env:${ref}}` },
+    env: [ref], models: { m: { name: "M" } },
+  });
+  const r = S.smartAudit({
+    provider: {
+      pool: shard("POOL_API_KEY"), "pool-2": shard("POOL_API_KEY_2"),
+      "pool-3": shard("POOL_API_KEY_3"), other: { npm: "x", models: { m: { name: "M" } } },
+    },
+    model: "pool/m",
+  });
+  const poolDup = r.findings.find((f) => f.id === "duplicate-model-id");
+  check("шарды пула схлопнуты в один источник",
+    !!poolDup && /у 2 провайдеров: pool, other/.test(poolDup.message), JSON.stringify(poolDup || null));
+  const rPure = S.smartAudit({
+    provider: { pool: shard("POOL_API_KEY"), "pool-2": shard("POOL_API_KEY_2") },
+    model: "pool/m",
+  });
+  check("чистый пул находок не даёт",
+    !rPure.findings.some((f) => f.id === "duplicate-model-id"), JSON.stringify(rPure.findings));
+  const r2 = S.smartAudit({
+    provider: {
+      pool: shard("POOL_API_KEY"),
+      alien: { npm: "x", options: { baseURL: "https://other.dev/v1" }, models: { m: {} } },
+    },
+    model: "pool/m",
+  });
+  check("чужой шлюз с той же моделью всё ещё дубль",
+    r2.findings.some((f) => f.id === "duplicate-model-id"), JSON.stringify(r2.findings));
+}
+
 // ------------------------------------------------------- когда всё хорошо
 {
   const r = S.smartAudit({

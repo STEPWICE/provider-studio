@@ -258,6 +258,18 @@ check("a default model with tools is quiet",
       a: { npm: "x", options: { baseURL: "https://one.dev/v1" }, models: {} },
       b: { npm: "x", options: { baseURL: "https://two.dev/v1" }, models: {} },
     } }, "duplicate-baseurl"));
+  // Pool shards share the address by construction — flagging them as copy-paste
+  // produced four warnings for one pool.
+  check("pool shards on one URL are not copy-paste",
+    !has({ provider: {
+      a: { npm: "x", options: { baseURL: "https://same.dev/v1", apiKey: "{env:POOL_API_KEY}" }, models: {} },
+      b: { npm: "x", options: { baseURL: "https://same.dev/v1", apiKey: "{env:POOL_API_KEY_2}" }, models: {} },
+    } }, "duplicate-baseurl"));
+  check("same URL with unrelated keys still warns",
+    has({ provider: {
+      a: { npm: "x", options: { baseURL: "https://same.dev/v1", apiKey: "{env:FOO_API_KEY}" }, models: {} },
+      b: { npm: "x", options: { baseURL: "https://same.dev/v1", apiKey: "{env:BAR_API_KEY}" }, models: {} },
+    } }, "duplicate-baseurl"));
 }
 
 // Anthropic-compatible endpoints need a version header to authenticate.

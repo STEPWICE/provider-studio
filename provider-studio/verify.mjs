@@ -308,6 +308,10 @@ try {
   const poolPlugin = poolApply.pluginFile || "";
   check("pool apply stages the rotation plugin next to the config",
     !!poolPlugin && existsSync(poolPlugin), poolPlugin);
+  const poolVal = await (await get("/api/validate")).json();
+  check("pool shards do not warn about copy-paste",
+    !(poolVal.issues || []).some((i) => i.id === "duplicate-baseurl"),
+    JSON.stringify((poolVal.issues || []).map((i) => i.id)));
   const poolPrev = await (await post("/api/preview-remove", { key: "pool-victim" })).json();
   check("pool removal preview names both shards",
     poolPrev.ok === true && (poolPrev.removedKeys || []).length === 2,

@@ -7,9 +7,9 @@
 import {
   FORMATS, MODALITIES, MODEL_STATUSES, PROVIDER_FIELDS, MODEL_FIELDS,
   slugify, normaliseHeaders, buildModelEntry, buildOpencodeProvider, managedModelKeys,
-  buildProviderChanges, buildRemovalChanges, decodeApiKey, isPlaintextKey,
+  buildProviderChanges, buildRemovalChanges, buildRemovals, decodeApiKey, isPlaintextKey,
   suggestEnvVarName, looksLikePackage, isCustomProviderBlock, detectApiFormat,
-  modelEntryToForm,
+  modelEntryToForm, samePool,
 } from "./src/formats.mjs";
 import { applyChangesVerified, parseJsonc, getPath } from "./src/jsonc-edit.mjs";
 
@@ -412,6 +412,22 @@ check("dropping the env var removes the env array",
 
 // --------------------------------------------------------------- removal
 
+// Pool-sibling detection: same address + same env stem with a numeric suffix
+// is one logical provider, not two. Anything less is not evidence.
+{
+  const shard = (ref) => ({ npm: "x", options: { baseURL: "https://p.dev/v1", apiKey: `{env:${ref}}` } });
+  check("pool shards are kin",
+    samePool(shard("P_API_KEY"), shard("P_API_KEY_2")) === true);
+  check("different vars are not kin",
+    samePool(shard("FOO_API_KEY"), shard("BAR_API_KEY")) === false);
+  check("the same var twice is not kin",
+    samePool(shard("P_API_KEY"), shard("P_API_KEY")) === false);
+  check("no address means no kinship",
+    samePool({ npm: "x", options: { apiKey: "{env:P_API_KEY}" } }, shard("P_API_KEY_2")) === false);
+  check("a literal key is not kin",
+    samePool(shard("P_API_KEY"), { npm: "x", options: { baseURL: "https://p.dev/v1", apiKey: "sk-x" } }) === false);
+}
+
 const rm = buildRemovalChanges("old", existing);
 check("removal succeeds", rm.ok, rm.error);
 eq("removal deletes the provider", rm.changes[0], { op: "delete", path: ["provider", "old"] });
@@ -430,6 +446,33 @@ check("removing an unrelated provider leaves the default model alone",
 const rmSmall = buildRemovalChanges("old", { ...existing, model: "other/z", small_model: "old/m1" });
 eq("removal repoints small_model too",
   rmSmall.changes.find((c) => c.path.join(".") === "small_model").value, "other/z");
+
+// Multi-removal: a shared default falls to a survivor, never to a removed
+// shard; the disable list is cleaned of removed names only.
+{
+  const cfg = {
+    model: "a/m1",
+    disabled_providers: ["a", "zzz"],
+    provider: {
+      a: { options: { baseURL: "https://x.dev" }, models: { m1: {} } },
+      b: { options: { baseURL: "https://x.dev" }, models: { m2: {} } },
+      c: { options: { baseURL: "https://y.dev" }, models: { m3: {} } },
+    },
+  };
+  const multi = buildRemovals(["a", "b"], cfg);
+  check("multi removal succeeds", multi.ok === true, multi.error || "");
+  eq("multi removal names every removed key", multi.providerKeys, ["a", "b"]);
+  eq("the default skips removed shards",
+    multi.changes.find((c) => c.path.join(".") === "model").value, "c/m3");
+  eq("disabled_providers loses only the removed names",
+    multi.changes.find((c) => c.path.join(".") === "disabled_providers").value, ["zzz"]);
+  const pluginCfg = { ...cfg, plugin: ["keypool-a.mjs", "./other.mjs"] };
+  const withPlugin = buildRemovals(["a", "b"], pluginCfg, { pluginFileName: "keypool-a.mjs" });
+  eq("the pool plugin entry goes with the pool",
+    withPlugin.changes.find((c) => c.path.join(".") === "plugin").value, ["./other.mjs"]);
+  check("an all-missing removal stays notFound",
+    buildRemovals(["ghost"], cfg).notFound === true);
+}
 
 // ----------------------------------------------------------- key encoding
 

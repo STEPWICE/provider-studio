@@ -489,6 +489,35 @@ function pluginBase(v) {
   return s.split(/[\\/]/).pop() || "";
 }
 
+/**
+ * Family of a provider block for pool-sibling detection. Pool shards share one
+ * address and one env-var stem (BASE vs BASE_2): flagging them as independent
+ * duplicates is noise — a pool of five shards produced four "copy-paste"
+ * warnings and three "same model at four providers" findings.
+ * Returns "" when there is no positive evidence (no address or no env ref),
+ * so genuinely different providers never collapse.
+ */
+export function providerFamily(block) {
+  const p = block && typeof block === "object" ? block : {};
+  const base = typeof p.options?.baseURL === "string"
+    ? p.options.baseURL.trim().replace(/\/+$/, "").toLowerCase() : "";
+  if (!base) return "";
+  const { useEnvVar, envVarName } = decodeApiKey(p.options?.apiKey);
+  if (!useEnvVar || !envVarName) return "";
+  return `${base} ${envVarName.replace(/_\d+$/, "")}`;
+}
+
+/** True when two blocks are shards of one key pool (same stem, different vars). */
+export function samePool(aBlock, bBlock) {
+  const fa = providerFamily(aBlock);
+  if (!fa) return false;
+  const fb = providerFamily(bBlock);
+  if (fa !== fb) return false;
+  const ra = decodeApiKey(aBlock?.options?.apiKey).envVarName;
+  const rb = decodeApiKey(bBlock?.options?.apiKey).envVarName;
+  return ra !== rb;
+}
+
 /** Recognises the current {env:VAR} form, the legacy $VAR one and {file:...}. */
 export function decodeApiKey(apiKey) {
   const raw = typeof apiKey === "string" ? apiKey.trim() : "";

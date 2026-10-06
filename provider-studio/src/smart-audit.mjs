@@ -13,6 +13,8 @@
 // Оценка: 100 − 10 за warn − 3 за info, пол — 0. Формула зафиксирована здесь
 // и в интерфейсе, чтобы число не выглядело магией.
 
+import { providerFamily } from "./formats.mjs";
+
 function isPlainObject(v) {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
@@ -74,18 +76,29 @@ export function smartAudit(config) {
       if (!limit && noLimitExamples.length < 5) noLimitExamples.push(`${key}/${mid}`);
       if (!price && noCostExamples.length < 5) noCostExamples.push(`${key}/${mid}`);
       if (!byId.has(mid)) byId.set(mid, []);
-      byId.get(mid).push({ provider: key, price });
+      byId.get(mid).push({ provider: key, price, family: providerFamily(p) });
     }
   }
 
   // Один id у нескольких шлюзов: не ошибка, но развилка — брать можно оттуда,
-  // где дешевле, а дефолт может стоять на дорогом источнике.
+  // где дешевле, а дефолт может стоять на дорогом источнике. Шарды одного пула
+  // выглядят как «модель у N провайдеров», но это один логический источник:
+  // схлопываем их в первого представителя. Без positive evidence (пустая семья)
+  // ничего не схлопываем: у npm-пакетов свой baked-in эндпоинт у каждого.
   let duplicates = 0;
   for (const [mid, sources] of byId) {
     if (sources.length < 2) continue;
+    const seenFam = new Set();
+    const list = [];
+    for (const s of sources) {
+      if (s.family && seenFam.has(s.family)) continue;
+      if (s.family) seenFam.add(s.family);
+      list.push(s);
+    }
+    if (list.length < 2) continue;
     duplicates++;
-    const pricedSources = sources.filter((s) => s.price);
-    const where = sources.map((s) => s.provider).join(", ");
+    const pricedSources = list.filter((s) => s.price);
+    const where = list.map((s) => s.provider).join(", ");
     let tail = "";
     if (pricedSources.length >= 2) {
       const sorted = [...pricedSources].sort((a, b) => a.price.total - b.price.total);
@@ -95,7 +108,7 @@ export function smartAudit(config) {
     }
     findings.push({
       severity: "info", id: "duplicate-model-id",
-      message: `Модель «${mid}» есть у ${sources.length} провайдеров: ${where}${tail}`,
+      message: `Модель «${mid}» есть у ${list.length} провайдеров: ${where}${tail}`,
     });
   }
 

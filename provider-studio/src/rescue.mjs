@@ -22,6 +22,7 @@ import { proxyForUrl, proxyFetch, describeProxy, isLocalTarget, readLimitedRespo
 import {
   looksLikePackage, isCustomProviderBlock, decodeApiKey, isPlaintextKey,
   suggestEnvVarName, MODALITIES, MODEL_STATUSES, PROVIDER_FIELDS, MODEL_FIELDS,
+  samePool,
 } from "./formats.mjs";
 import {
   resolveKeyRef, keyRefProblem, lookupEnv, setEnvCommand, SETX_MAX_LENGTH,
@@ -301,6 +302,7 @@ export function validateConfig(config) {
   // Два провайдера на один адрес — почти всегда копипаст из соседнего блока:
   // запросы уходят не туда, а ключ проверяется не тот. Только предупреждение:
   // зеркала одного шлюза существуют намеренно, и удалять тут нечего.
+  // Шарды одного пула делят адрес по построению — это не копипаст.
   const seenBase = new Map();
   for (const [key, p] of Object.entries(config.provider)) {
     if (!p || typeof p !== "object" || Array.isArray(p) || p.type === "local") continue;
@@ -308,9 +310,12 @@ export function validateConfig(config) {
     const base = typeof raw === "string" ? raw.trim().replace(/\/+$/, "").toLowerCase() : "";
     if (!base) continue;
     if (seenBase.has(base)) {
-      issues.push(issue("warn", "duplicate-baseurl",
-        `Провайдеры «${seenBase.get(base)}» и «${key}» указывают на один Base URL — обычно это копипаст`,
-        { provider: key }));
+      const first = seenBase.get(base);
+      if (!samePool(config.provider[first], p)) {
+        issues.push(issue("warn", "duplicate-baseurl",
+          `Провайдеры «${first}» и «${key}» указывают на один Base URL — обычно это копипаст`,
+          { provider: key }));
+      }
     } else {
       seenBase.set(base, key);
     }
