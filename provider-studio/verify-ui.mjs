@@ -609,7 +609,9 @@ const polishGaps = [];
   if (dialogs < 4) polishGaps.push(`only ${dialogs}/4 modals expose role=dialog`);
   const css = readFileSync("public/style.css", "utf8");
   if (/\.wipe/.test(css)) polishGaps.push("dead .wipe styles for a removed button");
-  if (!/max-width: 760px/.test(css)) polishGaps.push("no narrow-window stacking");
+  if (!/@media \(max-width:\s*\d+px\)[\s\S]{0,200}?\.workspace\s*{\s*grid-template-columns:\s*minmax\(0,\s*1fr\)/.test(css)) {
+    polishGaps.push("no narrow-window stacking");
+  }
   if (!/model-row:focus-within \.rm/.test(css)) polishGaps.push("model actions stay invisible to keyboard users");
 }
 console.log(polishGaps.length ? `POLISH GAPS: ${polishGaps.join("; ")}` : "key preview, preset filter, dialogs and small screens are covered");

@@ -3,7 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#080b12" />
   <title>Provider Studio</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%236c5ce7'/%3E%3Ctext x='32' y='43' font-family='Arial' font-size='30' font-weight='bold' fill='white' text-anchor='middle'%3EPS%3C/text%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -57,6 +59,13 @@
       <div class="workspace">
       <div class="col-main">
       <div class="card" id="editor">
+        <div class="card-heading">
+          <div>
+            <span class="card-eyebrow">Подключение</span>
+            <h2>Провайдер и модели</h2>
+          </div>
+          <span class="card-hint">Запись в конфиг — только после проверки diff</span>
+        </div>
         <!-- Провайдер -->
         <div class="card-head">
           <div class="form-grid">
@@ -88,14 +97,14 @@
 
           <div class="field">
             <label>Пул ключей <span class="muted">— необязательно, по одному на строке</span></label>
-            <textarea id="f-pool" class="pool-area" rows="3" placeholder="Вставь запасные ключи — каждый с новой строки. Основной ключ бери из поля выше." autocomplete="off" spellcheck="false"></textarea>
+            <textarea id="f-pool" class="pool-area" rows="2" placeholder="Вставь запасные ключи — каждый с новой строки. Основной ключ бери из поля выше." autocomplete="off" spellcheck="false"></textarea>
             <div class="pool-row">
               <button class="btn btn-ghost btn-sm" id="btnPoolCheck" type="button" title="Проверить каждый ключ пула живым запросом">&#x26A1; Проверить пул</button>
               <button class="btn btn-ghost btn-sm" id="btnPoolSave" type="button" title="Записать все ключи пула в переменные окружения">Записать пул в env</button>
               <span class="muted" id="poolCount"></span>
             </div>
             <div class="pool-status" id="poolStatus" hidden></div>
-            <div class="fmt-note">Если на одном ключе кончатся баланс или квота (401/402/429), плагин переключит запросы на следующий живой ключ сам.</div>
+            <div class="fmt-note">401/402/429 → плагин сам переключится на следующий живой ключ.</div>
           </div>
 
           <div class="field">
@@ -103,19 +112,17 @@
             <select id="f-format"></select>
             <div class="fmt-note" id="f-format-note"></div>
           </div>
-
-          <div class="field field-inline">
-            <button class="btn btn-ghost btn-sm" id="btnDiscover" title="Получить список моделей с сервера">&#x1F50D; Обнаружить модели</button>
-          </div>
         </div>
 
+        <div class="card-side">
         <!-- Модели -->
         <div class="models-block">
           <div class="models-head">
             <span>Список моделей</span>
             <div class="row-actions">
+              <button class="btn btn-ghost btn-sm" id="btnDiscover" title="Получить список моделей с сервера">&#x1F50D; Обнаружить</button>
               <button class="btn btn-ghost btn-sm" id="btnTestAll" title="Отправить пробный запрос к каждой модели по очереди">&#x26A1; Проверить все</button>
-              <button class="btn btn-soft" id="btnAddModel">+ Добавить модель</button>
+              <button class="btn btn-soft" id="btnAddModel" title="Добавить модель">+ Модель</button>
             </div>
           </div>
           <div class="batch-status" id="batchStatus" hidden></div>
@@ -140,6 +147,7 @@
           <button class="btn btn-soft" id="btnPreview" title="Показать, что изменится в файле (Ctrl+D)">Показать diff</button>
           <button class="btn btn-primary" id="btnApply" title="Записать в конфиг (Ctrl+S)">Применить</button>
         </div>
+        </div>
       </div>
 
       </div>
@@ -155,6 +163,7 @@
           <button class="btn btn-soft" id="btnBackupNow">Бэкап</button>
           <button class="btn btn-soft" id="btnUndo" title="Откатывать нечего" disabled>Отменить</button>
           <button class="btn btn-soft" id="btnPerks" title="Что провайдеры раздают прямо сейчас">Халява</button>
+          <button class="btn btn-soft" id="btnEnvAudit" title="Какие переменные заданы, что ссылается, что можно удалить">Env-аудит</button>
           <span class="muted" id="backupInfo"></span>
         </div>
         <!-- Placeholder rather than an empty column: an unexplained blank area
@@ -277,7 +286,7 @@
       </div>
 
       <ol class="wiz-steps" id="wizSteps">
-        <li data-step="0">Провайдер</li>
+        <li data-step="0">Сервис</li>
         <li data-step="1">Ключ</li>
         <li data-step="2">Модели</li>
         <li data-step="3">Запись</li>
@@ -285,8 +294,8 @@
 
       <!-- Шаг 1: выбор пресета -->
       <section class="wiz-pane" id="wizPane0">
-        <p class="wiz-lead">Выбери сервис. Base URL и формат API подставятся сами.</p>
-        <input type="text" id="presetSearch" class="provider-search" placeholder="Фильтр пресетов…" aria-label="Фильтр пресетов" />
+        <p class="wiz-lead">Выбери сервис из списка — Base URL и формат API подставятся сами. Для своего шлюза есть карточка «Другой (вручную)».</p>
+        <input type="text" id="presetSearch" class="provider-search" placeholder="Найти провайдера…" aria-label="Фильтр пресетов" />
         <div class="preset-grid" id="presetGrid"></div>
       </section>
 
@@ -342,7 +351,7 @@
         <div class="wiz-summary" id="wizSummary"></div>
       </section>
 
-      <div class="modal-foot">
+      <div class="modal-foot" id="wizFoot">
         <span class="muted" id="wizHint"></span>
         <button class="btn btn-ghost" id="wizBack">Назад</button>
         <button class="btn btn-primary" id="wizNext">Далее</button>

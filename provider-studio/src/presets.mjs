@@ -17,6 +17,10 @@
 // unattributed, undated number is worse than none: it reads as current.
 // The rule for editing this file: every `freeTier.limits` line must be
 // something the provider states, with `source` pointing at where it says so.
+//
+// `wizard: false` keeps niche/enterprise/unofficial presets out of the beginner
+// grid. They stay in the data so existing configs, perks and discovery can
+// still resolve them.
 
 /** Date the free-tier notes below were last checked against the providers. */
 export const FREE_TIER_CHECKED = "2026-09-17";
@@ -86,6 +90,9 @@ export const PRESETS = [
     envVarName: "NVIDIA_API_KEY",
     keyURL: "https://build.nvidia.com/settings/api-keys",
     needsKey: true,
+    // Enterprise-oriented onboarding; kept for existing configs and the
+    // digest, but not shown in the beginner setup wizard.
+    wizard: false,
     discover: true,
     freeTier: {
       summary: "Пробные кредиты на аккаунт, дальше — платно.",
@@ -189,6 +196,9 @@ export const PRESETS = [
     envVarName: "CEREBRAS_API_KEY",
     keyURL: "https://cloud.cerebras.ai/",
     needsKey: true,
+    // No permanent free tier and a niche onboarding flow; keep the preset
+    // available through discovery/perks, hide it from the beginner wizard.
+    wizard: false,
     discover: true,
     freeTier: {
       // Included precisely because the internet still lists Cerebras as
@@ -214,6 +224,9 @@ export const PRESETS = [
     apiFormat: "openai-chat",
     envVarName: "XKIRO_API_KEY",
     needsKey: true,
+    // Unofficial gateway with no public key page: not a sensible default for
+    // newcomers, so it stays out of the wizard grid.
+    wizard: false,
     // Без seed-списка намеренно: захардкоженные id протухают за недели, а живое
     // обнаружение (discover:true) отдаёт актуальный каталог с ценами и :free.
     discover: true,

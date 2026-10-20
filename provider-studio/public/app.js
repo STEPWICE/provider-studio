@@ -63,6 +63,18 @@ function asArray(v) {
   return [];
 }
 
+// The sidebar shows both the saved-provider store and the providers that only
+// exist in the opencode config (never imported). Refresh sites used to replace
+// the list with the store alone, so renaming a config-only provider emptied the
+// sidebar until the next full reload.
+function mergeProviderLists(store, live) {
+  const byName = new Map();
+  for (const p of [...asArray(store), ...asArray(live)]) {
+    if (p && p.name) byName.set(String(p.name), p);
+  }
+  return [...byName.values()];
+}
+
 function esc(s) {
   return String(s == null ? "" : s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -100,10 +112,13 @@ let previewSeq = 0;
 
 function toast(msg, kind) {
   setStatus(msg, kind);
-  const el = $("#status");
-  el.classList.add("toast-show");
   clearTimeout(window._toastTimer);
-  window._toastTimer = setTimeout(() => el.classList.remove("toast-show"), 3000);
+  const ours = $("#status").textContent;
+  window._toastTimer = setTimeout(() => {
+    // Clear only if the text is still ours: a newer sticky status may have
+    // replaced the message while this timer was running.
+    if ($("#status").textContent === ours) setStatus("", "");
+  }, 3000);
 }
 
 function setBtnLoading(btn, loading) {
@@ -113,7 +128,11 @@ function setBtnLoading(btn, loading) {
     btn.textContent = "...";
   } else {
     btn.disabled = false;
-    if (btn.dataset.origText) btn.textContent = btn.dataset.origText;
+    // Only undo our own "...": a handler may legitimately change the label
+    // while it runs (the wizard's last step renames "Далее" to "Показать diff").
+    // Restoring the pre-click text would put the stale label back.
+    if (btn.dataset.origText && btn.textContent === "...") btn.textContent = btn.dataset.origText;
+    delete btn.dataset.origText;
   }
 }
 
@@ -127,7 +146,7 @@ async function withLoading(btn, fn) {
 async function init() {
   const d = await apiSafe("/api/state");
   if (!d || (!asArray(d.formats).length && !d.opencode)) {
-    setStatus(`Сервер недоступен: ${(d && d.error) || "неизвестная ошибка"}`, "err");
+    setStatus(`Сервер недоступен: ${(d && d.error) || "неизвестная ошибка"}. Запусти сервер и обнови страницу.`, "err");
     return;
   }
   state.formats = asArray(d.formats);
@@ -135,12 +154,7 @@ async function init() {
   state.presets = asArray(d.presets);
   if (Number(d.poolMax) > 0) state.poolMax = Math.trunc(Number(d.poolMax));
   // The store file has historically held a bare object; never assume an array.
-  const live = asArray(d.opencode && d.opencode.providers);
-  const byName = new Map();
-  for (const p of [...asArray(d.providers), ...live]) {
-    if (p && p.name) byName.set(String(p.name), p);
-  }
-  state.providers = [...byName.values()];
+  state.providers = mergeProviderLists(d.providers, d.opencode && d.opencode.providers);
   state.backups = asArray(d.backups);
 
   const sel = $("#f-format");
@@ -155,6 +169,10 @@ async function init() {
 
   renderTargetChips();
   renderProviderList();
+  // Existing snapshots are part of the initial state; without this the panel
+  // stayed hidden until the user created another backup, so old ones could not
+  // be restored after a reload.
+  renderBackups(state.backups);
 
   if (d.opencode) {
     updateConfigChip(d.opencode);
@@ -164,7 +182,11 @@ async function init() {
   await loadConfigList();
   // loadConfigList may have restored a remembered non-default file; adopt its
   // hash before any write, or the first save goes out unguarded.
-  await refreshConfigState();
+  const initialCfg = await refreshConfigState();
+  if (initialCfg && initialCfg.opencode && initialCfg.opencode.error) {
+    // The red chip alone is easy to miss, and the form silently stays empty.
+    setStatus(`Конфиг не читается: ${initialCfg.opencode.error}`, "err");
+  }
   state.savedSnapshot = formSnapshot();
 
   renderModelList();
@@ -232,6 +254,10 @@ async function init() {
     state.configHash = "";
     rememberConfigPath(state.configPath);
     await refreshConfigState();
+    // The provider list is scoped to the file too: leaving the previous file's
+    // rows on screen made the new config look like it contained them.
+    await refreshProviders();
+    await refreshBackups();
     toast("Правки пойдут в: " + (state.configPath || "конфиг по умолчанию"), "");
   });
   $("#btnNew").addEventListener("click", () => {
@@ -239,6 +265,9 @@ async function init() {
       stashPoolDraft();
       state.models = [];
       state.editingKey = "";
+      // Probe verdicts belong to the provider that produced them: keeping them
+      // would paint provider A's "✓ works" onto provider B's same-named model.
+      state.probeResults = {};
       renderModelList();
       $$("#f-name, #f-baseurl, #f-apikey, #f-envname").forEach(el => el.value = "");
       clearPoolBox();
@@ -248,6 +277,7 @@ async function init() {
       restoreDefaults();
       state.dirty = false;
       state.savedSnapshot = formSnapshot();
+      renderProviderList();
       toast("Форма очищена — можно добавлять новый провайдер", "");
     }
   });
@@ -255,8 +285,8 @@ async function init() {
   $("#btnPoolCheck").addEventListener("click", () => withLoading($("#btnPoolCheck"), checkPool));
   $("#btnPoolSave").addEventListener("click", () => withLoading($("#btnPoolSave"), savePoolEnv));
   $("#f-pool").addEventListener("input", renderPoolCount);
-  $("#btnValidate").addEventListener("click", validate);
-  $("#btnBackupNow").addEventListener("click", backupNow);
+  $("#btnValidate").addEventListener("click", () => withLoading($("#btnValidate"), validate));
+  $("#btnBackupNow").addEventListener("click", () => withLoading($("#btnBackupNow"), backupNow));
   $("#btnUndo").addEventListener("click", doUndo);
   $("#btnPerks").addEventListener("click", () => withLoading($("#btnPerks"), () => renderDigest(false)));
   $("#extChangeBtn").addEventListener("click", async () => {
@@ -270,9 +300,10 @@ async function init() {
   // missed external edit turns the next write into a confusing 409.
   setInterval(pollExternalChanges, 5000);
   refreshUndo();
-  $("#btnImport").addEventListener("click", importFromOpenCode);
+  $("#btnImport").addEventListener("click", () => withLoading($("#btnImport"), importFromOpenCode));
   $("#btnDiscover").addEventListener("click", () => withLoading($("#btnDiscover"), openDiscover));
   $("#btnDiag").addEventListener("click", () => withLoading($("#btnDiag"), diagnose));
+  $("#btnEnvAudit").addEventListener("click", () => withLoading($("#btnEnvAudit"), runEnvAudit));
   $("#discoverClose").addEventListener("click", closeDiscover);
   $("#discoverCancel").addEventListener("click", closeDiscover);
   $("#discoverAdd").addEventListener("click", addDiscovered);
@@ -345,7 +376,10 @@ async function init() {
   });
   $("#wiz-envname").addEventListener("input", () => { $("#wiz-envname").dataset.touched = "1"; });
 
-  $$(".filter-chip").forEach((ch) => ch.addEventListener("click", () => {
+  // Scoped to the discover dialog: #wizFreeOnly carries the same class and
+  // used to get this handler too, so a click in the wizard silently toggled a
+  // filter of a dialog the user was not looking at.
+  $$("#discoverBackdrop .filter-chip").forEach((ch) => ch.addEventListener("click", () => {
     const f = ch.dataset.f;
     if (state.discoverFilters.has(f)) state.discoverFilters.delete(f); else state.discoverFilters.add(f);
     ch.classList.toggle("on", state.discoverFilters.has(f));
@@ -381,8 +415,20 @@ async function init() {
     e.preventDefault();
     e.returnValue = "";
   });
-  for (const sel of ["#f-name", "#f-baseurl", "#f-apikey", "#f-envname", "#f-format"]) {
+  // #f-pool counts too: twenty pasted keys lost to a reload with no warning
+  // is exactly what the dirty guard exists for.
+  for (const sel of ["#f-name", "#f-baseurl", "#f-apikey", "#f-envname", "#f-format", "#f-pool"]) {
     $(sel).addEventListener("input", () => { state.dirty = true; });
+  }
+  // A verdict earned with one key says nothing about another: editing the
+  // endpoint or the key invalidates every probe mark the list is showing.
+  for (const sel of ["#f-baseurl", "#f-apikey"]) {
+    $(sel).addEventListener("input", () => {
+      if (state.probeResults && Object.keys(state.probeResults).length) {
+        state.probeResults = {};
+        renderModelList();
+      }
+    });
   }
 
   restoreDefaults();
@@ -415,7 +461,7 @@ function renderKeyHint() {
       return;
     }
     el.className = "fmt-note";
-    el.textContent = `В конфиг запишется {env:${name}}. Установи переменную один раз: setx ${name} "твой-ключ" — затем перезапусти терминал и opencode.`;
+    el.textContent = `В конфиг запишется {env:${name}}; значение берётся из переменной окружения.`;
   } else {
     el.className = "fmt-note warn";
     el.textContent = "Ключ будет записан в opencode-конфиг открытым текстом. Включи $ENV, чтобы этого избежать.";
@@ -476,10 +522,11 @@ function renderProviderList() {
       ? (q ? `${shown.length}/${state.providers.length}` : String(state.providers.length))
       : "";
   }
-  // The search box is useless with nothing to search and misleading when a
-  // filter is the reason the list looks empty.
+  // The search box is useless with nothing to search — but while a filter is
+  // active it is the *only* place that shows why the list is short, so it
+  // stays visible until the filter is cleared.
   const search = $("#providerSearch");
-  if (search) search.hidden = state.providers.length < 6;
+  if (search) search.hidden = state.providers.length < 6 && !state.providerSearch;
 
   if (!state.providers.length) {
     list.innerHTML = `<div class="empty-models">Пока нет сохранённых провайдеров.<br>Начни с «Мастера настройки».</div>`;
@@ -497,14 +544,17 @@ function renderProviderList() {
   // Measured: with every provider imported it took 53px from a 227px row and
   // clipped "GenSparkOSNOVA" to "GenSpar…" while saying nothing at all.
   const mixed = shown.some((p) => p.fromOpenCode) && shown.some((p) => !p.fromOpenCode);
-  list.innerHTML = shown.map((p) => `
-    <div class="provider-row" data-name="${esc(p.name)}" tabindex="0" role="button">
+  list.innerHTML = shown.map((p) => {
+    const active = state.editingKey && state.editingKey === slugifyName(p.name);
+    return `
+    <div class="provider-row${active ? " is-active" : ""}" data-name="${esc(p.name)}" tabindex="0" role="button">
       ${healthDot(p)}
       <span class="nm" title="${esc(p.name)}">${esc(p.name)}</span>
       ${p.fromOpenCode && mixed ? `<span class="badge">opencode</span>` : ""}
       <button class="ren" title="Переименовать ключ провайдера в конфиге" aria-label="Переименовать ${esc(p.name)}">\u270e</button>
       <button class="del" title="Удалить провайдера полностью: из opencode-конфига и из списка" aria-label="Удалить ${esc(p.name)} полностью">\u00d7</button>
-    </div>`).join("");
+    </div>`;
+  }).join("");
   list.querySelectorAll(".provider-row").forEach((row) => {
     const open = () => {
       loadProviderIntoForm(row.dataset.name);
@@ -619,11 +669,17 @@ async function checkEnvVar() {
   if (r.set) {
     // Found only in the registry means already-open terminals will not see it,
     // which is the difference between "works" and "401" for opencode.
-    const inherited = asArray(r.scopes).includes("process");
+    const inherited = typeof r.inherited === "boolean" ? r.inherited : asArray(r.scopes).includes("process");
     el.className = inherited ? "env-state is-set" : "env-state is-warn";
     const where = r.scope === "machine" ? "система" : r.scope === "user" ? "пользователь" : "процесс";
-    el.textContent = `${inherited ? "\u2713" : "\u26a0"} ${name} задана (${r.length} симв., ${where})`;
-    if (r.note) el.title = r.note;
+    // The restart button is always offered: even a durable variable is invisible
+    // to an OpenCode service that was already running when it was written.
+    el.innerHTML = `${inherited ? "\u2713" : "\u26a0"} ${esc(name)} задана (${r.length} симв., ${esc(where)})
+      <button class="btn btn-mini" id="restartOpenCodeBtn" type="button"
+        title="${esc(r.restartHint || "")}">\u21bb перезапустить OpenCode</button>`;
+    el.title = [r.note, r.restartHint].filter(Boolean).join("\n") || "";
+    const b = $("#restartOpenCodeBtn");
+    if (b) b.onclick = () => restartOpenCode(b);
   } else {
     el.className = "env-state is-unset";
     el.innerHTML = `\u26a0 ${esc(name)} не задана \u2014 иначе opencode отправит пустой ключ и получит 401.
@@ -652,6 +708,28 @@ async function envVarStatus(name) {
   return r;
 }
 
+/**
+ * Restarts the OpenCode background service.
+ *
+ * `setx` writes the registry, not a running process: an OpenCode service that
+ * was already up keeps the environment it was born with, so a freshly written
+ * key stays invisible no matter how many times the window is reopened. That is
+ * the actual cause of "Provide your ... API key" right after a successful save.
+ */
+async function restartOpenCode(btn) {
+  const label = "\u21bb перезапустить OpenCode";
+  if (btn) { btn.disabled = true; btn.textContent = "перезапускаю\u2026"; }
+  const r = await apiSafe("/api/opencode-service", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "restart" }),
+  });
+  if (btn) { btn.disabled = false; btn.textContent = label; }
+  if (r && r.ok) {
+    return toast("Служба OpenCode перезапущена — новые переменные окружения теперь видны.", "ok");
+  }
+  toast(`Не удалось перезапустить: ${(r && (r.error || r.hint)) || "ошибка"}`, "err");
+}
+
 // Which of this provider's models becomes `model` in the config. Previously the
 // server just took the first one, so there was no way to choose.
 function renderDefaultModelPicker() {
@@ -670,10 +748,14 @@ async function refreshConfigState() {
   // Scoped to the viewed file, and never throws: this is awaited from a dozen
   // click handlers without their own try/catch, and a dropped connection must
   // not turn into an unhandled rejection in all of them.
+  const wantedPath = state.configPath || "";
   let d = null;
   try {
-    d = await api("/api/state" + "?configPath=" + encodeURIComponent(state.configPath || ""));
+    d = await api("/api/state" + "?configPath=" + encodeURIComponent(wantedPath));
   } catch { return null; }
+  // A slow answer for the file the user has since switched away from must not
+  // overwrite the new file's hash — the next write would die with a false 409.
+  if ((state.configPath || "") !== wantedPath) return null;
   if (d && d.opencode) {
     state.configHash = d.opencode.hash || "";
     state.configHasComments = !!d.opencode.comments;
@@ -697,7 +779,7 @@ async function refreshProviders() {
     d = await api("/api/state" + "?configPath=" + encodeURIComponent(state.configPath || ""));
   } catch { return; }
   if (d) {
-    state.providers = asArray(d.providers);
+    state.providers = mergeProviderLists(d.providers, d.opencode && d.opencode.providers);
     renderProviderList();
   }
 }
@@ -733,9 +815,12 @@ async function doUndo() {
     if (typeof r.hash === "string") state.configHash = r.hash;
     // Undoing a creation removes the file; the chip has to say so.
     await refreshConfigState();
+    await refreshProviders();
     refreshBackups();
-    toast(r.removed ? `Файл удалён (откат: ${r.label || ""})` : `Откачено: ${r.label || ""}. Перезапусти opencode.`, "ok");
+    // Diagnose first: it writes its own status line, and doing that after the
+    // success message made "Отменено: …" disappear instantly.
     await diagnose();
+    toast(r.removed ? `Файл удалён (откат: ${r.label || ""})` : `Откачено: ${r.label || ""}. Перезапусти opencode.`, "ok");
   } finally {
     if (b) setBtnLoading(b, false);
   }
@@ -784,7 +869,9 @@ async function pollExternalChanges() {
 // after a save, and not never just because the models array is empty.
 function formSnapshot() {
   const v = (sel) => { const el = $(sel); return el ? el.value : ""; };
-  return JSON.stringify({ n: v("#f-name"), u: v("#f-baseurl"), m: state.models || [] });
+  // The pool is part of the form's unsaved content: twenty pasted keys lost
+  // to a reload without a warning is exactly what this guard exists for.
+  return JSON.stringify({ n: v("#f-name"), u: v("#f-baseurl"), m: state.models || [], p: v("#f-pool") });
 }
 
 function isFormDirty() {
@@ -905,8 +992,7 @@ async function deleteEverywhere(name) {
       body: JSON.stringify({ name }),
     });
     if (!d || !d.ok) return toast((d && d.error) || "Не удалось убрать из списка", "err");
-    state.providers = asArray(d.providers);
-    renderProviderList();
+    await refreshProviders();
     return;
   }
   state.configHash = r.hash || "";
@@ -934,10 +1020,9 @@ async function deleteEverywhere(name) {
         if (res.conflict) await refreshConfigState();
         return toast(res.error || "Не удалось удалить", "err");
       }
-      state.providers = asArray(res.providers);
-      renderProviderList();
       renderBackups(asArray(res.backups));
       await refreshConfigState();
+      await refreshProviders();
       refreshUndo();
       toast(`Провайдер «${key}» удалён полностью. Перезапусти opencode.`, "ok");
     },
@@ -952,6 +1037,9 @@ function loadProviderIntoForm(name) {
   // display name must move that block, not leave an orphan behind.
   state.editingKey = slugifyName(p.name);
   state.dirty = false;
+  // Probe verdicts belong to the provider that produced them: without a reset
+  // they bleed onto same-named models of the provider being loaded.
+  state.probeResults = {};
   $("#f-name").value = p.name || "";
   $("#f-baseurl").value = p.baseURL || "";
   // Keys are never persisted server-side, so this is empty for stored providers.
@@ -973,6 +1061,9 @@ function loadProviderIntoForm(name) {
   // Snapshot after the fields are filled: this is the new clean point.
   state.savedSnapshot = formSnapshot();
   renderKeyPreview();
+  // The sidebar marks the provider being edited, so the form and the selected
+  // row read as one object instead of two unrelated panels.
+  renderProviderList();
 }
 
 /**
@@ -1122,9 +1213,19 @@ function poolEnvBase(provider) {
 function renderPoolCount() {
   const el = $("#poolCount");
   if (!el) return;
+  const max = state.poolMax || 20;
+  const lines = String($("#f-pool").value || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const unique = new Set(lines);
   const n = poolKeys();
-  const rawLines = String($("#f-pool").value || "").split(/\r?\n/).filter((l) => l.trim()).length;
-  el.textContent = n.length ? `${plural(n.length, "Ключ", "Ключа", "Ключей")}: ${n.length}${rawLines > n.length ? ` (дубли убраны: ${rawLines - n.length})` : ""}` : "";
+  if (!n.length) { el.textContent = ""; return; }
+  const parts = [`${plural(n.length, "Ключ", "Ключа", "Ключей")}: ${n.length}`];
+  const dupes = lines.length - unique.size;
+  // Duplicates and over-limit keys are not the same thing: calling both
+  // "дубли" told the user 25 keys were written when only 20 were.
+  if (dupes > 0) parts.push(`дубли убраны: ${dupes}`);
+  const over = unique.size - n.length;
+  if (over > 0) parts.push(`сверх лимита ${max} отброшено: ${over}`);
+  el.textContent = parts.join("; ");
 }
 
 // Маркер построчного вердикта — те же пять состояний, что у моделей.
@@ -1212,7 +1313,9 @@ async function checkPool() {
     }),
   });
   if (!r || !r.ok) {
-    box.innerHTML = `<div class="muted">✕ ${(r && r.error) || "не удалось проверить пул"}</div>`;
+    // esc() here too: an error string can carry a fragment of the provider's
+    // own response, and raw into innerHTML is how that becomes an injection.
+    box.innerHTML = `<div class="muted">✕ ${esc((r && r.error) || "не удалось проверить пул")}</div>`;
     return toast((r && r.error) || "Не удалось проверить пул", "err");
   }
   renderPoolResults(r.results);
@@ -1229,7 +1332,10 @@ async function savePoolEnv() {
   try {
     const r = await apiSafe("/api/setenv-pool", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ base, keys }),
+      // The field name is envBase: the server never read `base`, and the
+      // fallback silently wrote the keys to PROVIDER_API_KEY regardless of
+      // what the form actually showed.
+      body: JSON.stringify({ envBase: base, keys }),
     });
     if (!r || !r.ok) return toast((r && r.error) || "Не удалось записать пул", "err");
     const bad = (r.results || []).filter((x) => !x.ok);
@@ -1294,10 +1400,7 @@ async function poolApplyNow(provider) {
   }
   if (!res.ok) return toast(res.error || "Не удалось применить пул", "err");
   if (res.backupFile) setBackupInfo(`↻ Автобэкап: ${res.backupFile}`);
-  if (Array.isArray(res.providers)) {
-    state.providers = res.providers;
-    renderProviderList();
-  }
+  if (Array.isArray(res.providers)) await refreshProviders();
   if (res.storeSynced === false) {
     toast("Пул записан в конфиг, но sidebar-список не сохранился — проверь диск.", "err");
   }
@@ -1315,12 +1418,13 @@ async function poolApplyNow(provider) {
   resultsEl.innerHTML = `<div class="result-card"><h3>opencode · пул ключей</h3>`
     + `<div class="ok-line">✓ Применено: ${(res.shardKeys || []).length} ${plural((res.shardKeys || []).length, "шард", "шарда", "шардов")}. Модель по умолчанию: ${esc(res.defaultModel || "—")}</div>`
     + shardLines
-    + (res.pluginFile ? `<div class="ok-line" style="color:var(--muted)">Плагин ротации: ${esc(res.pluginFile)} — перезапусти opencode</div>`
+    + (res.pluginFile ? `<div class="ok-line" style="color:var(--muted)">Плагин ротации: ${esc(res.pluginFile)}</div>`
       : `<div class="err-line">✕ Плагин не записан: ${esc(res.pluginError || "ошибка")}</div>`)
+    + (res.pluginWarning ? `<div class="err-line">⚠ ${esc(res.pluginWarning)}</div>` : "")
     + `<div class="ok-line" style="color:var(--muted)">config: ${esc(res.path || "")}</div>`
     + ((res.missingEnv && res.missingEnv.length)
-      ? `<div class="err-line">✕ Нет значений: ${esc(res.missingEnv.join(", "))} — нажми «Записать пул в env», затем перезапусти терминал и opencode.</div>`
-      : `<div class="ok-line" style="color:var(--muted)">Все переменные пула заданы.</div>`)
+      ? `<div class="err-line">✕ Нет значений: ${esc(res.missingEnv.join(", "))} — нажми «Записать пул в env», затем перезапусти службу OpenCode (кнопка «↻» рядом с переменной).</div>`
+      : `<div class="ok-line" style="color:var(--muted)">Все переменные пула заданы. Если ключи писали только что — перезапусти службу OpenCode кнопкой «↻» или приложение целиком.</div>`)
     + `</div>`;
   if (!(await offerPoolEnvSave(res))) toast("Пул применён. Не забудь записать ключи в env.", "ok");
 }
@@ -1474,7 +1578,7 @@ $("#m-save").addEventListener("click", () => {
 function updateFormatNote() {
   const notes = {
     "anthropic": "Anthropic-совместимый. Kilo/Cline/Roo: \u00abAnthropic\u00bb.",
-    "openai-chat": "OpenAI-совместимый. Kilo/Cline/Roo: \u00abOpenAI Compatible\u00bb. Подходит для DeepSeek, Z.ai, BAI, локальных.",
+    "openai-chat": "OpenAI-совместимый: Kilo/Cline/Roo → \u00abOpenAI Compatible\u00bb.",
     "openai-responses": "OpenAI Responses. Kilo/Cline: \u00abOpenAI / Responses\u00bb.",
   };
   $("#f-format-note").textContent = notes[$("#f-format").value] || "";
@@ -1530,6 +1634,10 @@ function requestBody(provider) {
 // Renders the unified diff the server computed. Nothing is written until the
 // user confirms, so "Применить" stops being an act of faith.
 function openDiff({ title, meta, diff, hint, onConfirm, confirmLabel }) {
+  // preview()/poolPreview() put a sticky "Считаю изменения…" on screen. It has
+  // no timeout and sat on top of the diff footer, hiding the confirm button on
+  // narrow screens. The diff itself is the answer, so drop the progress line.
+  setStatus("", "");
   const view = $("#diffView");
   $("#diffTitle").textContent = title;
   $("#diffMeta").innerHTML = meta;
@@ -1641,8 +1749,15 @@ async function confirmEnvKey(provider) {
   const name = provider.envVarName;
   const info = await envVarStatus(name);
 
-  // Nothing to warn about: the variable exists and this process inherited it.
-  if (info && info.set && asArray(info.scopes).includes("process")) return true;
+  // The variable exists: the config write always proceeds. An existing
+  // variable must never block adding the provider to opencode — the worst
+  // case (set in the registry but not inherited here) is a hint, not a gate.
+  if (info && info.set) {
+    if (!asArray(info.scopes).includes("process")) {
+      toast(`Переменная ${name} задана, но её увидят только новые процессы — перезапусти службу OpenCode (кнопка «↻» рядом).`, "ok");
+    }
+    return true;
+  }
 
   const lines = [];
   if (provider.apiKey) {
@@ -1660,9 +1775,6 @@ async function confirmEnvKey(provider) {
       `    setx ${name} "твой-ключ"`,
       `затем перезапусти терминал и opencode.`,
     );
-  } else if (info && info.set) {
-    // Set in the registry but not inherited here.
-    lines.push(``, info.note || `Переменная ${name} задана, но её увидят только новые терминалы.`);
   } else {
     lines.push(``, `Проверить переменную ${name} не удалось — убедись, что она задана.`);
   }
@@ -1692,10 +1804,7 @@ async function applyNow(provider) {
   // while it is still on screen, instead of letting it evaporate.
   await offerEnvSave(provider);
   if (res.backupFile) setBackupInfo(`\u21bb Автобэкап: ${res.backupFile}`);
-  if (Array.isArray(res.providers)) {
-    state.providers = res.providers;
-    renderProviderList();
-  }
+  if (Array.isArray(res.providers)) await refreshProviders();
   if (res.storeSynced === false) {
     toast("В конфиг записано, но sidebar-список не сохранился — проверь диск.", "err");
   }
@@ -1714,6 +1823,7 @@ async function applyNow(provider) {
   }
   refreshBackups();
   refreshUndo();
+  renderProviderList();
 
   const resultsEl = $("#results");
   resultsEl.hidden = false;
@@ -1782,6 +1892,10 @@ function setStatus(msg, kind) {
   const el = $("#status");
   el.className = "status " + (kind || "");
   el.textContent = msg;
+  // .status is visibility:hidden until toast-show is present — it used to be
+  // added only by toast(), so every sticky status ("Считаю изменения…", and
+  // above all "Сервер недоступен") was written to an element nobody could see.
+  el.classList.toggle("toast-show", Boolean(msg));
 }
 
 async function copyJson() {
@@ -1838,7 +1952,12 @@ async function testConnection() {
     body: JSON.stringify({ provider }),
   });
   const t = r.result || {};
-  const msg = `${t.ok ? "\u2713" : "\u2715"} ${t.message || r.error || ""}`;
+  // testConnection() already prefixes its own verdict. Prepending another one
+  // produced a literal "✓ ✓ Ответ 200" for a healthy endpoint.
+  const body = String(t.message || r.error || "");
+  const msg = /^[\u2713\u2715]/.test(body)
+    ? body
+    : `${t.ok ? "\u2713" : "\u2715"} ${body}`;
   toast(msg, t.ok ? "ok" : "err");
   if (t.url) $("#status").title = `Ответ ${t.status || ""} от ${t.url}`;
 }
@@ -1968,6 +2087,7 @@ function renderBackups(backups) {
     // A restore rewrites the file, so the hash this page holds is stale and the
     // next write would be refused as a false conflict.
     await refreshConfigState();
+    await refreshProviders();
     await refreshBackups();
     refreshUndo();
     $("#results").hidden = true;
@@ -1983,8 +2103,7 @@ async function importFromOpenCode() {
   if (!r.ok) return toast(r.error || "Импорт не удался", "err");
   const imported = asArray(r.imported);
   toast(imported.length ? `Импортировано: ${imported.join(", ")}` : "Новых провайдеров из opencode конфига нет", "ok");
-  state.providers = asArray(r.providers);
-  renderProviderList();
+  await refreshProviders();
 }
 
 async function openDiscover() {
@@ -2268,6 +2387,9 @@ function openWizard() {
   $("#wiz-envname").value = "";
   $("#wiz-env").checked = true;
   $("#wiz-search").value = "";
+  // The pool holds secrets from the *previous* run: leaving it filled would
+  // silently shard provider B with provider A's keys on finish.
+  $("#wiz-pool").value = "";
   $("#wizEnvState").hidden = true;
   // A filter from the previous run would greet the user with a short list and
   // no visible reason why.
@@ -2315,10 +2437,13 @@ function renderPresetGrid() {
   if (!grid) return;
   const chosen = state.wizardPreset;
   const q = (state.presetSearch || "").trim().toLowerCase();
+  // `wizard: false` presets remain in the API for existing configs, perks and
+  // discovery, but a beginner should not have to triage them on step one.
+  const templates = state.presets.filter((p) => p.wizard !== false);
   const shown = q
-    ? state.presets.filter((p) => [p.label, p.hint, p.baseURL, p.id]
+    ? templates.filter((p) => [p.label, p.hint, p.baseURL, p.id]
         .some((s) => String(s || "").toLowerCase().includes(q)))
-    : state.presets;
+    : templates;
   if (!shown.length) {
     grid.innerHTML = `<div class="discover-empty">Ничего не найдено по «${esc(state.presetSearch.trim())}».</div>`;
     return;
@@ -2364,9 +2489,10 @@ function showWizardStep(n) {
     li.classList.toggle("on", i === step);
     li.classList.toggle("done", i < step);
   });
+  // Step 0 advances by clicking a preset, so its footer has no live controls
+  // and would only add an empty bar under the grid.
+  $("#wizFoot").hidden = step === 0;
   $("#wizBack").disabled = step === 0;
-  // Step 0 advances by clicking a preset, so a "Далее" button there would be a
-  // dead control.
   $("#wizNext").hidden = step === 0;
   $("#wizNext").textContent = step === WIZ_LAST ? "Показать diff и записать" : "Далее";
 
@@ -2380,7 +2506,9 @@ function showWizardStep(n) {
   }
   if (step === 2) loadWizardModels();
   if (step === 3) renderWizardSummary();
-  $("#wizHint").textContent = step === WIZ_LAST ? "Следующий шаг покажет точный diff файла." : "";
+  $("#wizHint").textContent = step === 1
+    ? "Проверь название и Base URL — ключ сохранится в переменной окружения."
+    : step === WIZ_LAST ? "Следующий шаг покажет точный diff файла." : "";
 }
 
 function syncWizEnvField() {
@@ -2423,8 +2551,11 @@ function syncWizEnvField() {
 async function offerEnvSave(provider) {
   if (!provider.useEnvVar || !provider.apiKey) return;
   const st = await envVarStatus(provider.envVarName);
-  if (st && st.set) return;
-  if (!confirm(`Сохранить введённый ключ в переменную ${provider.envVarName}, чтобы конфиг сразу заработал?\n(запишется через setx для текущего пользователя)`)) return;
+  // The variable already exists: the typed key is NOT silently dropped anymore.
+  // Offer to overwrite so a rotated key actually lands in the OS.
+  if (st && st.set) {
+    if (!confirm(`Переменная ${provider.envVarName} уже задана. Перезаписать её введённым ключом?\n(иначе в конфиге останется ссылка на старое значение)`)) return;
+  } else if (!confirm(`Сохранить введённый ключ в переменную ${provider.envVarName}, чтобы конфиг сразу заработал?\n(запишется через setx для текущего пользователя)`)) return;
   const r = await apiSafe("/api/setenv", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: provider.envVarName, value: provider.apiKey }),
@@ -2435,7 +2566,26 @@ async function offerEnvSave(provider) {
   }
   $("#f-apikey").value = "";
   renderKeyHint();
-  toast(`Ключ сохранён в ${provider.envVarName}. Запускай opencode из нового окна терминала.`, "ok");
+  // The service, not the window: offer the restart right here, since this is
+  // the exact moment the key becomes invisible to an already-running OpenCode.
+  const go = confirm(
+    `Ключ сохранён в ${provider.envVarName}.\n\n` +
+    `OpenCode запущен фоновой службой и не видит переменные, записанные после её старта.\n` +
+    `Перезапустить службу OpenCode сейчас?`,
+  );
+  if (go) {
+    const restarted = await apiSafe("/api/opencode-service", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "restart" }),
+    });
+    if (restarted && restarted.ok) {
+      toast(`Ключ сохранён в ${provider.envVarName}, служба OpenCode перезапущена.`, "ok");
+    } else {
+      toast(`Ключ сохранён, но служба не перезапустилась. Перезапусти приложение OpenCode или компьютер.`, "err");
+    }
+    return;
+  }
+  toast(`Ключ сохранён в ${provider.envVarName}. Перезапусти службу OpenCode (кнопка «↻») или приложение целиком.`, "ok");
 }
 
 /**
@@ -2530,17 +2680,24 @@ function wizardProvider() {
   };
 }
 
+// Two runs can be in flight at once (step 2 auto-loads, then "Обновить" is
+// clicked): the last *requested* answer must win, not the last to arrive —
+// a slow reply for an old key would otherwise overwrite the fresh list.
+let wizardModelsSeq = 0;
+
 async function loadWizardModels() {
+  const seq = ++wizardModelsSeq;
   const st = $("#wizModelStatus");
   const list = $("#wizModelList");
   st.className = "discover-status";
-  st.textContent = "Запрашиваю список моделей\u2026";
-  list.innerHTML = `<div class="discover-empty">Загрузка\u2026</div>`;
+  st.textContent = "Запрашиваю список моделей…";
+  list.innerHTML = `<div class="discover-empty">Загрузка…</div>`;
 
   const r = await apiSafe("/api/discover", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ provider: wizardProvider() }),
   });
+  if (seq !== wizardModelsSeq) return;
   const res = r.result || {};
   if (!res.ok) {
     st.className = "discover-status err";
@@ -2659,6 +2816,9 @@ function finishWizard() {
     .map((id) => modelFromDiscovered(state.wizModels.find((m) => m.id === id) || { id }));
   // A wizard run creates a provider, so nothing is being renamed.
   state.editingKey = "";
+  // Same reset as loading a provider: old probe marks would otherwise paint
+  // onto the freshly picked models.
+  state.probeResults = {};
   $("#f-name").value = p.name;
   $("#f-baseurl").value = p.baseURL;
   $("#f-apikey").value = p.apiKey;
@@ -2911,6 +3071,88 @@ async function diagnose() {
 }
 
 /**
+ * Env-аудит: какие переменные конфиг ссылает и заданы ли они, плюс сироты —
+ * ключевые переменные в окружении, на которые ничто не ссылается.
+ * С var set=true запись провайдера идёт всегда; эта панель — проверка, а не
+ * gate. Удаление сироты идёт через confirm и серверный guard, который
+ * откажется удалять переменную, используемую в конфиге.
+ */
+async function runEnvAudit() {
+  setStatus("Проверяю переменные…", "");
+  const r = await apiSafe("/api/env-audit", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ configPath: state.configPath }),
+  });
+  setStatus("", "");
+  if (!r || !r.ok) return toast((r && r.error) || "Аудит не удался", "err");
+  const vars = asArray(r.vars);
+  const orphaned = asArray(r.orphaned);
+  const missing = asArray(r.missing);
+  const el = $("#issues");
+  el.hidden = false;
+  syncSidePlaceholder();
+  let html = `<div class="result-card"><h3>Env-аудит</h3>`;
+  html += `<div class="ok-line" style="color:var(--muted)">config: ${esc(r.path || "")}</div>`;
+  if (!vars.length) {
+    html += `<div class="ok-line" style="color:var(--muted)">— в конфиге нет ссылок на переменные —</div>`;
+  } else if (!missing.length) {
+    html += `<div class="ok-line">✓ Все ${vars.length} ${plural(vars.length, "переменная", "переменные", "переменных")} заданы — провайдеры добавятся в opencode</div>`;
+    // Заданная переменная — ещё не видимая: фоновая служба OpenCode держит
+    // окружение, с которым стартовала. Одна строка здесь дешевле, чем ещё один
+    // круг «ключ есть, а провайдер отвечает 401».
+    html += `<div class="diag-sub muted">Служба OpenCode подхватывает новые переменные только после перезапуска: кнопка «↻» рядом с именем переменной, либо перезапуск приложения.</div>`;
+  } else {
+    html += `<div class="err-line">✕ Не заданы: ${esc(missing.join(", "))} — opencode подставит пустую строку (401)</div>`;
+  }
+  html += `<div class="diag-sect">Переменные в конфиге (${vars.length})</div>`;
+  for (const v of vars) {
+    const where = v.scope === "machine" ? "система" : v.scope === "user" ? "пользователь" : "процесс";
+    html += `<div class="diag-row"><span class="diag-name">${esc(v.name)}</span>`
+      + (v.set
+        ? `<span class="diag-meta">✓ ${v.length} симв., ${where}</span>`
+        : `<span class="diag-meta">✕ не задана</span>`)
+      + `</div>`;
+  }
+  html += `<div class="diag-sect">Сироты — заданы, но ничто не ссылается (${orphaned.length})</div>`;
+  if (!orphaned.length) {
+    html += `<div class="ok-line">✓ Сирот нет — чистить нечего</div>`;
+  } else {
+    html += `<div class="diag-sub muted">Удаление спрашивает подтверждение; переменную из конфига сервер удалять откажется.</div>`;
+    for (const name of orphaned) {
+      html += `<div class="diag-row"><span class="diag-name">${esc(name)}</span>`
+        + `<span class="diag-fix"><button class="btn btn-mini" data-env-remove="${esc(name)}" type="button">Удалить</button></span></div>`;
+    }
+  }
+  html += `<div class="diag-sect">Действия</div>
+    <div class="diag-fix"><button class="btn btn-mini" id="envAuditRerun" type="button">Обновить</button></div>`;
+  html += `</div>`;
+  el.innerHTML = html;
+  const rerun = $("#envAuditRerun");
+  if (rerun) rerun.onclick = () => runEnvAudit();
+  el.querySelectorAll("[data-env-remove]").forEach((b) => {
+    b.onclick = () => removeOrphanEnv(b.dataset.envRemove, b);
+  });
+}
+
+async function removeOrphanEnv(name, btn) {
+  const clean = String(name || "").trim();
+  if (!clean) return;
+  if (!confirm(`Удалить переменную ${clean} из окружения пользователя?`)) return;
+  if (btn) setBtnLoading(btn, true);
+  try {
+    const r = await apiSafe("/api/env-remove", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: clean, configPath: state.configPath }),
+    });
+    if (!r || !r.ok) return toast((r && r.error) || "Не удалось удалить", "err");
+    toast(`Переменная ${clean} удалена`, "ok");
+    await runEnvAudit();
+  } finally {
+    if (btn) setBtnLoading(btn, false);
+  }
+}
+
+/**
  * Автоисправление конфига: preview -> diff -> подтверждение -> запись.
  * Чинит только однозначное (мусорные поля, ключ не в том месте, $VAR,
  * неполные limit/cost, висячий default). Переменная окружения и пустой список
@@ -2961,6 +3203,15 @@ async function doAutoFix() {
       refreshBackups();
       refreshUndo();
       toast(`Исправлено: ${(res.fixed || []).length}`, "ok");
+      // Where a plaintext key was moved into an env var, say whether the value
+      // actually landed there — a silent miss here is a 401 in opencode.
+      const envWrites = asArray(res.envWrites);
+      if (envWrites.length && out) {
+        out.innerHTML = envWrites.map((w) => w.ok
+          ? `<div class="ok-line">✓ ${esc(w.envVar)} записана (${w.scope === "user" ? "пользователь" : esc(w.scope || "")}) — открой opencode из нового окна терминала</div>`
+          : `<div class="diag-sub">⚠ ${esc(w.envVar)}: ${esc(w.error || "запиши вручную")}${w.command ? ` — <code>${esc(w.command)}</code>` : ""}</div>`
+        ).join("");
+      }
       await diagnose();
     },
   });
@@ -3181,6 +3432,14 @@ async function renderDigest(force) {
   paintDigest();
 }
 
+// Only http(s) links are rendered: the digest comes from an external feed,
+// and a "javascript:…" source would otherwise become a clickable script in
+// our own DOM. esc() protects the attribute, not the scheme.
+function digestSafeUrl(u) {
+  const s = String(u || "").trim();
+  return /^https?:\/\//i.test(s) ? s : "";
+}
+
 function paintDigest() {
   const r = state.lastDigest;
   if (!r) return;
@@ -3226,7 +3485,7 @@ function paintDigest() {
       + (p.claim ? `<div class="diag-sub">Как забрать: ${esc(p.claim)}</div>` : "")
       + `<div class="diag-sub">`
       + (preset ? `<button class="btn btn-mini" data-digest-preset="${esc(preset.id)}" type="button">Настроить: ${esc(preset.label)}</button> ` : "")
-      + (p.source ? `<a class="digest-link" href="${esc(p.source)}" target="_blank" rel="noopener">источник ↗</a>` : "")
+      + (digestSafeUrl(p.source) ? `<a class="digest-link" href="${esc(digestSafeUrl(p.source))}" target="_blank" rel="noopener">источник ↗</a>` : "")
       + `</div>`;
   }
   if (!visible.length) html += `<div class="ok-line" style="color:var(--muted)">— с таким фильтром ничего нет —</div>`;
@@ -3237,7 +3496,7 @@ function paintDigest() {
   for (const n of news) {
     html += `<div class="diag-row"><span class="diag-name">${esc(n.title || n.id || "?")}</span></div>`
       + `<div class="diag-sub">${esc([n.provider, n.product].filter(Boolean).join(" · "))}`
-      + (n.source ? ` \u00b7 <a class="digest-link" href="${esc(n.source)}" target="_blank" rel="noopener">источник \u2197</a>` : "")
+      + (digestSafeUrl(n.source) ? ` · <a class="digest-link" href="${esc(digestSafeUrl(n.source))}" target="_blank" rel="noopener">источник ↗</a>` : "")
       + `</div>`;
   }
   html += `</div>`;
