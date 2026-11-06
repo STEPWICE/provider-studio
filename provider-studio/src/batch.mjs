@@ -32,13 +32,18 @@ export const RETRY_DELAY_MS = 800;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** A 429, or a message that plainly says the same thing. */
+/** A 429, or a failure the prober classified as throttling. */
 export function isRateLimited(result) {
   if (!result || typeof result !== "object") return false;
   if (result.status === 429) return true;
-  if (result.fault === "rate") return true;
+  // rescue.mjs tags throttling as fault "quota" — including gateways that
+  // throttle with a bare 403/400 instead of 429. The tag is the stable
+  // signal; the message text is localised and provider-specific, so matching
+  // it here would drift the moment rescue rephrases (it already did once:
+  // "Слишком частые запросы" never matched "слишком часто").
+  if (result.fault === "quota" || result.fault === "rate") return true;
   const m = String(result.message || "");
-  return /\b429\b|rate.?limit|too many requests|слишком часто|превышен лимит/i.test(m);
+  return /\b429\b|rate.?limit|too many requests|слишком част|превышен лимит/i.test(m);
 }
 
 /**
@@ -169,7 +174,12 @@ export async function runBatch(ids, probe, opts = {}) {
       }
 
       results.push({ ...r, id, ok: !!r.ok, rateLimited: limited });
-      if (onProgress) onProgress({ ...state(), last: { id, ok: !!r.ok, rateLimited: limited } });
+      // A throwing progress callback must not kill the run: the probes already
+      // cost real money, and their results are more valuable than a render.
+      if (onProgress) {
+        try { onProgress({ ...state(), last: { id, ok: !!r.ok, rateLimited: limited } }); }
+        catch { /* a UI callback is not worth aborting paid probes for */ }
+      }
       if (stopped) return;
       if (gap) await wait(gap);
     }

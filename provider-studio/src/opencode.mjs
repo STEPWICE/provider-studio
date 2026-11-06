@@ -19,12 +19,14 @@ import { existsSync, readFileSync } from "node:fs";
 import {
   parseJsonc, hasComments, applyChangesVerified, getPath,
 } from "./jsonc-edit.mjs";
+import { shadowLegacyProviders, applySchemaChanges } from "./schema.mjs";
 import {
   resolveOpencodeConfigPath, listOpencodeConfigs, defaultOpencodeConfigPath,
   fileStamp, sha256, writeFileAtomic,
 } from "./paths.mjs";
 import {
   slugify, buildOpencodeProvider, buildProviderChanges, buildRemovals,
+  resolveProviderKey,
   FORMATS, decodeApiKey, detectApiFormat, isCustomProviderBlock, looksLikePackage,
   modelEntryToForm,
 } from "./formats.mjs";
@@ -67,7 +69,10 @@ export function readConfigAtPath(p) {
   if (!parsed.value || typeof parsed.value !== "object" || Array.isArray(parsed.value)) {
     return { ...base, config: null, error: "корень конфига должен быть объектом" };
   }
-  return { ...base, config: parsed.value };
+  // A V2 document keeps its providers under `providers`. Everything below reads
+  // `config.provider`; the non-enumerable view keeps those readers working
+  // without duplicating the block in the parsed object.
+  return { ...base, config: shadowLegacyProviders(parsed.value) };
 }
 
 export function readConfig(configPath) {
@@ -143,7 +148,7 @@ export function planProviderChange(provider, opts = {}) {
   const schemaChange = withSchema(loaded.text, loaded.config);
   if (schemaChange) changes.unshift(schemaChange);
 
-  const applied = applyChangesVerified(loaded.text, changes);
+  const applied = applySchemaChanges(loaded.text, loaded.config, changes);
   if (!applied.ok) return { ok: false, error: applied.error, configPath: loaded.path };
 
   return {
@@ -151,10 +156,13 @@ export function planProviderChange(provider, opts = {}) {
     configPath: loaded.path,
     before: loaded.text,
     after: applied.text,
-    changes,
+    changes: applied.changes,
     providerKey: built.providerKey,
     previousKey: built.previousKey,
     defaultModel: built.defaultModel,
+    // The block was listed in `disabled_providers` and the plan removes that
+    // entry: surfaced so the UI can say the provider was re-enabled.
+    reenabled: built.reenabled === true,
     created: loaded.created,
     hash: loaded.created ? "" : loaded.current.hash,
     // The patcher preserves comments, so this is informational only now.
@@ -181,7 +189,7 @@ export function planProvidersRemoval(keys, opts = {}) {
     return { ok: false, error: built.error, configPath: loaded.path, notFound: built.notFound === true };
   }
 
-  const applied = applyChangesVerified(loaded.text, built.changes);
+  const applied = applySchemaChanges(loaded.text, loaded.config, built.changes);
   if (!applied.ok) return { ok: false, error: applied.error, configPath: loaded.path };
 
   return {
@@ -189,10 +197,11 @@ export function planProvidersRemoval(keys, opts = {}) {
     configPath: loaded.path,
     before: loaded.text,
     after: applied.text,
-    changes: built.changes,
+    changes: applied.changes,
     providerKeys: built.providerKeys,
     missing: built.missing,
     orphaned: built.orphaned,
+    envOrphans: built.envOrphans || [],
     pluginEntry: built.pluginEntry,
     hash: loaded.current.hash,
   };
@@ -242,7 +251,7 @@ export function planDefaultModelChange(modelId, opts = {}) {
   const schemaChange = withSchema(loaded.text, loaded.config);
   if (schemaChange) changes.unshift(schemaChange);
 
-  const applied = applyChangesVerified(loaded.text, changes);
+  const applied = applySchemaChanges(loaded.text, loaded.config, changes);
   if (!applied.ok) return { ok: false, error: applied.error, configPath: loaded.path };
 
   return {
@@ -250,7 +259,7 @@ export function planDefaultModelChange(modelId, opts = {}) {
     configPath: loaded.path,
     before: loaded.text,
     after: applied.text,
-    changes,
+    changes: applied.changes,
     modelId: target,
     previousModel: previous,
     providerKey,
@@ -318,6 +327,7 @@ export function commitPlan(plan, { expectedHash, backup } = {}) {
     backupFile,
     hash: sha256(plan.after),
     orphaned: plan.orphaned || [],
+    envOrphans: plan.envOrphans || [],
   };
 }
 
@@ -358,7 +368,7 @@ export function renameProvider(fromKey, toKey, opts = {}) {
   const loaded = loadForEdit(configPath);
   if (!loaded.ok) return { ok: false, error: loaded.error, configPath: loaded.path };
 
-  const from = slugify(fromKey || "");
+  const from = resolveProviderKey(fromKey, loaded.config?.provider || {}) || slugify(fromKey || "");
   const to = slugify(toKey || "");
   if (!from || !to) return { ok: false, error: "Нужны оба ключа", configPath: loaded.path };
   if (from === to) return { ok: false, error: "Ключи совпадают", configPath: loaded.path };
@@ -376,17 +386,22 @@ export function renameProvider(fromKey, toKey, opts = {}) {
       changes.push({ op: "set", path: [field], value: to + "/" + cur.slice(from.length + 1) });
     }
   }
-  const disabled = loaded.config.disabled_providers;
-  if (Array.isArray(disabled) && disabled.includes(from)) {
-    changes.push({ op: "set", path: ["disabled_providers"], value: disabled.map((d) => (d === from ? to : d)) });
+  // The key also lives in the enable/disable lists: renaming without them
+  // leaves a dangling old name there and drops the provider from the user's
+  // picks — opencode treats those lists by exact name.
+  for (const listField of ["disabled_providers", "enabled_providers"]) {
+    const arr = loaded.config[listField];
+    if (Array.isArray(arr) && arr.includes(from)) {
+      changes.push({ op: "set", path: [listField], value: arr.map((d) => (d === from ? to : d)) });
+    }
   }
 
-  const applied = applyChangesVerified(loaded.text, changes);
+  const applied = applySchemaChanges(loaded.text, loaded.config, changes);
   if (!applied.ok) return { ok: false, error: applied.error, configPath: loaded.path };
 
   return commitPlan({
     ok: true, configPath: loaded.path, before: loaded.text, after: applied.text,
-    changes, providerKey: to, previousKey: from, hash: loaded.current.hash,
+    changes: applied.changes, providerKey: to, previousKey: from, hash: loaded.current.hash,
   }, { expectedHash, backup });
 }
 

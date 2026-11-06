@@ -8,6 +8,7 @@
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import http from "node:http";
 
 let pass = 0;
 const fails = [];
@@ -99,6 +100,10 @@ eq("stripJsonc drops a trailing comma", JSON.parse(R.stripJsonc('{ "a": 1, }')),
 eq("stripJsonc drops nested trailing commas", JSON.parse(R.stripJsonc('{ "a": [1, 2,], "b": { "c": 3, }, }')), { a: [1, 2], b: { c: 3 } });
 eq("stripJsonc keeps // inside a string", JSON.parse(R.stripJsonc('{ "u": "https://x.dev/v1" }')), { u: "https://x.dev/v1" });
 eq("stripJsonc keeps an escaped quote", JSON.parse(R.stripJsonc('{ "q": "a\\"b" }')), { q: 'a"b' });
+// The trailing-comma cleanup used to run a regex over the whole output and
+// happily cut commas inside string values.
+eq("stripJsonc keeps a comma-brace inside a string",
+  JSON.parse(R.stripJsonc('{ "n": "a, }", "b": 1, }')), { n: "a, }", b: 1 });
 
 // ------------------------------------------------------------- validation
 
@@ -458,11 +463,15 @@ check("fetchModels fails cleanly on a dead endpoint", deadModels.ok === false &&
   const anon = await R.testConnection({ baseURL: base, apiFormat: "openai-chat", apiKey: "" });
   eq("testConnection: a 401 with no key sent is fault=nokey", anon.fault, "nokey");
   check("the endpoint is still reported as reachable", anon.reach === "up", JSON.stringify(anon));
+  // Reachable is not the same as usable: a refused key used to come back as
+  // ok:true, which painted the probe green and counted the key as passed.
+  check("a 401 is not reported as a successful probe", anon.ok === false, JSON.stringify(anon));
   check("the message does not claim the key was rejected",
     !/не принят/.test(anon.message) && /не отправлен/.test(anon.message), anon.message);
 
   const withKey = await R.testConnection({ baseURL: base, apiFormat: "openai-chat", apiKey: "sk-wrong" });
   eq("testConnection: a 401 with a key sent is fault=key", withKey.fault, "key");
+  check("a refused key is not reported as a successful probe", withKey.ok === false, JSON.stringify(withKey));
 
   const anonModels = await R.fetchModels({ baseURL: base, apiFormat: "openai-chat", apiKey: "" });
   eq("fetchModels: a 401 with no key sent is fault=nokey", anonModels.fault, "nokey");
@@ -475,6 +484,58 @@ check("fetchModels fails cleanly on a dead endpoint", deadModels.ok === false &&
   eq("an anthropic x-api-key counts as a key that was sent", anthKey.fault, "key");
 
   await new Promise((r) => unauthorized.close(r));
+}
+
+// --------------------------------------- 401: client gate vs key refused
+// Some gateways authenticate the *client* before they look at the key.
+// Measured live 2026-10-21 on agentrouter.org: the same working key answered
+// 401 "unauthorized client detected" with our probe UA and 200 with the Claude
+// Code one. Calling that "ключ не принят" sends the user off to regenerate a
+// token that was never even read.
+{
+  const http = await import("node:http");
+  const gate = http.createServer((rq, rs) => {
+    rs.writeHead(401, { "content-type": "application/json" });
+    rs.end(JSON.stringify({
+      error: { message: "unauthorized client detected, contact support for assistance" },
+      type: "unauthorized_client_error",
+    }));
+  });
+  await new Promise((r) => gate.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${gate.address().port}/v1`;
+
+  const gated = await R.testConnection({ baseURL: base, apiFormat: "openai-chat", apiKey: "sk-good" });
+  eq("testConnection: a client gate is not blamed on the key", gated.fault, "client");
+  check("the endpoint is still reported as reachable", gated.reach === "up", JSON.stringify(gated));
+  check("the message says the key was not examined",
+    /клиента/.test(gated.message) && !/проверь API key/.test(gated.message), gated.message);
+
+  const gatedList = await R.fetchModels({ baseURL: base, apiFormat: "openai-chat", apiKey: "sk-good" });
+  eq("fetchModels: a client gate is not blamed on the key", gatedList.fault, "client");
+
+  // A 401 that is really about the key must keep saying so.
+  const plain = http.createServer((rq, rs) => {
+    rs.writeHead(401, { "content-type": "application/json" });
+    rs.end(JSON.stringify({ error: { message: "Invalid token" } }));
+  });
+  await new Promise((r) => plain.listen(0, "127.0.0.1", r));
+  const plainBase = `http://127.0.0.1:${plain.address().port}/v1`;
+  const refused = await R.testConnection({ baseURL: plainBase, apiFormat: "openai-chat", apiKey: "sk-wrong" });
+  eq("a plain 401 still means the key was refused", refused.fault, "key");
+
+  // The fingerprint is per-host: sending a Claude Code UA to everybody would
+  // misrepresent this tool to every other provider.
+  const fp = R.clientFingerprintHeaders("https://agentrouter.org/v1");
+  check("the gated host gets a whitelisted UA", /^claude-cli\//.test(fp["User-Agent"] || ""), JSON.stringify(fp));
+  eq("the gated host also gets x-app", fp["x-app"], "cli");
+  eq("the mirror domain is gated too", R.clientFingerprintHeaders("https://ps.air-outer.com/v1")["x-app"], "cli");
+  eq("other providers get no fingerprint", Object.keys(R.clientFingerprintHeaders("https://api.openai.com/v1")).length, 0);
+  const gatedHeaders = R.probeHeaders("sk-x", "openai-chat", "https://agentrouter.org/v1");
+  check("probeHeaders keeps the fingerprint, not its own UA",
+    /^claude-cli\//.test(gatedHeaders.headers["User-Agent"] || ""), JSON.stringify(gatedHeaders.headers));
+
+  await new Promise((r) => gate.close(r));
+  await new Promise((r) => plain.close(r));
 }
 
 // --------------------------------------------------------- model parsing
@@ -804,6 +865,32 @@ check("describeProxy on null is empty", P.describeProxy(null) === "");
     await new Promise((r) => bigSrv.close(r));
   }
 
+  // Multi-byte UTF-8 split across TCP chunks: concatenating chunks as strings
+  // (the old behaviour) turned the straddling character into U+FFFD and broke
+  // JSON.parse on real catalogues full of CJK model names.
+  {
+    const unicodeSrv = http.createServer((rq, rs) => {
+      const payload = JSON.stringify({ data: [{ id: "модель-中文-🎉" }] });
+      const bytes = Buffer.from(payload, "utf8");
+      rs.writeHead(200, { "content-type": "application/json" });
+      // Awkward 7-byte slices guarantee multibyte characters straddle chunks.
+      const parts = [];
+      for (let i = 0; i < bytes.length; i += 7) parts.push(bytes.subarray(i, i + 7));
+      (function next(j) {
+        if (j >= parts.length) return rs.end();
+        rs.write(parts[j], () => setImmediate(() => next(j + 1)));
+      })(0);
+    });
+    await new Promise((r) => unicodeSrv.listen(0, "127.0.0.1", r));
+    const uni = await P.proxyFetch(`http://127.0.0.1:${unicodeSrv.address().port}/v1/models`, {
+      timeoutMs: 5000, proxy,
+    });
+    const parsed = await uni.json();
+    eq("multibyte characters survive chunk-splitting", parsed.data[0].id, "модель-中文-🎉");
+    check("no replacement characters in the body", !JSON.stringify(parsed).includes("\uFFFD"));
+    await new Promise((r) => unicodeSrv.close(r));
+  }
+
   // 407 must be reported as a proxy fault, not as a dead provider.
   const denySrv = http.createServer((rq, rs) => { rs.writeHead(407); rs.end(); });
   denySrv.on("connect", (rq, sock) => { sock.write("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"); sock.end(); });
@@ -867,6 +954,42 @@ check("isLocalTarget covers loopback and private ranges",
   ["127.0.0.1", "::1", "10.1.2.3", "192.168.0.1", "172.16.0.1", "localhost", "box.local"].every(P.isLocalTarget));
 check("isLocalTarget leaves public hosts alone",
   ["api.openai.com", "8.8.8.8", "1.1.1.1"].every((h) => !P.isLocalTarget(h)));
+
+// ------------------------------------------------- new patterns & 402 / WAF
+check("ENTITLEMENT_PATTERN matches 'credit balance is too low'", R.ENTITLEMENT_PATTERN.test("credit balance is too low"));
+check("ENTITLEMENT_PATTERN matches 'balance is too low'", R.ENTITLEMENT_PATTERN.test("balance is too low"));
+check("REGION_PATTERN matches 'user location is not supported'", R.REGION_PATTERN.test("user location is not supported"));
+check("REGION_PATTERN matches 'user location not supported'", R.REGION_PATTERN.test("user location not supported"));
+check("BAD_KEY_PATTERN matches 'API_KEY_INVALID'", R.BAD_KEY_PATTERN.test("API_KEY_INVALID"));
+check("BAD_KEY_PATTERN matches 'account_deactivated'", R.BAD_KEY_PATTERN.test("account_deactivated"));
+
+{
+  const srv = http.createServer((req, res) => {
+    res.writeHead(402, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "Payment required" } }));
+  });
+  await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  const port = srv.address().port;
+  const comp = await R.testCompletion({ baseURL: `http://127.0.0.1:${port}/v1`, apiKey: "sk-x", modelId: "test-m" });
+  eq("402 completion returns fault plan", comp.fault, "plan");
+  eq("402 completion status is 402", comp.status, 402);
+
+  // WAF check with keywords beyond 160 chars
+  const longPrefix = "a".repeat(200);
+  const wafSrv = http.createServer((req, res) => {
+    res.writeHead(403, { "Content-Type": "text/html" });
+    res.end(`<html><body>${longPrefix} Cloudflare error: captcha required </body></html>`);
+  });
+  await new Promise((resolve) => wafSrv.listen(0, "127.0.0.1", resolve));
+  const wafPort = wafSrv.address().port;
+  const conn = await R.testConnection({ baseURL: `http://127.0.0.1:${wafPort}/v1`, apiKey: "sk-x" });
+  eq("deep WAF in testConnection yields fault blocked", conn.fault, "blocked");
+  const wafComp = await R.testCompletion({ baseURL: `http://127.0.0.1:${wafPort}/v1`, apiKey: "sk-x", modelId: "test-m" });
+  eq("deep WAF in testCompletion yields fault blocked", wafComp.fault, "blocked");
+
+  await new Promise((resolve) => srv.close(resolve));
+  await new Promise((resolve) => wafSrv.close(resolve));
+}
 
 // ------------------------------------------------------------------ report
 

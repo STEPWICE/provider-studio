@@ -8,6 +8,7 @@ import {
   FORMATS, MODALITIES, MODEL_STATUSES, PROVIDER_FIELDS, MODEL_FIELDS,
   slugify, normaliseHeaders, buildModelEntry, buildOpencodeProvider, managedModelKeys,
   buildProviderChanges, buildRemovalChanges, buildRemovals, decodeApiKey, isPlaintextKey,
+  resolveProviderKey,
   suggestEnvVarName, looksLikePackage, isCustomProviderBlock, detectApiFormat,
   modelEntryToForm, samePool,
 } from "./src/formats.mjs";
@@ -91,6 +92,18 @@ eq("slugify keeps digits", slugify("gpt 4o"), "gpt-4o");
   const back = buildModelEntry({ id: "m", ...form });
   eq("limit round-trips back into the entry", back.entry.limit, { context: 1000, output: 100 });
   eq("cost round-trips back into the entry", back.entry.cost.input, 1);
+
+  const namedFree = modelEntryToForm("deepseek-v4.1-flash:free", {});
+  eq("a segmented free suffix survives config import", [namedFree.free, namedFree.freeSource], [true, "name"]);
+  const zeroPriced = modelEntryToForm("metered", { cost: { input: 0, output: 0 } });
+  eq("an explicit zero price is confirmed free", [zeroPriced.free, zeroPriced.freeSource], [true, "price"]);
+  const paidFreeName = modelEntryToForm("metered:free", { cost: { input: 1, output: 2 } });
+  eq("a declared nonzero price beats the model name", [paidFreeName.free, paidFreeName.freeSource], [false, "price"]);
+  for (const id of ["freeway", "carefree"]) {
+    eq(`${id} is not misclassified as free`, modelEntryToForm(id, {}).free, false);
+  }
+  const unknownPriced = modelEntryToForm("unknown", { cost: { input: "", output: "" } });
+  eq("empty prices stay unknown rather than becoming free", [unknownPriced.free, unknownPriced.freeSource], [false, "unknown"]);
 }
 
 // ------------------------------------------------------- clearing scalar options
@@ -163,8 +176,14 @@ check("cost dropped when output is missing",
 eq("cost carries cache fields",
   buildModelEntry({ id: "m", costInput: 3, costOutput: 15, costCacheRead: 0.3, costCacheWrite: 3.75 }).entry.cost,
   { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 });
-check("cost never contains NaN",
-  Number.isFinite(buildModelEntry({ id: "m", costInput: "x", costOutput: "y" }).entry.cost.input));
+// Unparseable price text is *unknown*, not zero: writing 0 would paint the
+// model free (isFreeEntry reads exactly this object) when nothing is known.
+check("cost dropped when non-numeric",
+  buildModelEntry({ id: "m", costInput: "x", costOutput: "y" }).entry.cost === undefined);
+check("cost never contains NaN", (() => {
+  const c = buildModelEntry({ id: "m", costInput: "1", costOutput: "2", costCacheRead: "junk" }).entry.cost;
+  return Number.isFinite(c.input) && Number.isFinite(c.output) && c.cache_read === undefined;
+})());
 
 const vision = buildModelEntry({ id: "v", inputTypes: ["text", "image"] });
 eq("attachment set for image input", vision.entry.attachment, true);
@@ -472,6 +491,78 @@ eq("removal repoints small_model too",
     withPlugin.changes.find((c) => c.path.join(".") === "plugin").value, ["./other.mjs"]);
   check("an all-missing removal stays notFound",
     buildRemovals(["ghost"], cfg).notFound === true);
+}
+
+// ----------------------------------------------------------- exact config keys
+
+// Config keys are arbitrary strings, so `my_provider` and `dot.name` are legal.
+// slugify() would rewrite them, and the removal then looked for a key the file
+// never had: the provider simply could not be deleted.
+{
+  const providers = {
+    my_provider: { models: { m: {} } },
+    "dot.name": { models: { m: {} } },
+    "Mixed-Case": { models: { m: {} } },
+  };
+  eq("an exact key resolves to itself", resolveProviderKey("my_provider", providers), "my_provider");
+  eq("a dotted key resolves to itself", resolveProviderKey("dot.name", providers), "dot.name");
+  eq("a display name still resolves through the slug",
+    resolveProviderKey("my provider", providers), "my_provider");
+  eq("a slug resolves back to the exact key", resolveProviderKey("mixed-case", providers), "Mixed-Case");
+  eq("an unknown key resolves to nothing", resolveProviderKey("ghost", providers), "");
+
+  const cfg = { model: "my_provider/m", provider: providers };
+  const byExact = buildRemovals(["my_provider"], cfg);
+  check("an underscore key is removable", byExact.ok, byExact.error || "");
+  eq("the delete targets the exact key",
+    byExact.changes.find((c) => c.op === "delete"), { op: "delete", path: ["provider", "my_provider"] });
+  const byDot = buildRemovals(["dot.name"], cfg);
+  eq("a dotted key is removable",
+    byDot.changes.find((c) => c.op === "delete"), { op: "delete", path: ["provider", "dot.name"] });
+
+  // Editing must update the block that exists instead of creating a slug twin.
+  const edit = buildProviderChanges(
+    { name: "my_provider", baseURL: "https://x.dev/v1", apiFormat: "openai-chat", models: [{ id: "m2" }] },
+    { existingConfig: { provider: { my_provider: { models: { m: {} } } } }, previousKey: "my_provider" },
+  );
+  check("editing an underscore key succeeds", edit.ok, edit.error || "");
+  eq("editing an underscore key keeps it", edit.providerKey, "my_provider");
+  eq("editing does not count as a rename", edit.previousKey, "");
+  check("the edit lands on the exact key",
+    edit.changes.every((c) => c.path[0] !== "provider" || c.path[1] === "my_provider"));
+}
+
+// Re-adding a provider that is still in disabled_providers used to leave it
+// disabled: the block was written, the list hid it, and the UI said success.
+{
+  const reenabled = buildProviderChanges(
+    { name: "xkiro", baseURL: "https://x.dev/v1", apiFormat: "openai-chat", models: [{ id: "m" }] },
+    { existingConfig: { provider: {}, disabled_providers: ["xkiro", "nvidia"] } },
+  );
+  eq("a disabled provider is re-enabled on save", reenabled.reenabled, true);
+  eq("only the saved key leaves the disabled list",
+    reenabled.changes.find((c) => c.path.join(".") === "disabled_providers").value, ["nvidia"]);
+  const untouched = buildProviderChanges(
+    { name: "other", baseURL: "https://x.dev/v1", apiFormat: "openai-chat", models: [{ id: "m" }] },
+    { existingConfig: { provider: {}, disabled_providers: ["xkiro"] } },
+  );
+  check("an unrelated save leaves the disabled list alone",
+    !untouched.changes.some((c) => c.path.join(".") === "disabled_providers"));
+}
+
+// Env variables only the removed block referenced are reported, never deleted.
+{
+  const cfg = {
+    provider: {
+      gone: { env: ["GONE_KEY"], options: { apiKey: "{env:GONE_KEY}" }, models: { m: {} } },
+      kept: { env: ["KEPT_KEY"], options: { apiKey: "{env:KEPT_KEY}" }, models: { m: {} } },
+      shared: { env: ["SHARED_KEY"], options: { apiKey: "{env:SHARED_KEY}" }, models: { m: {} } },
+      gone2: { env: ["SHARED_KEY"], options: { apiKey: "{env:SHARED_KEY}" }, models: { m: {} } },
+    },
+  };
+  const r = buildRemovals(["gone", "gone2"], cfg);
+  eq("only unshared variables are reported as env orphans", r.envOrphans, ["GONE_KEY"]);
+  check("the shared variable survives the report", !r.envOrphans.includes("SHARED_KEY"));
 }
 
 // ----------------------------------------------------------- key encoding

@@ -20,6 +20,13 @@
 
 import { proxyForUrl, proxyFetch } from "./proxy.mjs";
 import { slugify, suggestEnvVarName } from "./formats.mjs";
+import {
+  BAD_KEY_PATTERN, ENTITLEMENT_PATTERN,
+  NO_ACCOUNTS_PATTERN, NO_CHANNEL_PATTERN, NOT_SUPPORTED_PATTERN, RATE_PATTERN,
+} from "./rescue.mjs";
+
+export const POOL_DAILY_RE =
+  /requests per day|tokens per day|free-models-per-day-stealth|free-models-per-day|per-day|daily.?limit|usage limit reached/i;
 
 /** Больше ключей за раз не принимаем: каждый ключ — это живые запросы. */
 export const MAX_POOL_KEYS = 20;
@@ -96,18 +103,21 @@ export function validateKeyPool(keys) {
  *   - key/plan/quota/blocked/transient/endpoint/timeout — да, следующий ключ
  *     либо рабочий, либо со своим лимитом/балансом;
  *   - model (404 неверный id), nokey (ключ вообще не отправлен — битый конфиг),
- *     proxy (сеть не вышла наружу) — нет, следующий ключ даст то же самое.
+ *     region (модель закрыта для страны — другой ключ из того же места получит
+ *     тот же 403), proxy (сеть не вышла наружу) — нет, следующий ключ даст то
+ *     же самое.
  */
 export function shouldRotate(result) {
   const r = result && typeof result === "object" ? result : {};
   const fault = String(r.fault || "");
   const status = Number(r.status) || 0;
   if (r.ok) return { rotate: false, cooldownMs: 0, reason: "ok" };
-  if (fault === "model" || fault === "nokey" || fault === "proxy") {
+  if (fault === "model" || fault === "nokey" || fault === "proxy" || fault === "region") {
     return { rotate: false, cooldownMs: 0, reason: fault || "config" };
   }
   // 429 без разбора fault тоже ротируем: лимит почти всегда именно на ключ.
   if (status === 429) return { rotate: true, cooldownMs: 60_000, reason: "rate-limited" };
+  if (status === 402) return { rotate: true, cooldownMs: 0, reason: "payment-required" };
   if (fault === "quota") return { rotate: true, cooldownMs: 60_000, reason: "quota" };
   if (fault === "plan") return { rotate: true, cooldownMs: 0, reason: "plan" };
   if (fault === "key") return { rotate: true, cooldownMs: 0, reason: "key" };
@@ -164,7 +174,7 @@ export function recordPoolResult(state, index, result, now = Date.now()) {
   }
   const decision = shouldRotate(r);
   state.failures[index] += 1;
-  if (String(r.fault || "") === "key" || Number(r.status) === 401) {
+  if (String(r.fault || "") === "key" || Number(r.status) === 401 || Number(r.status) === 402) {
     state.dead[index] = true;
     state.cooldownUntil[index] = 0;
     return;
@@ -256,43 +266,113 @@ export function buildPoolShards(provider, envBase, keys) {
   }));
 }
 
-/** Имя файла плагина рядом с конфигом: keypool-<slug>.mjs */
+/** Имя каталога плагина: keypool-<slug> */
+export function poolPluginDirName(providerKey) {
+  return `keypool-${slugify(providerKey || "provider")}`;
+}
+
+/** Имя файла плагина рядом с конфигом (legacy): keypool-<slug>.mjs */
 export function poolPluginFileName(providerKey) {
   return `keypool-${slugify(providerKey || "provider")}.mjs`;
+}
+
+/** Определение типа авторизации провайдера для заголовков пула. */
+export function getPoolAuthType({ providerKey, apiFormat, baseURL } = {}) {
+  const fmt = String(apiFormat || "").toLowerCase();
+  const key = String(providerKey || "").toLowerCase();
+  const base = String(baseURL || "").toLowerCase();
+  if (fmt.includes("anthropic") || key.includes("anthropic")) return "anthropic";
+  if (fmt.includes("gemini") || fmt.includes("google") || key.includes("gemini") || key.includes("google") || base.includes("generativelanguage.googleapis.com")) return "google";
+  if (fmt.includes("azure") || key.includes("azure") || base.includes("azure.com")) return "azure";
+  return "bearer";
+}
+
+/** Формирование заголовков авторизации под тип провайдера. */
+export function poolAuthHeaders(key, authType = "bearer") {
+  if (authType === "anthropic") return { "x-api-key": key, "anthropic-version": "2023-06-01" };
+  if (authType === "google") return { "x-goog-api-key": key };
+  if (authType === "azure") return { "api-key": key };
+  return { Authorization: "Bearer " + key };
 }
 
 /**
  * Исходник opencode-плагина автопереключения. Секретов внутри нет —
  * только имена переменных и адрес; ключи читаются из process.env
- * в момент запроса, поэтому `setx` без правок файла подхватывается
- * после перезапуска opencode.
+ * или реестра Windows в момент запроса, поэтому `setx` без правок
+ * файла подхватывается сразу.
  *
  * Плагин патчит globalThis.fetch при загрузке: запросы на baseURL
  * идут с ротацией Authorization, ответы-классификаторы (401/402/429/5xx,
- * «insufficient balance/credit», «rate limit») переключают на следующий
- * ключ и повторяют запрос (тело — только строковое/пустое, иначе повтор
- * небезопасен и возвращается первый ответ).
+ * «insufficient balance/credit», «rate limit», суточные квоты) переключают на следующий
+ * ключ и повторяют запрос.
  */
 export function buildKeypoolPlugin({ providerKey, displayName, baseURL, apiFormat, envNames }) {
   const base = String(baseURL || "").trim().replace(/\/+$/, "");
   const names = (Array.isArray(envNames) ? envNames : []).map((n) => String(n || "").trim()).filter(Boolean);
+  const dirName = poolPluginDirName(providerKey);
+  const pluginDir = `plugins/${dirName}`;
   const fileName = poolPluginFileName(providerKey);
-  const anthropic = String(apiFormat || "").includes("anthropic");
+  const authType = getPoolAuthType({ providerKey, apiFormat, baseURL });
+  const anthropic = authType === "anthropic";
   // Display text lands inside // line comments of generated code that opencode
   // executes. A newline in the name would break out of the comment and inject
   // arbitrary JS into the plugin (e.g. an imported config with a crafted name),
   // so it is flattened to a single line; */ is neutralised for the same reason.
   const safeLabel = String(displayName || providerKey || "provider").replace(/[\r\n]+/g, " ").replace(/\*\//g, "* /").slice(0, 120);
   const safeKey = String(providerKey || "pool").replace(/[^a-z0-9-]/gi, "");
+  // The rotation policy below is built from the same patterns rescue.mjs
+  // classifies probe results with, embedded as source. A hand-maintained copy
+  // already drifted once (empty-403 and "not supported by any account" were
+  // rotated by the server but not by the plugin) — embed, never copy.
+  const planReSrc = [
+    ENTITLEMENT_PATTERN.source, NOT_SUPPORTED_PATTERN.source,
+    NO_ACCOUNTS_PATTERN.source, NO_CHANNEL_PATTERN.source,
+    "billing",
+  ].join("|");
   const lines = [
-    `// ${fileName} — автопереключение пула ключей «${safeLabel}».`,
+    `// index.mjs — автопереключение пула ключей «${safeLabel}» (OpenCode V2 plugin).`,
     `// Сгенерировано Provider Studio. Секретов здесь нет: ключи берутся из переменных`,
-    `// окружения (${names.join(", ") || "—"}) в момент запроса.`,
-    `// Логика: round-robin, пропуск мёртвых (401) и кулдаун квоты (429/5xx/balance).`,
+    `// окружения (${names.join(", ") || "—"}) или реестра Windows в момент запроса.`,
+    `// Логика: round-robin, пропуск мёртвых (401) и суточных лимитов / кулдаун квоты.`,
+    ``,
+    `import { execSync } from "node:child_process";`,
     ``,
     `const POOL_ENVS = ${JSON.stringify(names)};`,
     `const POOL_BASE = ${JSON.stringify(base)};`,
+    `const POOL_AUTH_TYPE = ${JSON.stringify(authType)};`,
     `const POOL_ANTHROPIC = ${anthropic ? "true" : "false"};`,
+    ``,
+    `let regCache = null;`,
+    `function getRegistryEnvs() {`,
+    `  if (regCache !== null) return regCache;`,
+    `  regCache = new Map();`,
+    `  if (process.platform === "win32") {`,
+    `    try {`,
+    `      const out = execSync('reg query "HKCU\\\\Environment"', {`,
+    `        encoding: "utf8",`,
+    `        stdio: ["pipe", "pipe", "ignore"],`,
+    `        timeout: 3000,`,
+    `      });`,
+    `      for (const line of out.split(/\\r?\\n/)) {`,
+    `        const match = line.match(/^\\s*([A-Za-z0-9_]+)\\s+REG_[A-Z_]+\\s+(.+)$/i);`,
+    `        if (match) regCache.set(match[1].toUpperCase(), match[2].trim());`,
+    `      }`,
+    `    } catch {}`,
+    `  }`,
+    `  return regCache;`,
+    `}`,
+    ``,
+    `function getEnvVal(envName) {`,
+    `  const v = (process.env[envName] || "").trim();`,
+    `  if (v) return v;`,
+    `  const reg = getRegistryEnvs();`,
+    `  const fromReg = reg.get(envName.toUpperCase()) || "";`,
+    `  if (fromReg) {`,
+    `    process.env[envName] = fromReg;`,
+    `    return fromReg;`,
+    `  }`,
+    `  return "";`,
+    `}`,
     ``,
     `const poolState = { cursor: 0, dead: new Set(), cooldownUntil: new Map(), fails: new Map() };`,
     ``,
@@ -300,7 +380,7 @@ export function buildKeypoolPlugin({ providerKey, displayName, baseURL, apiForma
     `  const now = Date.now();`,
     `  const alive = [];`,
     `  for (const env of POOL_ENVS) {`,
-    `    const v = (process.env[env] || "").trim();`,
+    `    const v = getEnvVal(env);`,
     `    if (!v) continue;`,
     `    if (poolState.dead.has(env)) continue;`,
     `    if ((poolState.cooldownUntil.get(env) || 0) > now) continue;`,
@@ -310,20 +390,38 @@ export function buildKeypoolPlugin({ providerKey, displayName, baseURL, apiForma
     `}`,
     ``,
     `function poolAuthHeaders(key) {`,
-    `  if (POOL_ANTHROPIC) return { "x-api-key": key, "anthropic-version": "2023-06-01" };`,
+    `  if (POOL_AUTH_TYPE === "anthropic") return { "x-api-key": key, "anthropic-version": "2023-06-01" };`,
+    `  if (POOL_AUTH_TYPE === "google") return { "x-goog-api-key": key };`,
+    `  if (POOL_AUTH_TYPE === "azure") return { "api-key": key };`,
     `  return { Authorization: "Bearer " + key };`,
     `}`,
     ``,
-    `const BALANCE_RE = /(insufficient|balance|credit|quota|out of (credit|funds)|payment required|billing|rate.?limit|too many requests|429)/i;`,
+    `const POOL_DAILY_RE = ${POOL_DAILY_RE.toString()};`,
+    `const POOL_RATE_RE = ${RATE_PATTERN.toString()};`,
+    `const POOL_BADKEY_RE = ${BAD_KEY_PATTERN.toString()};`,
+    `const POOL_PLAN_RE = new RegExp(${JSON.stringify(planReSrc)}, "i");`,
     `async function poolShouldRotate(res) {`,
     `  if (!res) return { rotate: true, cooldownMs: 0 };`,
     `  const s = res.status || 0;`,
-    `  if (s === 401) return { rotate: true, dead: true };`,
-    `  if (s === 402 || s === 429 || (s >= 500 && s < 600)) return { rotate: true, cooldownMs: s === 429 ? 60000 : 30000 };`,
+    `  if (s === 401) return { rotate: true, dead: true, reason: "invalid_key_401" };`,
+    `  if (s === 402) return { rotate: true, dead: true, reason: "payment_required_402" };`,
+    `  if (s === 429) {`,
+    `    let text = "";`,
+    `    try { text = await res.clone().text(); } catch { text = ""; }`,
+    `    if (POOL_DAILY_RE.test(text)) {`,
+    `      return { rotate: true, dead: true, reason: "daily_quota_limit" };`,
+    `    }`,
+    `    return { rotate: true, cooldownMs: 60000, reason: "rate_limit_rpm" };`,
+    `  }`,
+    `  if (s >= 500 && s < 600) return { rotate: true, cooldownMs: 30000, reason: "server_5xx" };`,
     `  if (s === 400 || s === 403 || s === 404) {`,
     `    let text = "";`,
     `    try { text = await res.clone().text(); } catch { text = ""; }`,
-    `    if (BALANCE_RE.test(text)) return { rotate: true, cooldownMs: 0 };`,
+    `    if (POOL_DAILY_RE.test(text)) return { rotate: true, dead: true, reason: "daily_quota_limit" };`,
+    `    if (s === 403 && !text.trim()) return { rotate: true, cooldownMs: 10000 };`,
+    `    if (POOL_RATE_RE.test(text)) return { rotate: true, cooldownMs: 60000 };`,
+    `    if (POOL_BADKEY_RE.test(text)) return { rotate: true, dead: true };`,
+    `    if (POOL_PLAN_RE.test(text)) return { rotate: true, dead: true };`,
     `    return { rotate: false };`,
     `  }`,
     `  return { rotate: false };`,
@@ -332,7 +430,7 @@ export function buildKeypoolPlugin({ providerKey, displayName, baseURL, apiForma
     `function poolNote(env, decision, status) {`,
     `  if (decision.dead) {`,
     `    poolState.dead.add(env);`,
-    `    console.error("[keypool ${safeKey}] ключ " + env + " отклонён (" + status + ") — выведен из ротации");`,
+    `    console.error("[keypool ${safeKey}] ключ " + env + " отклонён (" + status + (decision.reason ? ": " + decision.reason : "") + ") — выведен из ротации");`,
     `  } else if (decision.cooldownMs) {`,
     `    const fails = (poolState.fails.get(env) || 0) + 1;`,
     `    poolState.fails.set(env, fails);`,
@@ -340,53 +438,88 @@ export function buildKeypoolPlugin({ providerKey, displayName, baseURL, apiForma
     `  }`,
     `}`,
     ``,
-    `if (typeof globalThis.fetch === "function" && !globalThis.__psKeypoolPatched) {`,
+    `// The guard flag is per-pool, not one global: with two pools installed a`,
+    `// single shared flag would let the first win and the second silently never`,
+    `// install. Patches chain instead — each pool checks only its own POOL_BASE.`,
+    `if (typeof globalThis.fetch === "function" && !globalThis[${JSON.stringify(`__psKeypoolPatched_${safeKey}`)}]) {`,
     `  const origFetch = globalThis.fetch.bind(globalThis);`,
-    `  globalThis.__psKeypoolPatched = true;`,
+    `  globalThis[${JSON.stringify(`__psKeypoolPatched_${safeKey}`)}] = true;`,
     `  globalThis.fetch = async function poolFetch(input, init) {`,
     `    let url = "";`,
     `    try { url = String(typeof input === "string" ? input : input?.url || ""); } catch { url = ""; }`,
     `    const headers = new Headers((init && init.headers) || (typeof input !== "string" && input?.headers) || {});`,
-    `    const hasAuth = headers.has("authorization") || headers.has("x-api-key");`,
-    `    if (!POOL_BASE || !url.startsWith(POOL_BASE) || !hasAuth) return origFetch(input, init);`,
+    `    const hasAuth = headers.has("authorization") || headers.has("x-api-key") || headers.has("x-goog-api-key") || headers.has("api-key");`,
+    `    // Exact-prefix match: a bare startsWith(POOL_BASE) would also catch`,
+    `    // "https://api.foo.com/v10/..." — a different provider on the same host —`,
+    `    // and would rewrite its Authorization with this pool's keys.`,
+    `    const inScope = url === POOL_BASE || url.startsWith(POOL_BASE + "/") || url.startsWith(POOL_BASE + "?");`,
+    `    if (!POOL_BASE || !inScope || !hasAuth) return origFetch(input, init);`,
     `    const body = init?.body;`,
     `    const replayable = body == null || typeof body === "string";`,
     `    const alive = poolKeys();`,
     `    if (!alive.length) return origFetch(input, init);`,
     `    // Начинаем с ключа, который opencode уже подставил, если он из пула, — иначе round-robin.`,
-    `    const current = String(headers.get("authorization") || headers.get("x-api-key") || "").replace(/^Bearer\\s+/i, "");`,
+    `    const current = String(headers.get("authorization") || headers.get("x-api-key") || headers.get("x-goog-api-key") || headers.get("api-key") || "").replace(/^Bearer\\s+/i, "");`,
     `    let order = alive.slice();`,
     `    const hit = order.findIndex((e) => e.key === current);`,
     `    if (hit > 0) order = order.slice(hit).concat(order.slice(0, hit));`,
     `    else if (poolState.cursor > 0) order = order.slice(poolState.cursor).concat(order.slice(0, poolState.cursor));`,
     `    let lastRes = null;`,
     `    for (let i = 0; i < order.length; i++) {`,
+    `      const item = order[i];`,
+    `      if (poolState.dead.has(item.env)) continue;`,
+    `      if ((poolState.cooldownUntil.get(item.env) || 0) > Date.now()) continue;`,
     `      const h = new Headers(headers);`,
-    `      for (const [k, v] of Object.entries(poolAuthHeaders(order[i].key))) h.set(k, v);`,
+    `      for (const [k, v] of Object.entries(poolAuthHeaders(item.key))) h.set(k, v);`,
     `      let res;`,
     `      try {`,
     `        res = await origFetch(typeof input === "string" ? input : input?.url || input, { ...init, headers: h });`,
     `      } catch (e) {`,
     `        // Транспортная ошибка: следующий ключ (другой аккаунт/квота) может пройти.`,
-    `        poolState.cursor = (poolState.cursor + 1) % Math.max(1, alive.length);`,
+    `        poolState.cursor = (order.indexOf(item) + 1) % Math.max(1, order.length);`,
     `        lastRes = null;`,
     `        continue;`,
     `      }`,
-    `      if (res.ok) { poolState.fails.set(order[i].env, 0); return res; }`,
+    `      if (res.ok) {`,
+    `        poolState.fails.set(item.env, 0);`,
+    `        poolState.cursor = (order.indexOf(item) + 1) % Math.max(1, order.length);`,
+    `        return res;`,
+    `      }`,
     `      const decision = await poolShouldRotate(res);`,
-    `      poolNote(order[i].env, decision, res.status);`,
+    `      poolNote(item.env, decision, res.status);`,
     `      lastRes = res;`,
     `      if (!decision.rotate || !replayable) return res;`,
-    `      // Следующая итерация — следующий ключ.`,
+    `      poolState.cursor = (order.indexOf(item) + 1) % Math.max(1, order.length);`,
     `    }`,
     `    return lastRes || origFetch(input, init);`,
     `  };`,
     `}`,
     ``,
-    `export default {};`,
+    `export default {`,
+    `  id: ${JSON.stringify(`keypool-${safeKey}`)},`,
+    `  setup: async () => {`,
+    `    console.log(${JSON.stringify(`[keypool-${safeKey}] Plugin initialized, pool size:`)}, poolKeys().length);`,
+    `  }`,
+    `};`,
     ``,
   ];
-  return { fileName, source: lines.join("\n") };
+  const packageJson = {
+    name: dirName,
+    version: "1.0.0",
+    type: "module",
+    main: "index.mjs",
+  };
+  const packageJsonText = JSON.stringify(packageJson, null, 2) + "\n";
+  const source = lines.join("\n");
+  return {
+    dirName,
+    pluginDir,
+    fileName,
+    packageJson,
+    packageJsonText,
+    indexSource: source,
+    source,
+  };
 }
 
 /**

@@ -40,6 +40,9 @@ eq("success never rotates", K.shouldRotate({ ok: true }).rotate, false);
 eq("bad model id never rotates", K.shouldRotate({ ok: false, fault: "model", status: 404 }).rotate, false);
 eq("missing credential never rotates", K.shouldRotate({ ok: false, fault: "nokey", status: 401 }).rotate, false);
 eq("proxy failure never rotates", K.shouldRotate({ ok: false, fault: "proxy" }).rotate, false);
+// A region-blocked model answers the same way for every key from this country,
+// so rotating burns requests without changing the outcome.
+eq("a region block never rotates", K.shouldRotate({ ok: false, fault: "region", status: 403 }).rotate, false);
 eq("429 rotates", K.shouldRotate({ ok: false, fault: "quota", status: 429 }).rotate, true);
 eq("plan/balance rotates", K.shouldRotate({ ok: false, fault: "plan", status: 402 }).rotate, true);
 eq("rejected key rotates to the next", K.shouldRotate({ ok: false, fault: "key", status: 401 }).rotate, true);
@@ -63,6 +66,44 @@ eq("plain 404 does not rotate", K.shouldRotate({ ok: false, fault: "endpoint", s
   const st = K.createPoolState(1);
   K.recordPoolResult(st, 0, { ok: false, fault: "key", status: 401 }, 0);
   eq("last dead key means nobody left", K.pickPoolIndex(st, 0), -1);
+}
+{
+  const st = K.createPoolState(2);
+  K.recordPoolResult(st, 0, { ok: false, status: 402 }, 1000);
+  check("402 marks key dead", st.dead[0] === true);
+  eq("second key picked after 402", K.pickPoolIndex(st, 1000), 1);
+}
+
+// ------------------------------------------------------- daily limit patterns
+check("Gemini 15 RPM error is NOT daily limit", !K.POOL_DAILY_RE.test("Resource has been exhausted (e.g. check quota)"));
+check("Groq daily requests limit matches", K.POOL_DAILY_RE.test("requests per day limit reached"));
+check("Cerebras tokens per day matches", K.POOL_DAILY_RE.test("tokens per day limit exceeded"));
+check("daily limit matches", K.POOL_DAILY_RE.test("daily limit reached"));
+check("usage limit reached matches", K.POOL_DAILY_RE.test("usage limit reached"));
+
+// ------------------------------------------------------- auth headers
+eq("auth type gemini is google", K.getPoolAuthType({ providerKey: "google-gemini", baseURL: "https://generativelanguage.googleapis.com" }), "google");
+eq("auth type azure is azure", K.getPoolAuthType({ providerKey: "my-azure", baseURL: "https://my-resource.openai.azure.com" }), "azure");
+eq("auth type anthropic is anthropic", K.getPoolAuthType({ providerKey: "claude", apiFormat: "anthropic" }), "anthropic");
+eq("auth type openai is bearer", K.getPoolAuthType({ providerKey: "openai", apiFormat: "openai-chat" }), "bearer");
+
+eq("google headers use x-goog-api-key", K.poolAuthHeaders("key123", "google"), { "x-goog-api-key": "key123" });
+eq("azure headers use api-key", K.poolAuthHeaders("key123", "azure"), { "api-key": "key123" });
+eq("anthropic headers use x-api-key", K.poolAuthHeaders("key123", "anthropic"), { "x-api-key": "key123", "anthropic-version": "2023-06-01" });
+eq("bearer headers use Authorization", K.poolAuthHeaders("key123", "bearer"), { Authorization: "Bearer key123" });
+
+{
+  const geminiPlugin = K.buildKeypoolPlugin({
+    providerKey: "gemini", displayName: "Gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai", apiFormat: "google", envNames: ["GEMINI_KEY"],
+  });
+  check("gemini plugin uses x-goog-api-key", geminiPlugin.source.includes("x-goog-api-key"));
+  check("gemini plugin checks hasAuth for x-goog-api-key", geminiPlugin.source.includes('headers.has("x-goog-api-key")'));
+
+  const azurePlugin = K.buildKeypoolPlugin({
+    providerKey: "azure", displayName: "Azure", baseURL: "https://foo.openai.azure.com", apiFormat: "azure", envNames: ["AZURE_KEY"],
+  });
+  check("azure plugin uses api-key", azurePlugin.source.includes('"api-key": key'));
+  check("azure plugin checks hasAuth for api-key", azurePlugin.source.includes('headers.has("api-key")'));
 }
 
 // ------------------------------------------------------- shards + plugin
@@ -96,6 +137,29 @@ eq("plain 404 does not rotate", K.shouldRotate({ ok: false, fault: "endpoint", s
     providerKey: "t", displayName: "T", baseURL: "https://x", apiFormat: "anthropic", envNames: ["T"],
   });
   check("anthropic pool uses x-api-key", a.source.includes("x-api-key"));
+
+  // Two pools in one opencode process: a single shared guard flag used to let
+  // the first plugin win, and the second pool silently never installed.
+  check("guard flag is per-pool",
+    plugin.source.includes('__psKeypoolPatched_test') && !plugin.source.includes("!globalThis.__psKeypoolPatched)"));
+  // A bare startsWith(POOL_BASE) also matched "https://api.example.com/v10" —
+  // a different provider on the same host — and rewrote its Authorization
+  // header with this pool's keys.
+  check("url match is exact-prefix",
+    plugin.source.includes('url === POOL_BASE || url.startsWith(POOL_BASE + "/")'));
+  // The rotation policy is built from the same patterns rescue.mjs classifies
+  // probe results with — a hand-copied map already drifted once (empty-403 and
+  // account-capacity 404 were rotated by the server but not by the plugin).
+  check("plugin rotates an empty 403", plugin.source.includes("s === 403 && !text.trim()"));
+  check("plugin knows the account-capacity 404", plugin.source.includes("not supported by any"));
+  check("plugin knows the Chinese throttling body", plugin.source.includes("请求过于频繁"));
+  check("plugin knows bad-key bodies", plugin.source.includes("valid api"));
+  check("plugin knows daily stealth limit", plugin.source.includes("free-models-per-day-stealth"));
+  check("plugin includes registry fallback", plugin.source.includes("reg query"));
+  check("plugin exports valid OpenCode V2 object", plugin.source.includes("setup:") && plugin.source.includes("id:"));
+  eq("plugin package.json name", plugin.packageJson.name, "keypool-test");
+  eq("plugin package.json main", plugin.packageJson.main, "index.mjs");
+  eq("plugin dirName", plugin.dirName, "keypool-test");
 }
 eq("plugin entry deduped", K.mergePluginEntry(["a", "b"], "a"), ["a", "b"]);
 eq("plugin entry appended", K.mergePluginEntry(["a"], "b"), ["a", "b"]);

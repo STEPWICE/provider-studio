@@ -18,6 +18,7 @@ import {
   backupDir, dataDir, ensureDir, writeFileAtomic, isInside, IS_WINDOWS,
 } from "./paths.mjs";
 import { parseJsonc } from "./jsonc-edit.mjs";
+import { providerMap, shadowLegacyProviders, legacyProvidersOf } from "./schema.mjs";
 import { proxyForUrl, proxyFetch, describeProxy, isLocalTarget, readLimitedResponseText } from "./proxy.mjs";
 import {
   looksLikePackage, isCustomProviderBlock, decodeApiKey, isPlaintextKey,
@@ -169,6 +170,10 @@ function prune(max = 30) {
 /** Comment stripper kept for callers that still want plain JSON text. */
 export function stripJsonc(raw) {
   let out = ""; let inStr = false; let block = false;
+  // Commas outside strings, recorded while scanning. The previous version
+  // regex-replaced trailing commas over the finished text — which also cut
+  // commas sitting *inside* string values ("a, }" became "a}").
+  const commaPositions = [];
   for (let i = 0; i < raw.length; i++) {
     const c = raw[i]; const n = raw[i + 1];
     if (block) { if (c === "*" && n === "/") { block = false; i++; } continue; }
@@ -181,18 +186,26 @@ export function stripJsonc(raw) {
     if (c === '"') { inStr = true; out += c; continue; }
     if (c === "/" && n === "/") { while (i < raw.length && raw[i] !== "\n") i++; continue; }
     if (c === "/" && n === "*") { block = true; i++; continue; }
+    if (c === ",") commaPositions.push(out.length);
     out += c;
   }
   // Trailing commas are valid JSONC but not JSON; drop them so the result
-  // survives JSON.parse.
-  return out.replace(/,(\s*[}\]])/g, "$1");
+  // survives JSON.parse. Backwards, so earlier positions stay valid.
+  for (let i = commaPositions.length - 1; i >= 0; i--) {
+    const rest = out.slice(commaPositions[i] + 1);
+    if (/^\s*[}\]]/.test(rest)) out = out.slice(0, commaPositions[i]) + rest;
+  }
+  return out;
 }
 
 // ------------------------------------------------------------- validation
 
 const VALID_MODALITIES = new Set(MODALITIES);
 const VALID_STATUSES = new Set(MODEL_STATUSES);
-const PROVIDER_FIELD_SET = new Set([...PROVIDER_FIELDS, "type", "$schema"]);
+// "$schema" is a top-level field of the config file — inside a provider block
+// opencode rejects it under additionalProperties:false, so it must not be
+// whitelisted here. ("type" stays: "local" providers carry it legitimately.)
+const PROVIDER_FIELD_SET = new Set([...PROVIDER_FIELDS, "type"]);
 // Misplaced fields that get their own, more actionable message.
 const SPECIFIC_PROVIDER_FIELDS = new Set(["apiKey", "baseURL"]);
 const MODEL_FIELD_SET = new Set(MODEL_FIELDS);
@@ -224,11 +237,25 @@ export function introducedErrors(beforeConfig, afterConfig) {
  * Only reports what is actually checkable here; anything requiring the network
  * belongs in the diagnostics endpoint.
  */
-export function validateConfig(config) {
+export function validateConfig(input) {
   const issues = [];
-  if (!config || typeof config !== "object" || Array.isArray(config)) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
     issues.push(issue("error", "not-object", "Конфиг не является объектом", { fixable: false }));
     return issues;
+  }
+  // Accept a document straight from jsonc-edit (V2 files keep `providers`):
+  // the checks below are written against the V1 view.
+  const config = shadowLegacyProviders(input);
+  // A file can carry both maps after a hand-done migration. V2 reads only
+  // `providers`, so the legacy blocks are dead weight that looks live in an
+  // editor — worth saying out loud, since the studio does not list them.
+  const staleLegacy = legacyProvidersOf(config);
+  if (staleLegacy && Object.keys(staleLegacy).length) {
+    issues.push(issue("warn", "mixed-provider-maps",
+      `В конфиге есть и «providers» (V2), и legacy-«provider». OpenCode V2 читает только «providers», ` +
+      `поэтому блоки ${Object.keys(staleLegacy).map((k) => `«${k}»`).join(", ")} не используются — ` +
+      `перенеси их в «providers» или удали`,
+      { fixable: false }));
   }
   if (!config.provider || typeof config.provider !== "object" || Array.isArray(config.provider)) {
     issues.push(issue("error", "no-provider", "Нет блока provider — добавь провайдера"));
@@ -322,7 +349,61 @@ export function validateConfig(config) {
   }
 
   validateDefaultModel(config, issues);
+  validateV2Compat(config, issues);
   return issues;
+}
+
+/**
+ * Findings specific to OpenCode V2 that the V1-shaped checks above cannot see.
+ *
+ * 1. `attachment` and `reasoning` still pass the schema, but the V2 normalizer
+ *    drops them ("omitted unsupported legacy setting" in the server log). V2
+ *    falls back to its own defaults for custom models (tools + text/image
+ *    input), so the practical loss is the explicit reasoning capability and
+ *    any future nuance — capabilities live in `model.capabilities` now.
+ * 2. `plugin` entries must resolve to a *directory* in V2. A path to a .mjs
+ *    file is logged as "configured plugin path must be a directory" and never
+ *    loads: the config looks installed and does nothing.
+ *
+ * Both are reported as warnings, not errors: the config stays valid, it just
+ * does less than it says.
+ */
+function validateV2Compat(config, issues) {
+  const listField = Array.isArray(config.plugins) ? "plugins" : Array.isArray(config.plugin) ? "plugin" : "";
+  for (const entry of (listField ? config[listField] : [])) {
+    const ref = typeof entry === "string"
+      ? entry
+      : entry && typeof entry === "object" && typeof entry.package === "string" ? entry.package : "";
+    if (!ref) continue;
+    // A bare package name ("opencode-x") is fine; anything that looks like a
+    // filesystem path and ends in a source extension is not.
+    const isPath = /^\.{0,2}[\\/]/.test(ref) || /^[A-Za-z]:[\\/]/.test(ref) || /^file:/i.test(ref);
+    if (!isPath || !/\.(mjs|cjs|js|ts)$/i.test(ref)) continue;
+    issues.push(issue("warn", "plugin-file-path",
+      `Плагин «${ref}» указан файлом, а OpenCode V2 подключает только каталоги — ` +
+      `плагин молча не загрузится. Сделай из него каталог с index.js или убери запись из ${listField}`));
+  }
+
+  // The provider map of the document itself: on a V2 file `config.provider` is
+  // a synthesized V1 view (with `attachment`/`reasoning` derived from
+  // `capabilities`), and scanning that view would flag every V2 config for
+  // fields it does not actually contain.
+  for (const [key, p] of Object.entries(providerMap(config))) {
+    if (!p || typeof p !== "object" || Array.isArray(p)) continue;
+    const dropped = [];
+    for (const [mid, m] of Object.entries(p.models || {})) {
+      if (!m || typeof m !== "object" || Array.isArray(m)) continue;
+      const fields = ["attachment", "reasoning"].filter((f) => m[f] !== undefined);
+      if (fields.length) dropped.push(`${mid} (${fields.join(", ")})`);
+    }
+    if (dropped.length) {
+      issues.push(issue("warn", "v2-dropped-model-fields",
+        `Провайдер «${key}»: OpenCode V2 отбрасывает legacy-поля attachment/reasoning — ` +
+        `${dropped.join("; ")}. Возможности модели теперь описываются в capabilities; ` +
+        `картинки V2 принимает по умолчанию, reasoning-настройки стоит выставить явно`,
+        { provider: key }));
+    }
+  }
 }
 
 // Таймаут и env-массив руками пишут редко, но когда пишут — пишут как попало:
@@ -407,11 +488,14 @@ function validateApiKey(key, p, issues) {
       // positive. Warn instead.
       const authoritative = IS_WINDOWS;
       issues.push(issue(authoritative ? "error" : "warn", "env-missing",
-        `Провайдер «${key}»: переменная ${decoded.envVarName} не задана — opencode отправит пустой ключ и получит 401. Выполни ${setEnvCommand(decoded.envVarName)} и перезапусти терминал`,
+        `Провайдер «${key}»: переменная ${decoded.envVarName} не задана — opencode отправит пустой ключ и получит 401. ` +
+        `Выполни ${setEnvCommand(decoded.envVarName)}, затем перезапусти службу OpenCode ` +
+        `(кнопка «↻» рядом с переменной или перезапуск приложения)`,
         { provider: key, envVar: decoded.envVarName }));
     } else if (!info.scopes.includes("process")) {
       issues.push(issue("warn", "env-not-inherited",
-        `Провайдер «${key}»: переменная ${decoded.envVarName} задана в системе, но не видна текущему процессу — opencode нужно запускать из нового окна терминала`,
+        `Провайдер «${key}»: переменная ${decoded.envVarName} задана в системе, но не видна текущему процессу — ` +
+        `opencode увидит её только после перезапуска своей службы`,
         { provider: key, envVar: decoded.envVarName }));
     } else if (info.length > SETX_MAX_LENGTH) {
       issues.push(issue("warn", "env-truncated",
@@ -596,9 +680,17 @@ function validateModel(key, mid, m, issues) {
   }
 
   const needsAttachment = Array.isArray(input) && input.some((t) => t !== "text");
-  if (needsAttachment && m.attachment !== true) {
+  // V2 has no `attachment` flag: a model declares its accepted input types in
+  // `capabilities.input` and OpenCode allows those attachments by itself.
+  // Demanding `attachment: true` there would be a false alarm on a valid V2
+  // config — reported as a warning that the user can only "fix" by adding a
+  // field their version ignores.
+  const declaredInCaps = Array.isArray(m.capabilities?.input)
+    && m.capabilities.input.some((t) => t !== "text");
+  if (needsAttachment && m.attachment !== true && !declaredInCaps) {
     issues.push(issue("warn", "no-attachment",
-      `Модель «${key}/${mid}» принимает ${input.filter((t) => t !== "text").join("/")}, но без attachment:true вложения не пройдут`,
+      `Модель «${key}/${mid}» принимает ${input.filter((t) => t !== "text").join("/")}, но без attachment:true вложения не пройдут` +
+      ` (в OpenCode V2 вместо него — capabilities.input)`,
       { provider: key, model: mid, fixable: true }));
   }
   if (m.status !== undefined && !VALID_STATUSES.has(m.status)) {
@@ -648,6 +740,47 @@ function validateDefaultModel(config, issues) {
 // ------------------------------------------------------------ network probes
 
 const PROBE_UA = "provider-studio/1.0";
+
+// Some gateways authenticate the *client* before they look at the key.
+//
+// AgentRouter answers `401 unauthorized client detected` to every request whose
+// User-Agent is outside its supported-harness whitelist (Claude Code, Codex,
+// opencode, ...). Verified live 2026-10-21: the same working key returned 401
+// with our own UA and 200 with the Claude Code one, on agentrouter.org and on
+// its mirror ps.air-outer.com. A probe sent as "provider-studio/1.0" therefore
+// reports a refused key for a provider that is fine, and the user goes off to
+// regenerate a token that was never the problem. Sending the fingerprint below
+// makes the probe see what opencode would see.
+const CLIENT_FINGERPRINT_HEADERS = {
+  "User-Agent": "claude-cli/2.1.158 (external, sdk-cli)",
+  "x-app": "cli",
+  "anthropic-version": "2023-06-01",
+  "anthropic-beta": "claude-code-20250219",
+};
+
+/** Hosts that gate on the client fingerprint rather than on the key. */
+const CLIENT_FINGERPRINT_HOSTS = ["agentrouter.org", "air-outer.com"];
+
+/** Body marker of a client-whitelist rejection (not a verdict on the key). */
+const CLIENT_GATE_PATTERN = /unauthorized[_ ]client|unauthorized_client_error/i;
+
+/** Fingerprint headers for hosts that refuse unknown clients, {} otherwise. */
+export function clientFingerprintHeaders(baseURL) {
+  let host = "";
+  try { host = new URL(String(baseURL || "")).hostname.toLowerCase(); } catch { return {}; }
+  const gated = CLIENT_FINGERPRINT_HOSTS.some((s) => host === s || host.endsWith("." + s));
+  return gated ? { ...CLIENT_FINGERPRINT_HEADERS } : {};
+}
+
+/**
+ * Wording for a client-whitelist rejection, or "" when the body is something
+ * else. The key was never examined in this case, so the message must not send
+ * the user to the dashboard to re-enter it.
+ */
+function clientGateMessage(detail) {
+  if (!CLIENT_GATE_PATTERN.test(String(detail || ""))) return "";
+  return "⚠ Сервер отклонил клиента, а не ключ (WAF/whitelist) — ключ даже не проверялся. Нужен User-Agent поддерживаемого клиента (Claude Code, Codex, opencode).";
+}
 // Token budget for the live-fire probe. Kept tiny so a check costs nothing,
 // but above the minimum some gateways enforce (they 400 on max_tokens <= 2).
 const PROBE_MAX_TOKENS = 16;
@@ -792,8 +925,13 @@ async function resolvedHostRisk(hostname, blockLocal) {
  * exactly what opencode would send, and `problem` names the real cause when the
  * variable does not exist.
  */
-export function probeHeaders(apiKey, apiFormat) {
-  const headers = { "User-Agent": PROBE_UA, Accept: "application/json" };
+export function probeHeaders(apiKey, apiFormat, baseURL) {
+  const headers = {
+    "User-Agent": PROBE_UA,
+    Accept: "application/json",
+    // Applied after the default UA so a gated host gets its fingerprint.
+    ...clientFingerprintHeaders(baseURL),
+  };
   const ref = resolveKeyRef(apiKey);
   if (ref.isRef && !ref.resolved) {
     return { headers, problem: keyRefProblem(apiKey) };
@@ -922,17 +1060,28 @@ async function guardedRequest(target, { headers, method = "GET", body = null, ti
 }
 
 /** Reachability probe: is there an API server behind this URL? */
+// Probing http:// against a public host sends the credential in plaintext.
+// The config validator flags http:// in the file, but a probe runs straight
+// from the form and never passes through the config — so the warning has to
+// live on the result itself. Local endpoints (ollama, LM Studio) are exempt:
+// http is the only way they talk.
+function insecureTransportNote(u, sentKey) {
+  if (!sentKey || u.protocol !== "http:" || isPrivateHost(u.hostname)) return "";
+  return " · ⚠ http:// — ключ уходит открытым текстом";
+}
+
 export async function testConnection({ baseURL, apiFormat, apiKey } = {}) {
   const guard = validateProbeUrl(baseURL);
   if (!guard.ok) return { ok: false, message: guard.error };
   const t0 = Date.now();
   const ms = () => Date.now() - t0;
 
-  const auth = probeHeaders(apiKey, apiFormat);
+  const auth = probeHeaders(apiKey, apiFormat, guard.url);
   // A reference to a variable that does not exist can only ever produce an
   // empty bearer token, so say that instead of probing and blaming the key.
   if (auth.problem) return { ok: false, message: auth.problem };
   const headers = auth.headers;
+  const insecure = insecureTransportNote(guard.url, headersCarryKey(headers));
   // Only /models paths are probed. The base root used to be a third candidate,
   // but any homepage answers 200 there — so google.com passed as an "API
   // endpoint". A 200 on "/" proves a web server, not an API.
@@ -951,21 +1100,53 @@ export async function testConnection({ baseURL, apiFormat, apiKey } = {}) {
     }
     if (r.ok) {
       const via = r.viaProxy ? " (через прокси)" : "";
-      return { ok: true, status: r.status, url: c, reach: "up", ms: ms(), viaProxy: Boolean(r.viaProxy), message: `✓ Ответ ${r.status} — эндпоинт доступен${via}` };
+      return {
+        ok: true, status: r.status, url: c, reach: "up", ms: ms(), viaProxy: Boolean(r.viaProxy),
+        // Honest scope: a 200 on /models proves the route and the key, not that
+        // the chosen model can answer. OpenRouter serves its catalogue from one
+        // region and the stealth model from another, so this check stayed green
+        // while every real completion was refused. The live model probe is the
+        // only thing that answers "will my chat work".
+        message: `✓ Ответ ${r.status} — эндпоинт и ключ доступны${via}${insecure}. Это проверка /models, а не генерации — модель проверь кнопкой ⚡ или «Проверить все»`,
+      };
     }
-    // Reachable but unauthorised still proves the endpoint exists.
+    // Reachable but unauthorised still proves the endpoint exists. It is not a
+    // success, though: returning ok:true here painted a rejected or blocked
+    // request green in the UI and counted it as a passed key in a pool check.
     if (r.status === 401 || r.status === 403) {
-      // Distinguish "no key was sent" from "the key was rejected": otherwise a
-      // probe run with an empty field reads as a bad key. These need different
-      // faults, not just different wording — the badge said "ключ не принят"
-      // while the line underneath said "ключ не отправлен", accusing a key that
-      // does not exist. `nokey` is a missing credential, `key` is a refused one.
       const sentKey = headersCarryKey(headers);
+      const body = await readLimitedResponseText(r, 8192).catch(() => "");
+      // A gated host rejects the client before it ever reads the key, so the
+      // body decides the wording: "check your API key" here would accuse a
+      // credential that was never examined.
+      const gate = clientGateMessage(body);
+      if (gate) {
+        return {
+          ok: false, status: r.status, url: c, reach: "up", fault: "client",
+          ms: ms(), viaProxy: Boolean(r.viaProxy), message: gate + insecure,
+        };
+      }
+      const detail = providerErrorMessage(body);
+      const tail = detail ? ` — ${detail}` : "";
+      if (r.status === 403 && REGION_PATTERN.test(detail)) {
+        return {
+          ok: false, status: r.status, url: c, reach: "up", fault: "region",
+          ms: ms(), viaProxy: Boolean(r.viaProxy),
+          message: `⚠ Модель/эндпоинт недоступен в твоём регионе (403) — ключ рабочий${tail}${insecure}`,
+        };
+      }
+      if (r.status === 403 && (WAF_PATTERN.test(body) || WAF_PATTERN.test(detail) || !detail)) {
+        return {
+          ok: false, status: r.status, url: c, reach: "up", fault: "blocked", transient: true,
+          ms: ms(), viaProxy: Boolean(r.viaProxy),
+          message: `⚠ Запрос отклонён защитой шлюза (403) — похоже на WAF/геоблок, не на ключ${tail}${insecure}`,
+        };
+      }
       const hint = sentKey ? "проверь API key" : "ключ не отправлен — заполни API key";
       return {
-        ok: true, status: r.status, url: c, reach: "up",
+        ok: false, status: r.status, url: c, reach: "up",
         fault: sentKey ? "key" : "nokey", ms: ms(), viaProxy: Boolean(r.viaProxy),
-        message: `⚠ Нет доступа (${r.status}) — сервер жив, ${hint}`,
+        message: `⚠ Нет доступа (${r.status}) — сервер жив, ${hint}${tail}${insecure}`,
       };
     }
     if (r.status >= 300 && r.status < 400) {
@@ -1001,7 +1182,7 @@ export async function testCompletion({ baseURL, apiKey, apiFormat, modelId } = {
   const model = String(modelId || "").trim();
   if (!model) return { ok: false, message: "Не указана модель для проверки" };
 
-  const auth = probeHeaders(apiKey, apiFormat);
+  const auth = probeHeaders(apiKey, apiFormat, guard.url);
   if (auth.problem) return { ok: false, message: auth.problem, fault: "key" };
 
   const base = guard.url.toString().replace(/\/+$/, "");
@@ -1022,7 +1203,8 @@ export async function testCompletion({ baseURL, apiKey, apiFormat, modelId } = {
 
   const raw = await readLimitedResponseText(r, 2_000_000).catch(() => "");
   if (r.ok) {
-    return { ok: true, reach: "up", status: r.status, viaProxy: Boolean(r.viaProxy), message: `✓ Модель ответила (HTTP ${r.status}) — связка рабочая` };
+    const insecure = insecureTransportNote(guard.url, headersCarryKey(auth.headers));
+    return { ok: true, reach: "up", status: r.status, viaProxy: Boolean(r.viaProxy), message: `✓ Модель ответила (HTTP ${r.status}) — связка рабочая${insecure}` };
   }
   // Provider error bodies are the only place the real reason appears, so a
   // short excerpt is worth more than the status alone.
@@ -1041,6 +1223,11 @@ export async function testCompletion({ baseURL, apiKey, apiFormat, modelId } = {
   if (r.status === 401 || r.status === 403) {
     if (!headersCarryKey(auth.headers)) {
       return { ok: false, reach: "up", fault: "nokey", status: r.status, message: `Ключ не отправлен (${r.status}) — заполни API key${tail}` };
+    }
+    // Client-whitelist gates answer 401 without ever looking at the key.
+    const gate = clientGateMessage(detail);
+    if (gate) {
+      return { ok: false, reach: "up", fault: "client", status: r.status, message: gate };
     }
     // A 403 often means "your key is fine, this particular model is not
     // included in your plan" — checked live on a gateway that answered
@@ -1075,7 +1262,28 @@ export async function testCompletion({ baseURL, apiKey, apiFormat, modelId } = {
         message: `Слишком частые запросы (403) — ключ рабочий, сбавь темп или повтори позже${tail}`,
       };
     }
+    // Модель отключена для страны запроса. Это не тариф и не ключ: другой
+    // ключ из того же региона получит тот же 403.
+    if (r.status === 403 && REGION_PATTERN.test(detail)) {
+      return {
+        ok: false, reach: "up", fault: "region", status: r.status,
+        message: `Модель «${model}» недоступна в твоём регионе (403) — ключ рабочий; нужен прокси/VPN в поддерживаемой стране или другая модель${tail}`,
+      };
+    }
+    // WAF отклонил запрос до того, как его увидел провайдер.
+    if (r.status === 403 && (WAF_PATTERN.test(raw) || WAF_PATTERN.test(detail))) {
+      return {
+        ok: false, reach: "up", fault: "blocked", status: r.status, transient: true,
+        message: `Запрос отклонён защитой провайдера (403) — ключ не при чём; проверь прокси/VPN или повтори позже${tail}`,
+      };
+    }
     return { ok: false, reach: "up", fault: "key", status: r.status, message: `Ключ не принят (${r.status})${tail}` };
+  }
+  if (r.status === 402) {
+    return {
+      ok: false, reach: "up", fault: "plan", status: r.status,
+      message: `Требуется оплата или пополнение баланса (402) — ключ рабочий${tail}`,
+    };
   }
   if (r.status === 404) {
     // Модель не подключена на этой группе/тарифе — проверено live: dacall.ai
@@ -1162,14 +1370,35 @@ export function completionBody(model, apiFormat) {
   return body;
 }
 
-/** Pulls the human-readable message out of a provider's error body. */
+/**
+ * Pulls the human-readable message out of a provider's error body.
+ *
+ * OpenRouter is the reason this walks into `error.metadata.raw`. Its visible
+ * message is the useless "Provider returned error", while the actual cause
+ * ("This model is not available in your region") lives one level deeper. The
+ * old reader stopped at `error.message`, so a region block was filed as a
+ * rejected key and the user went off to regenerate a working token.
+ */
 function providerErrorMessage(raw) {
   const text = String(raw || "").trim();
   if (!text) return "";
   try {
     const j = JSON.parse(text);
-    const m = j?.error?.message || j?.message || j?.error || j?.detail;
-    if (typeof m === "string" && m.trim()) return m.trim().slice(0, 200);
+    const err = j?.error && typeof j.error === "object" ? j.error : null;
+    const parts = [];
+    const add = (v) => {
+      if (typeof v !== "string" || !v.trim()) return;
+      const s = v.trim();
+      if (!parts.some((p) => p.toLowerCase() === s.toLowerCase())) parts.push(s);
+    };
+    add(err?.message);
+    add(err?.metadata?.raw);
+    if (!parts.length) {
+      add(j?.message);
+      if (typeof j?.error === "string") add(j.error);
+      add(j?.detail);
+    }
+    if (parts.length) return parts.join(" — ").slice(0, 300);
   } catch { /* not JSON: fall through to the excerpt */ }
   return text.replace(/\s+/g, " ").slice(0, 160);
 }
@@ -1195,28 +1424,41 @@ const FREE_PATTERN = /(^|[:/\-_.\s])free([:/\-_.\s]|$)/i;
 // A credential problem reported with a 400 instead of a 401. Verified live:
 // Google's OpenAI-compatible endpoint answers 400 "Please pass a valid API
 // key". Narrow on purpose — "invalid model" must not match.
-const BAD_KEY_PATTERN =
-  /(valid api[ _-]?key|invalid api[ _-]?key|api[ _-]?key (is )?(invalid|missing|not valid)|missing api[ _-]?key|неверный ключ|некорректный ключ|令牌无效|密钥无效|无效.*(密钥|令牌)|未授权|授权失败|身份验证失败)/i;
-const ENTITLEMENT_PATTERN =
-  /(deposit|top.?up|insufficient (balance|credit|funds)|no credit|out of credit|upgrade your plan|not (included|available) in your plan|premium model|subscription required|payment required|требуется (пополнен|подписк|оплат)|недостаточно средств|пополните баланс|余额不足|余额为0|余额不够|请充值|欠费|账户余额不足)/i;
+// These patterns are exported for keypool.mjs, which embeds them into the
+// generated rotation plugin — one shared table, so the server's verdicts and
+// the plugin's cannot drift apart.
+export const BAD_KEY_PATTERN =
+  /(valid api[ _-]?key|invalid api[ _-]?key|api[ _-]?key (is )?(invalid|missing|not valid)|missing api[ _-]?key|API_KEY_INVALID|account_deactivated|неверный ключ|некорректный ключ|令牌无效|密钥无效|无效.*(密钥|令牌)|未授权|授权失败|身份验证失败)/i;
+export const ENTITLEMENT_PATTERN =
+  /(deposit|top.?up|insufficient (balance|credit|funds)|credit balance is too low|balance is too low|no credit|out of credit|upgrade your plan|not (included|available) in your plan|premium model|subscription required|payment required|требуется (пополнен|подписк|оплат)|недостаточно средств|пополните баланс|余额不足|余额为0|余额不够|请充值|欠费|账户余额不足)/i;
 // Шлюзы-агрегаторы (проверено live на dacall.ai): модель числится в /models,
 // но под неё нет свободных upstream-аккаунтов — прилетает 503
 // "No available accounts: no available accounts". Это ёмкость провайдера, а не
 // ключ и не модель: ретрай осмысленен, а смена модели обычно помогает сразу.
 // Отдельным паттерном, а не частью ENTITLEMENT: там fault "plan" без ретрая,
 // здесь нужен transient.
-const NO_ACCOUNTS_PATTERN = /no available accounts/i;
+export const NO_ACCOUNTS_PATTERN = /no available accounts/i;
 // Китайские агрегаторы говорят то же самое по-своему: «нет свободных каналов» —
 // тоже ёмкость, тоже ретраится и лечится сменой модели, а не ключа.
-const NO_CHANNEL_PATTERN = /无可用渠道|没有可用渠道|暂无可用|渠道不足/;
+export const NO_CHANNEL_PATTERN = /无可用渠道|没有可用渠道|暂无可用|渠道不足/;
 // Лимит частоты, пришедший не тем статусом: 403/400 с «too fast» вместо 429.
 // Без этого китайский троттлинг читался как «ключ не принят» и останавливал
 // батч, хотя ключ рабочий.
-const RATE_PATTERN = /rate.?limit|too many requests|请求过于频繁|请求.*频繁|稍后重试|限流|请求过快|过于频繁/i;
+export const RATE_PATTERN = /rate.?limit|too many requests|请求过于频繁|请求.*频繁|稍后重试|限流|请求过快|过于频繁/i;
 // Тот же класс шлюзов другим ключом отвечает 404
 // 'Model "x" is not supported by any configured account in this group':
 // модель не подключена на этой группе/тарифе, ключ при этом рабочий.
-const NOT_SUPPORTED_PATTERN = /not supported by any (configured )?account/i;
+export const NOT_SUPPORTED_PATTERN = /not supported by any (configured )?account/i;
+// Модель существует, ключ рабочий, но upstream не отдаёт её из этой страны.
+// Проверено live на OpenRouter/stealth/crouton-alpha: HTTP 403, message
+// "Provider returned error", а настоящая причина — в error.metadata.raw:
+// "This model is not available in your region." Смена ключа не помогает,
+// помогает другой регион (прокси/VPN) или другая модель.
+export const REGION_PATTERN = /user location (is )?not supported|not available in your (region|country)|not available in the (region|country)|(region|country).*(not (supported|available)|unsupported)|unsupported (region|country)|geo.?restrict|地区.*(不支持|不可用)|不支持.*(地区|区域)/i;
+// WAF/Cloudflare блокирует сам запрос до провайдера. OpenRouter отвечает так
+// на прямой запрос с этой машины ("Access denied by security policy"), хотя
+// через прокси тот же ключ работает. Это не отказ ключа.
+export const WAF_PATTERN = /access denied by security policy|security policy|just a moment|attention required|cf-error|cloudflare|captcha/i;
 
 function guessCapabilities(id) {
   const input = ["text"];
@@ -1467,7 +1709,7 @@ export async function fetchModels({ baseURL, apiKey, apiFormat } = {}) {
   const guard = validateProbeUrl(baseURL);
   if (!guard.ok) return { ok: false, models: [], message: guard.error };
 
-  const auth = probeHeaders(apiKey, apiFormat);
+  const auth = probeHeaders(apiKey, apiFormat, guard.url);
   if (auth.problem) return { ok: false, models: [], message: auth.problem };
   const headers = auth.headers;
   let lastErr = "";
@@ -1484,7 +1726,17 @@ export async function fetchModels({ baseURL, apiKey, apiFormat } = {}) {
     }
     if (r.ok) {
       let json;
-      try { json = JSON.parse(await readLimitedResponseText(r, 2_000_000)); } catch (e) {
+      let text;
+      try {
+        // Generous ceiling: big gateways already answer with ~2 MB of JSON,
+        // and a truncated read must surface as a size problem — reporting
+        // "не JSON" for it sends the user chasing a bug in a good response.
+        text = await readLimitedResponseText(r, 8_000_000);
+      } catch (e) {
+        lastErr = String(e?.message || e);
+        continue;
+      }
+      try { json = JSON.parse(text); } catch {
         lastErr = "ответ не является JSON";
         continue;
       }
@@ -1501,7 +1753,22 @@ export async function fetchModels({ baseURL, apiKey, apiFormat } = {}) {
       if (!headersCarryKey(headers)) {
         return { ok: false, models: [], reach: "up", fault: "nokey", message: `Сервер доступен (${r.status}), но ключ не отправлен — заполни API key` };
       }
-      return { ok: false, models: [], reach: "up", fault: "key", message: "Сервер доступен, но API-ключ не принят (401/403)" };
+      const body = await readLimitedResponseText(r, 8192).catch(() => "");
+      // ...and neither does a client-whitelist rejection, where the key was
+      // never read at all.
+      const gate = clientGateMessage(body);
+      if (gate) {
+        return { ok: false, models: [], reach: "up", fault: "client", message: gate };
+      }
+      const detail = providerErrorMessage(body);
+      const tail = detail ? ` — ${detail}` : "";
+      if (r.status === 403 && REGION_PATTERN.test(detail)) {
+        return { ok: false, models: [], reach: "up", fault: "region", status: r.status, message: `Эндпоинт недоступен в твоём регионе (403) — ключ рабочий${tail}` };
+      }
+      if (r.status === 403 && (WAF_PATTERN.test(body) || WAF_PATTERN.test(detail) || !detail)) {
+        return { ok: false, models: [], reach: "up", fault: "blocked", transient: true, status: r.status, message: `Запрос отклонён защитой шлюза (403) — похоже на WAF/геоблок, не на ключ${tail}` };
+      }
+      return { ok: false, models: [], reach: "up", fault: "key", status: r.status, message: `Сервер доступен, но API-ключ не принят (${r.status})${tail}` };
     }
     lastErr = `HTTP ${r.status}`;
     lastClass = null;

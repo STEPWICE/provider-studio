@@ -182,8 +182,15 @@ export async function loadDigest({ timeoutMs = 15000, refresh = false, fetchImpl
   }
   // Хотя бы одна половина есть, второй нет нигде: показать что есть, а не ноль.
   if (perks || news) {
+    const anythingFresh = !!(freshPerks || freshNews);
     return present({ at: Date.now(), as_of: "", perks, news }, {
-      stale: false, cachedAt: Date.now(), partial: true, error: errors.join("; "),
+      // A half served from the stale cache makes the answer stale, even if the
+      // other half just arrived: marking it fresh would present yesterday's
+      // perks as today's. And cachedAt is the cache's own timestamp, not
+      // "now" — re-labelling old data is how stale starts looking fresh.
+      stale: !anythingFresh,
+      cachedAt: anythingFresh ? Date.now() : (cached?.at || 0),
+      partial: true, error: errors.join("; "),
     });
   }
   // Сюда попадаем, только когда нет ни свежего, ни кэшированного: полный

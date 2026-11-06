@@ -297,6 +297,70 @@ if (IS_WINDOWS) {
     typeof E.SETX_MAX_LENGTH === "number" && E.SETX_MAX_LENGTH === 1024, String(E.SETX_MAX_LENGTH));
 }
 
+// ------------------------------------------------- audit helpers (orphan cleanup)
+// The audit lists key-like user variables nothing references, and removal must
+// never delete a variable the config still needs.
+
+{
+  check("key-like names are recognised",
+    E.KEY_LIKE_RE.test("FOO_API_KEY") && E.KEY_LIKE_RE.test("MY_TOKEN") && !E.KEY_LIKE_RE.test("Path"));
+  eq("removing an invalid name is refused", E.removeUserEnvVar("no-dashes", {}).ok, false);
+  check("removing a referenced variable is refused",
+    E.removeUserEnvVar("USED_KEY", { referenced: ["USED_KEY"] }).ok === false);
+  const names = E.listUserEnvNames();
+  check("the user-scope listing is an array", Array.isArray(names), JSON.stringify(names).slice(0, 80));
+  if (IS_WINDOWS) {
+    const NAME = "PS_ENV_AUDIT_SCRATCH_API_KEY";
+    try {
+      execFileSync("setx", [NAME, "audit-scratch"], { stdio: "ignore", windowsHide: true });
+      E.clearEnvCache();
+      check("a scratch variable shows up in the listing",
+        E.listUserEnvNames().includes(NAME), NAME);
+      check("an unreferenced scratch variable can be removed",
+        E.removeUserEnvVar(NAME, { referenced: ["OTHER_KEY"] }).ok === true);
+      check("it is gone from the registry afterwards",
+        E.lookupEnv(NAME, { useCache: false }).set === false);
+    } finally {
+      try {
+        execFileSync("reg", ["delete", "HKCU\\Environment", "/v", NAME, "/f"],
+          { stdio: "ignore", windowsHide: true });
+      } catch { /* already gone */ }
+      delete process.env[NAME];
+      E.clearEnvCache();
+    }
+  } else {
+    console.log("SKIP  audit listing round-trip (Windows only)");
+  }
+}
+
+// ------------------------------------------------- protected vars & powershell
+{
+  for (const v of ["PATH", "TEMP", "TMP", "COMSPEC", "SYSTEMROOT", "WINDIR", "USERPROFILE", "HOMEDRIVE"]) {
+    check(`isProtectedEnvVar identifies ${v}`, E.isProtectedEnvVar(v));
+    const setR = E.setUserEnvVar(v, "hacked");
+    eq(`setUserEnvVar refuses protected var ${v}`, setR.ok, false);
+    check(`setUserEnvVar error message for ${v}`, setR.error.includes("защищена"));
+    const rmR = E.removeUserEnvVar(v);
+    eq(`removeUserEnvVar refuses protected var ${v}`, rmR.ok, false);
+    check(`removeUserEnvVar error message for ${v}`, rmR.error.includes("защищена"));
+  }
+
+  // >1024 characters command
+  const longVal = "x".repeat(1025);
+  const psCmd = E.setEnvCommand("MY_LONG_KEY", longVal);
+  if (IS_WINDOWS) {
+    check("long value generates PowerShell command", psCmd.startsWith("powershell -Command"));
+    check("PowerShell command sets EnvironmentVariable", psCmd.includes("[Environment]::SetEnvironmentVariable('MY_LONG_KEY'"));
+  }
+
+  // Ghost keys regex matches shard keys like OPENROUTER_API_KEY_2
+  check("KEY_LIKE_RE matches OPENROUTER_API_KEY_2", E.KEY_LIKE_RE.test("OPENROUTER_API_KEY_2"));
+  check("KEY_LIKE_RE matches CEREBRAS_API_KEY_10", E.KEY_LIKE_RE.test("CEREBRAS_API_KEY_10"));
+  check("KEY_LIKE_RE matches GROQ_API_KEY", E.KEY_LIKE_RE.test("GROQ_API_KEY"));
+  check("KEY_LIKE_RE does not match PATH", !E.KEY_LIKE_RE.test("PATH"));
+  check("KEY_LIKE_RE does not match USERPROFILE", !E.KEY_LIKE_RE.test("USERPROFILE"));
+}
+
 console.log(`\n${pass}/${pass + fails.length} passed`);
 if (fails.length) {
   console.log("Failed:");

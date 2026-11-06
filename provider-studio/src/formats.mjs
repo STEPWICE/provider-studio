@@ -40,14 +40,26 @@ export const OUTPUT_TYPES = MODALITIES;
 // model.status enum.
 export const MODEL_STATUSES = ["active", "beta", "alpha", "deprecated"];
 
-/** Fields opencode accepts directly on a provider block. Anything else is rejected. */
-export const PROVIDER_FIELDS = ["api", "name", "env", "id", "npm", "whitelist", "blacklist", "options", "models"];
+/**
+ * Fields opencode accepts directly on a provider block. Anything else is rejected.
+ *
+ * The V2 names (`package`, `settings`, `headers`, `body`, `canonical`,
+ * `compatibility`) are listed next to the V1 ones (`npm`, `options`) because a
+ * V2 config is a first-class input too: the tool imports, validates and edits
+ * whatever is on disk, and flagging every V2 field as "не входит в схему"
+ * would be a false alarm on a perfectly valid file.
+ */
+export const PROVIDER_FIELDS = [
+  "api", "name", "env", "id", "npm", "whitelist", "blacklist", "options", "models",
+  "package", "settings", "headers", "body", "canonical", "compatibility",
+];
 
-/** Fields opencode accepts on a model entry. */
+/** Fields opencode accepts on a model entry (V1 and V2 shapes). */
 export const MODEL_FIELDS = [
   "id", "name", "family", "release_date", "attachment", "reasoning", "temperature",
   "tool_call", "interleaved", "cost", "limit", "modalities", "experimental",
   "status", "provider", "options", "headers", "variants",
+  "capabilities", "modelID", "settings", "package", "compatibility", "body", "disabled",
 ];
 
 /**
@@ -114,6 +126,32 @@ export function slugify(name) {
     return `provider-${(h >>> 0).toString(36)}`;
   }
   return "provider";
+}
+
+/**
+ * Maps a requested provider identifier onto the key actually present in a
+ * provider map.
+ *
+ * Config keys are arbitrary strings: `my_provider` and `dot.name` are legal and
+ * slugify() would rewrite them to `my-provider` / `dot-name`, which the file
+ * never contained. An exact match therefore wins; the slug is only a fallback
+ * for callers that still pass a display name.
+ */
+export function resolveProviderKey(wanted, providers) {
+  const map = providers && typeof providers === "object" && !Array.isArray(providers) ? providers : {};
+  const raw = String(wanted ?? "").trim();
+  if (!raw) return "";
+  if (Object.prototype.hasOwnProperty.call(map, raw)) return raw;
+  const slug = slugify(raw);
+  if (slug && Object.prototype.hasOwnProperty.call(map, slug)) return slug;
+  const lower = raw.toLowerCase();
+  const sameCase = Object.keys(map).find((k) => k.toLowerCase() === lower);
+  if (sameCase) return sameCase;
+  // Last resort: a key whose slug is what the caller asked for. Ambiguous
+  // matches (two different keys slugging the same) are refused rather than
+  // guessed, so a delete can never hit the wrong provider.
+  const bySlug = slug ? Object.keys(map).filter((k) => slugify(k) === slug) : [];
+  return bySlug.length === 1 ? bySlug[0] : "";
 }
 
 /** Modalities that require `attachment: true` before opencode allows file input. */
@@ -183,10 +221,19 @@ export function buildModelEntry(m) {
   const costIn = m.costInput;
   const costOut = m.costOutput;
   if (costIn !== "" && costIn != null && costOut !== "" && costOut != null) {
-    const cost = { input: num(costIn), output: num(costOut) };
-    if (m.costCacheRead !== "" && m.costCacheRead != null) cost.cache_read = num(m.costCacheRead);
-    if (m.costCacheWrite !== "" && m.costCacheWrite != null) cost.cache_write = num(m.costCacheWrite);
-    entry.cost = cost;
+    const ci = Number(costIn);
+    const co = Number(costOut);
+    // Garbage ("abc") used to become 0 via num(), and a zeroed cost reads as
+    // "free" downstream. A price we cannot parse is unknown, not zero —
+    // and unknown stays out of the config.
+    if (Number.isFinite(ci) && Number.isFinite(co)) {
+      const cost = { input: ci, output: co };
+      const cr = Number(m.costCacheRead);
+      const cw = Number(m.costCacheWrite);
+      if (m.costCacheRead !== "" && m.costCacheRead != null && Number.isFinite(cr)) cost.cache_read = cr;
+      if (m.costCacheWrite !== "" && m.costCacheWrite != null && Number.isFinite(cw)) cost.cache_write = cw;
+      entry.cost = cost;
+    }
   }
 
   if (input.some((t) => ATTACHMENT_MODALITIES.has(t))) entry.attachment = true;
@@ -219,7 +266,12 @@ export function buildOpencodeProvider(provider) {
   const models = {};
   for (const m of provider.models || []) {
     const built = buildModelEntry(m);
-    if (built) models[built.id] = built.entry;
+    // defineProperty, not assignment: an id literally named "__proto__" would
+    // hit the prototype setter on a plain object, and the model would vanish
+    // from Object.keys while looking successfully written.
+    if (built) Object.defineProperty(models, built.id, {
+      value: built.entry, enumerable: true, writable: true, configurable: true,
+    });
   }
 
   const block = { npm: fmt.opencodeNpm };
@@ -274,13 +326,19 @@ export function buildProviderChanges(provider, opts = {}) {
   // silently create a second provider.
   const keySource = trimmed(provider?.key) || trimmed(provider?.name) || displayName;
   if (!keySource) return { ok: false, error: "Поле Name обязательно" };
-  const providerKey = slugify(keySource);
 
   const fmt = FORMATS[provider.apiFormat] || FORMATS["openai-chat"];
   const changes = [];
 
-  const oldKey = slugify(previousKey || "");
-  const renaming = !!previousKey && oldKey !== providerKey;
+  const prevKeyRaw = trimmed(previousKey);
+  const slugged = slugify(keySource);
+  // A block can carry a key slugify() would rewrite (`my_provider`,
+  // `dot.name`). Editing that provider must update the block that exists, not
+  // create a sibling under the slug — but only while the typed name still maps
+  // to the same slug, so changing the name keeps working as a rename.
+  const providerKey = prevKeyRaw && slugged === slugify(prevKeyRaw) ? prevKeyRaw : slugged;
+  const oldKey = prevKeyRaw;
+  const renaming = !!prevKeyRaw && oldKey !== providerKey;
   const existingProviders = existingConfig?.provider || {};
   if (renaming) {
     if (!existingProviders[oldKey]) {
@@ -291,6 +349,13 @@ export function buildProviderChanges(provider, opts = {}) {
     }
     // Rename first so the merges below land on the new key.
     changes.push({ op: "rename", path: ["provider", oldKey], key: providerKey });
+    // The key also lives in the enable/disable lists: skipping them leaves a
+    // dead entry under the old name and drops the provider under the new one.
+    for (const listField of ["disabled_providers", "enabled_providers"]) {
+      const arr = existingConfig?.[listField];
+      if (!Array.isArray(arr) || !arr.includes(oldKey)) continue;
+      changes.push({ op: "set", path: [listField], value: arr.map((d) => (d === oldKey ? providerKey : d)) });
+    }
   }
 
   const base = ["provider", providerKey];
@@ -330,6 +395,19 @@ export function buildProviderChanges(provider, opts = {}) {
 
   if (Object.keys(options).length) merge.options = options;
   changes.push({ op: "merge", path: base, value: merge });
+
+  // A provider listed in `disabled_providers` stays hidden in opencode no matter
+  // how complete its block is. Adding or saving it from the studio is an
+  // explicit "I want this provider", so drop the stale entry — otherwise a
+  // re-added provider silently does nothing and the UI reports success.
+  let reenabled = false;
+  const disabledList = existingConfig?.disabled_providers;
+  if (Array.isArray(disabledList) && disabledList.includes(providerKey)) {
+    const next = disabledList.filter((d) => d !== providerKey);
+    if (next.length) changes.push({ op: "set", path: ["disabled_providers"], value: next });
+    else changes.push({ op: "delete", path: ["disabled_providers"] });
+    reenabled = true;
+  }
 
   // Drop what is no longer configured, so a cleared field does not linger.
   if (!(provider.useEnvVar && envVarName) && prior?.env) {
@@ -404,7 +482,7 @@ export function buildProviderChanges(provider, opts = {}) {
     }
   }
 
-  return { ok: true, providerKey, previousKey: renaming ? oldKey : "", defaultModel, changes };
+  return { ok: true, providerKey, previousKey: renaming ? oldKey : "", defaultModel, changes, reenabled };
 }
 
 /**
@@ -427,9 +505,19 @@ export function buildRemovalChanges(key, existingConfig) {
  * which owns the filesystem.
  */
 export function buildRemovals(keys, existingConfig, { pluginFileName } = {}) {
-  const list = (Array.isArray(keys) ? keys : [keys]).map((k) => slugify(k || "")).filter(Boolean);
-  if (!list.length) return { ok: false, error: "Не указан провайдер" };
   const providers = existingConfig?.provider || {};
+  const requested = Array.isArray(keys) ? keys : [keys];
+  const list = [];
+  for (const raw of requested) {
+    const wanted = String(raw ?? "").trim();
+    if (!wanted) continue;
+    // Exact key first: the config may hold `my_provider`, which slugify would
+    // rewrite into a key that does not exist. A slug is only the fallback for
+    // callers that still pass a display name.
+    const key = resolveProviderKey(wanted, providers) || slugify(wanted);
+    if (key && !list.includes(key)) list.push(key);
+  }
+  if (!list.length) return { ok: false, error: "Не указан провайдер" };
   const found = list.filter((k) => providers[k]);
   const missing = list.filter((k) => !providers[k]);
   if (!found.length) {
@@ -439,6 +527,35 @@ export function buildRemovals(keys, existingConfig, { pluginFileName } = {}) {
   }
   const changes = found.map((k) => ({ op: "delete", path: ["provider", k] }));
   const orphaned = [];
+
+  // Variables only the doomed blocks reference: after the removal they are
+  // orphans. Reported, not deleted — an env var can be shared with something
+  // outside opencode, and the env audit is the place that can confirm it.
+  const envNamesOf = (p) => {
+    const out = [];
+    const raw = typeof p?.options?.apiKey === "string" ? p.options.apiKey
+      : (typeof p?.apiKey === "string" ? p.apiKey : "");
+    const m = raw.match(/^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$/)
+      || raw.match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/);
+    if (m) out.push(m[1]);
+    for (const n of Array.isArray(p?.env) ? p.env : []) {
+      if (typeof n === "string" && n.trim()) out.push(n.trim());
+    }
+    return out;
+  };
+  const survivors = new Set();
+  for (const [k, p] of Object.entries(providers)) {
+    if (found.includes(k)) continue;
+    for (const n of envNamesOf(p)) survivors.add(n.toLowerCase());
+  }
+  const envOrphans = [];
+  for (const k of found) {
+    for (const n of envNamesOf(providers[k])) {
+      const lower = n.toLowerCase();
+      if (survivors.has(lower) || envOrphans.some((x) => x.toLowerCase() === lower)) continue;
+      envOrphans.push(n);
+    }
+  }
 
   const remaining = Object.keys(providers).filter((k) => !found.includes(k));
   const fallbackFrom = (keys) => {
@@ -480,7 +597,7 @@ export function buildRemovals(keys, existingConfig, { pluginFileName } = {}) {
     }
   }
 
-  return { ok: true, providerKeys: found, missing, orphaned, changes, pluginEntry };
+  return { ok: true, providerKeys: found, missing, orphaned, envOrphans, changes, pluginEntry };
 }
 
 /** Basename of a plugin entry, which may be a string or a [name, options] pair. */
@@ -584,18 +701,30 @@ export function detectApiFormat(block) {
   return "openai-chat";
 }
 
+const FREE_ID_PATTERN = /(^|[:/\-_.\s])free([:/\-_.\s]|$)/i;
+
 /** Turns a stored model entry back into the shape the form edits. */
 export function modelEntryToForm(id, entry) {
   const e = entry && typeof entry === "object" ? entry : {};
+  // V2 moved capabilities out of modalities/attachment/reasoning/tool_call.
+  // Reading both shapes keeps a config written by hand in V2 from losing its
+  // flags the moment it is loaded into the form and applied back.
+  const caps = e.capabilities && typeof e.capabilities === "object" ? e.capabilities : null;
+  const inTypes = Array.isArray(caps?.input) ? caps.input : e.modalities?.input;
+  const outTypes = Array.isArray(caps?.output) ? caps.output : e.modalities?.output;
+  const reasoning = typeof caps?.reasoning === "object" && caps.reasoning !== null
+    ? caps.reasoning.supported !== false
+    : typeof caps?.reasoning === "boolean" ? caps.reasoning : e.reasoning === true;
+  const tools = typeof caps?.tools === "boolean" ? caps.tools : e.tool_call !== false;
   const out = {
     id,
     name: typeof e.name === "string" ? e.name : id,
-    inputTypes: Array.isArray(e.modalities?.input) ? e.modalities.input.filter((t) => VALID_MODALITIES.has(t)) : ["text"],
-    outputTypes: Array.isArray(e.modalities?.output) ? e.modalities.output.filter((t) => VALID_MODALITIES.has(t)) : ["text"],
+    inputTypes: Array.isArray(inTypes) ? inTypes.filter((t) => VALID_MODALITIES.has(t)) : ["text"],
+    outputTypes: Array.isArray(outTypes) ? outTypes.filter((t) => VALID_MODALITIES.has(t)) : ["text"],
     contextWindow: num(e.limit?.context) || "",
     maxOutput: num(e.limit?.output) || "",
-    reasoning: e.reasoning === true,
-    toolUse: e.tool_call !== false,
+    reasoning,
+    toolUse: tools,
   };
   if (!out.inputTypes.length) out.inputTypes = ["text"];
   if (!out.outputTypes.length) out.outputTypes = ["text"];
@@ -604,6 +733,22 @@ export function modelEntryToForm(id, entry) {
     out.costOutput = e.cost.output ?? "";
     if (e.cost.cache_read != null) out.costCacheRead = e.cost.cache_read;
     if (e.cost.cache_write != null) out.costCacheWrite = e.cost.cache_write;
+    if (out.costInput !== "" && out.costOutput !== "") {
+      const input = Number(out.costInput);
+      const output = Number(out.costOutput);
+      if (Number.isFinite(input) && Number.isFinite(output)) {
+        out.free = input === 0 && output === 0;
+        out.freeSource = "price";
+      }
+    }
+  }
+  if (out.freeSource === undefined && FREE_ID_PATTERN.test(id)) {
+    out.free = true;
+    out.freeSource = "name";
+  }
+  if (out.freeSource === undefined) {
+    out.free = false;
+    out.freeSource = "unknown";
   }
   if (typeof e.release_date === "string") out.releaseDate = e.release_date;
   if (typeof e.family === "string") out.family = e.family;

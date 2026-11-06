@@ -36,6 +36,9 @@ export const AGREEMENT_TOLERANCE = 0.05;
 // right shape. It is not persisted: a stale file on disk that nobody expires is
 // a worse failure than one extra download per session.
 const CACHE_TTL_MS = 60 * 60 * 1000;
+// Failures are cached too, but briefly: an unreachable catalogue otherwise
+// costs a fresh 4.4 MB attempt on every single UI request that touches it.
+const NEGATIVE_TTL_MS = 60 * 1000;
 let cache = null;
 
 export function clearCatalogCache() {
@@ -91,7 +94,7 @@ export function consensusList(values) {
  * and the tool worked without it before.
  */
 export async function loadCatalog({ timeoutMs = 20000, fetchImpl } = {}) {
-  if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.value;
+  if (cache && Date.now() - cache.at < cache.ttl) return cache.value;
 
   let db;
   // Behind a corporate proxy or VPN a plain fetch never leaves the machine, so
@@ -105,12 +108,14 @@ export async function loadCatalog({ timeoutMs = 20000, fetchImpl } = {}) {
       : fetch(u, { signal: AbortSignal.timeout(timeoutMs) })));
     const r = await get(CATALOG_URL);
     if (!r.ok) {
-      return { ok: false, error: `models.dev ответил ${r.status}`, byId: new Map(), providers: new Map() };
+      const value = { ok: false, error: `models.dev ответил ${r.status}`, byId: new Map(), providers: new Map() };
+      cache = { at: Date.now(), ttl: NEGATIVE_TTL_MS, value };
+      return value;
     }
     db = JSON.parse(await readLimitedResponseText(r, 16_000_000));
   } catch (e) {
     const why = e && e.message ? e.message : String(e);
-    return {
+    const value = {
       ok: false,
       // Name the proxy when there is one: otherwise a broken tunnel reads as a
       // dead catalogue and the user looks for the fault in the wrong place.
@@ -118,6 +123,8 @@ export async function loadCatalog({ timeoutMs = 20000, fetchImpl } = {}) {
       byId: new Map(),
       providers: new Map(),
     };
+    cache = { at: Date.now(), ttl: NEGATIVE_TTL_MS, value };
+    return value;
   }
 
   const byId = new Map();
@@ -133,7 +140,7 @@ export async function loadCatalog({ timeoutMs = 20000, fetchImpl } = {}) {
   }
 
   const value = { ok: true, byId, providers, count: byId.size, error: null };
-  cache = { at: Date.now(), value };
+  cache = { at: Date.now(), ttl: CACHE_TTL_MS, value };
   return value;
 }
 
@@ -150,13 +157,14 @@ export function lookupModel(catalog, id) {
 
   const bare = clean.includes("/") ? clean.slice(clean.indexOf("/") + 1) : clean;
   // Strip an OpenRouter-style ":free"/":nitro" suffix — it marks a tier, not a
-  // different model.
-  const stem = bare.includes(":") ? bare.slice(0, bare.indexOf(":")) : bare;
+  // different model. Case-folded: "GPT-4o" and "gpt-4o" are the same model,
+  // and a case-sensitive compare just never matched them.
+  const stem = (bare.includes(":") ? bare.slice(0, bare.indexOf(":")) : bare).toLowerCase();
   const hits = [];
   for (const [mid, list] of catalog.byId) {
     const mbare = mid.includes("/") ? mid.slice(mid.indexOf("/") + 1) : mid;
     const mstem = mbare.includes(":") ? mbare.slice(0, mbare.indexOf(":")) : mbare;
-    if (mstem === stem) hits.push(...list);
+    if (mstem.toLowerCase() === stem) hits.push(...list);
   }
   return { entries: hits, matchedBy: hits.length ? "name" : null };
 }

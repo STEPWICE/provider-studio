@@ -267,6 +267,30 @@ export const PRESETS = [
     discover: true,
   },
   {
+    // Verified live 2026-10-21: GET /v1/models 200 and a real completion on
+    // deepseek-v4-flash (gpt-6-astra / gpt-6.1-sol were listed too; Claude
+    // models had no channel at that moment and answered 503).
+    //
+    // This gateway authenticates the *client* as well as the key: any UA outside
+    // its supported-harness whitelist gets 401 "unauthorized client detected"
+    // before the key is read, which is why a plain curl (or this tool's own
+    // probe UA) fails with a perfectly good token. The headers below are what
+    // makes opencode look like a supported client.
+    id: "agentrouter",
+    label: "AgentRouter",
+    hint: "Бесплатные кредиты, Claude/GPT/GLM/DeepSeek. Требует UA поддерживаемого клиента.",
+    baseURL: "https://agentrouter.org/v1",
+    apiFormat: "openai-chat",
+    envVarName: "AGENTROUTER_API_KEY",
+    keyURL: "https://agentrouter.org/console/token",
+    needsKey: true,
+    discover: true,
+    headers: {
+      "User-Agent": "claude-cli/2.1.158 (external, sdk-cli)",
+      "x-app": "cli",
+    },
+  },
+  {
     id: "custom",
     label: "Другой (вручную)",
     hint: "Любой OpenAI- или Anthropic-совместимый эндпоинт.",

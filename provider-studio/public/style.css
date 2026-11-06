@@ -27,6 +27,17 @@
 
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
+
+/* Inline stroke icons. The static sprite and the JS helper both use these. */
+.svg-sprite { display: none; }
+.ico {
+  width: 14px; height: 14px; flex: 0 0 auto;
+  fill: none; stroke: currentColor; stroke-width: 1.8;
+  stroke-linecap: round; stroke-linejoin: round; vertical-align: -2px;
+}
+.btn .ico { width: 14px; height: 14px; }
+.btn-sm .ico, .btn-mini .ico { width: 12px; height: 12px; }
+.btn-eye .ico { width: 17px; height: 17px; }
 body {
   background:
     radial-gradient(980px 520px at 88% -12%, rgba(109, 108, 255, .16), transparent 64%),
@@ -159,6 +170,7 @@ body {
 .provider-row:hover .del,
 .provider-row:focus-within .ren,
 .provider-row:focus-within .del { opacity: 1; width: auto; padding: 3px 4px; }
+.provider-row .ren .ico, .provider-row .del .ico { width: 12px; height: 12px; pointer-events: none; }
 .provider-row .ren:hover { color: var(--accent-2); background: rgba(99,102,241,.12); }
 /* Deletion reads red; the tooltip spells out that it removes the provider
    from the config as well as from the list. */
@@ -182,7 +194,7 @@ body {
 
 .side-foot { margin-top: auto; padding-top: 14px; border-top: 1px solid rgba(255, 255, 255, .055); }
 
-.main { flex: 1; min-width: 0; overflow-y: auto; overflow-x: hidden; padding: 28px 42px 32px; }
+.main { flex: 1; min-width: 0; overflow-y: auto; overflow-x: hidden; padding: 28px 42px 26px; }
 .topbar {
   display: flex; justify-content: space-between; align-items: flex-start;
   gap: 24px; margin-bottom: 24px; padding-bottom: 20px; min-width: 0;
@@ -239,6 +251,50 @@ body {
   max-height: calc(100vh - 64px); overflow-y: auto;
 }
 
+/* One pane at a time. Before this the column was a growing stack: every click
+   appended a card below the previous one, so the page got taller and the
+   output the user asked for could land off-screen. */
+.side-tabs {
+  display: flex; gap: 4px; padding: 4px; min-width: 0;
+  background: rgba(8, 12, 20, .82); border: 1px solid rgba(255, 255, 255, .07);
+  border-radius: 10px;
+  /* Long diagnostics/perks lists scroll the bounded column; the tabs must not
+     scroll away with them, or switching panes means going back to the top. */
+  position: sticky; top: 0; z-index: 2;
+  backdrop-filter: blur(8px);
+}
+.side-tab {
+  flex: 1; min-width: 0; min-height: 31px; padding: 5px 8px;
+  border: 1px solid transparent; border-radius: 7px;
+  background: transparent; color: var(--muted);
+  font: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.side-tab:hover { color: var(--text); background: rgba(255, 255, 255, .045); }
+.side-tab.on {
+  color: #eef1ff; background: rgba(109, 108, 255, .17);
+  border-color: rgba(129, 140, 248, .28);
+}
+.tab-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent-2);
+  box-shadow: 0 0 0 3px rgba(109, 108, 255, .14);
+}
+.tab-dot[hidden], .tab-count[hidden] { display: none !important; }
+.tab-count {
+  min-width: 17px; height: 17px; padding: 0 5px; border-radius: 99px;
+  display: inline-grid; place-items: center;
+  background: rgba(255, 255, 255, .08); color: #c7d2fe;
+  font-size: 9.5px; font-weight: 700;
+}
+.side-pane {
+  display: flex; flex-direction: column; gap: 16px; min-width: 0;
+  /* No scroll anchoring here: inserting a report must not push the viewport. */
+  overflow-anchor: none;
+}
+.side-pane[hidden] { display: none !important; }
+.side-pane > .issues, .side-pane > .results, .side-pane > .backups { min-width: 0; }
+
 /* Below this the editor would be narrower than the side column, so collapse to
    one stack instead of shipping two cramped tracks. The floor counts the
    sidebar, main padding, both track minimums and the gap. */
@@ -290,6 +346,39 @@ body {
 .card-head { display: flex; flex-direction: column; gap: 18px; }
 .card-side { min-width: 0; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+/* Optional form block: closed it is one thin line, open it is the old pair of
+   fields. The summary carries the current format and pool count, so collapsing
+   it never hides state. */
+.fold {
+  border-top: 1px solid rgba(255, 255, 255, .065);
+  padding-top: 13px;
+}
+.fold > summary {
+  list-style: none; cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+  color: #b8c5d9; font-size: 11.5px; font-weight: 600;
+  padding: 2px 0;
+}
+.fold > summary::-webkit-details-marker { display: none; }
+.fold > summary::before {
+  content: ""; width: 6px; height: 6px; flex-shrink: 0;
+  border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg); transition: transform .15s;
+}
+.fold[open] > summary::before { transform: rotate(45deg); }
+.fold > summary:hover { color: var(--text); }
+.fold > summary .ico { width: 13px; height: 13px; color: var(--accent-2); }
+.fold-meta {
+  margin-left: auto; min-width: 0; color: var(--muted);
+  font-size: 10.5px; font-weight: 500; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.fold-body { display: flex; flex-direction: column; gap: 18px; padding-top: 16px; }
+
+.models-more {
+  align-self: center; margin-top: 2px; color: var(--accent-2);
+}
 
 .field { display: flex; flex-direction: column; gap: 7px; }
 .field label { font-size: 11.5px; color: #b8c5d9; font-weight: 600; letter-spacing: .012em; }
@@ -381,6 +470,14 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
    making them the hardest thing to read. */
 .fmt-note { font-size: 11.5px; color: var(--muted); margin-top: 4px; line-height: 1.55; }
 .fmt-note.warn { color: #fbbf24; }
+.fmt-note.is-saved { color: var(--ok); }
+/* An env-backed key is intentionally not echoed into the field; a quiet green
+   edge says "stored" without painting a fake key or a red-looking empty box. */
+#f-apikey.has-saved-key {
+  border-color: rgba(52, 211, 153, .34);
+  background: rgba(52, 211, 153, .035);
+}
+#f-apikey.has-saved-key::placeholder { color: #6ee7b7; opacity: .8; }
 
 .models-block { margin-top: 26px; border-top: 1px solid rgba(255, 255, 255, .065); padding-top: 22px; }
 .models-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 13px; }
@@ -423,7 +520,12 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
 .batch-status.err { border-color: var(--err); color: var(--err); }
 .batch-status.warn { border-color: var(--warn); color: var(--warn); }
 .batch-stop { margin-top: 4px; color: var(--muted); }
-.model-row .rm { color: var(--muted); background: none; border: 0; cursor: pointer; font-size: 14px; opacity: 0; transition: all .15s; }
+.model-row .rm {
+  width: 24px; height: 24px; display: inline-grid; place-items: center;
+  color: var(--muted); background: none; border: 0; border-radius: 5px;
+  cursor: pointer; font-size: 14px; opacity: 0; transition: all .15s;
+}
+.model-row .rm .ico { width: 13px; height: 13px; }
 .model-row:hover .rm,
 .model-row:focus-within .rm { opacity: 1; }
 .model-row .rm:hover { color: var(--err); }
@@ -561,6 +663,7 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
   border-radius: var(--radius-sm); min-height: 38px; padding: 8px 14px; font-size: 12.5px; cursor: pointer;
   font-family: inherit; transition: background .15s, border-color .15s, color .15s, transform .15s, box-shadow .15s;
   font-weight: 600; line-height: 1.2; white-space: nowrap;
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
 }
 .btn:hover {
   border-color: var(--border-2); background: rgba(255, 255, 255, .065);
@@ -639,6 +742,40 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
   padding: 12px; font-size: 11px; overflow-x: auto; white-space: pre-wrap;
   font-family: var(--mono); color: var(--text); margin: 12px 0 0;
 }
+
+/* Smart routes: compact recommendation cards, one apply button each. */
+.route-card { padding: 16px; }
+.route-title { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.route-title h3 { margin: 0; }
+.route-title > .tag { margin-left: auto; }
+.route-row {
+  margin-top: 10px; padding: 10px 11px;
+  border: 1px solid rgba(255, 255, 255, .07); border-radius: 9px;
+  background: rgba(5, 9, 16, .45); min-width: 0;
+}
+.route-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.route-kind {
+  font-size: 10px; font-weight: 700; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--accent-2);
+}
+.route-health {
+  margin-left: auto; display: inline-flex; align-items: center; gap: 3px;
+  font-size: 10px; color: var(--muted); white-space: nowrap;
+}
+.route-health .ico { width: 11px; height: 11px; }
+.route-health.ok { color: var(--ok); }
+.route-health.warn { color: var(--warn); }
+.route-health.err { color: var(--err); }
+.route-model {
+  margin-top: 4px; font-family: var(--mono); font-size: 11px;
+  color: #e2e8f0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.route-model > span { color: var(--muted); padding: 0 1px; }
+.route-why { margin-top: 3px; font-size: 10.5px; color: var(--muted); line-height: 1.45; }
+.route-actions { display: flex; justify-content: flex-end; margin-top: 7px; }
+.route-actions .btn-mini { margin: 0; }
+.route-actions .current { display: inline-flex; align-items: center; gap: 4px; color: var(--ok); }
+.route-actions .current .ico { width: 11px; height: 11px; }
 
 .modal-backdrop {
   position: fixed; inset: 0;
@@ -999,6 +1136,7 @@ input[type="checkbox"] { width: auto; accent-color: var(--accent); }
   .config-picker { width: 100%; max-width: 100%; }
   .opencode-chip { max-width: 100%; }
   .col-side { max-height: none; }
+  .side-tabs { position: static; }
 }
 
 /* Narrow screens: the row is a single line of three fixed-width groups. The

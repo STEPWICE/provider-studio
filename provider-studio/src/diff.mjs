@@ -195,29 +195,48 @@ export function toUnifiedText(diff, context = 3) {
 // browser or a log. The diff of a config full of keys is otherwise a neat way to
 // leak every one of them at once. Both quote styles are covered: the JSONC
 // parser accepts single-quoted strings, so a hand-written
-// 'apiKey': 'sk-…' would otherwise sail through unmasked.
-const SECRET_KEYS = /["'](apiKey|api_key|token|secret|password|authorization)["']\s*:\s*["']/i;
+// 'apiKey': 'sk-…' would otherwise sail through unmasked. x-api-key is the
+// way Anthropic-compatible providers authenticate, so it is a secret too.
+const SECRET_KEYS = /["'](api[-_]?key|x[-_]api[-_]key|token|secret|password|authorization|private[-_]?key)["']\s*:\s*(["'])/gi;
 
 /** Masks secret values in a single line, keeping enough to recognise the key. */
 export function maskSecretsInLine(line) {
   const s = String(line ?? "");
-  const m = s.match(SECRET_KEYS);
-  if (!m) return s;
-  const quote = m[0].slice(-1);
-  const valueStart = s.indexOf(quote, s.indexOf(":", s.indexOf(m[1]))) + 1;
-  if (valueStart <= 0) return s;
-  const valueEnd = s.indexOf(quote, valueStart);
-  if (valueEnd < 0) return s;
-  const value = s.slice(valueStart, valueEnd);
-  // Ссылки — не секреты, а то, что пользователь хочет видеть: env-переменная
-  // или путь к файлу с ключом.
-  if (/^\{env:[A-Za-z_][A-Za-z0-9_]*\}$/.test(value) || /^\{file:[^}]+\}$/.test(value) || /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(value)) return s;
-  if (!value) return s;
-  const keep = value.length > 12 ? 4 : 0;
-  const masked = keep
-    ? value.slice(0, keep) + "…" + "*".repeat(6)
-    : "*".repeat(Math.min(8, value.length));
-  return s.slice(0, valueStart) + masked + s.slice(valueEnd);
+  SECRET_KEYS.lastIndex = 0;
+  let out = "";
+  let cursor = 0;
+  let changed = false;
+  let m;
+  // Every match on the line is masked, not just the first: an inline object
+  // { "apiKey": "…", "token": "…" } would otherwise show the second secret.
+  while ((m = SECRET_KEYS.exec(s))) {
+    const quote = m[2];
+    // The value starts exactly where the match ends — searching the line for
+    // the key name would find a same-named word inside an earlier string.
+    const valueStart = m.index + m[0].length;
+    let valueEnd = -1;
+    for (let i = valueStart; i < s.length; i++) {
+      if (s[i] === "\\") { i++; continue; } // escaped char, never the closer
+      if (s[i] === quote) { valueEnd = i; break; }
+      if (s[i] === "\n") break;
+    }
+    if (valueEnd < 0) continue;
+    const value = s.slice(valueStart, valueEnd);
+    SECRET_KEYS.lastIndex = valueEnd + 1;
+    // Ссылки — не секреты, а то, что пользователь хочет видеть: env-переменная
+    // или путь к файлу с ключом.
+    if (/^\{env:[A-Za-z_][A-Za-z0-9_]*\}$/.test(value) || /^\{file:[^}]+\}$/.test(value) || /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(value)) continue;
+    if (!value) continue;
+    const keep = value.length > 12 ? 4 : 0;
+    const masked = keep
+      ? value.slice(0, keep) + "…" + "*".repeat(6)
+      : "*".repeat(Math.min(8, value.length));
+    out += s.slice(cursor, valueStart) + masked;
+    cursor = valueEnd;
+    changed = true;
+  }
+  if (!changed) return s;
+  return out + s.slice(cursor);
 }
 
 /** Applies secret masking across a whole diff. */

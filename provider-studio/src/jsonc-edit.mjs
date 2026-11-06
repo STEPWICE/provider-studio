@@ -155,11 +155,16 @@ function parseObject(text, i, state) {
       valueStart, valueEnd: i,
       value: parsed.node,
       start: keyStart, end: i,
+      // Position of the separating comma after this member, known exactly at
+      // parse time. Mutations use it instead of a text search, because a
+      // naive indexOf(",", member.end) can land inside a comment that
+      // happens to contain a comma.
+      commaAfter: -1,
     });
     trailingComma = false;
 
     const after = skipTrivia(text, i, state);
-    if (text[after] === ",") { i = after + 1; trailingComma = true; continue; }
+    if (text[after] === ",") { members[members.length - 1].commaAfter = after; i = after + 1; trailingComma = true; continue; }
     i = after;
     if (text[i] === "}") { closeStart = i; i++; break; }
     if (i >= text.length) throw new ParseError("незакрытый объект", start);
@@ -206,8 +211,15 @@ export function toValue(node) {
   if (node.type === "literal") return node.value;
   if (node.type === "array") return node.elements.map(toValue);
   const out = {};
-  // Later duplicate keys win, matching JSON.parse.
-  for (const m of node.members) out[m.key] = toValue(m.value);
+  // Later duplicate keys win, matching JSON.parse. defineProperty rather than
+  // assignment: a key literally named "__proto__" would otherwise hit the
+  // prototype setter and the member would exist in the file while staying
+  // invisible to Object.keys — config validation would then lie about it.
+  for (const m of node.members) {
+    Object.defineProperty(out, m.key, {
+      value: toValue(m.value), enumerable: true, writable: true, configurable: true,
+    });
+  }
   return out;
 }
 
@@ -393,8 +405,7 @@ function insertMember(text, objNode, key, value, style) {
     } else {
       const last = objNode.members[objNode.members.length - 1];
       if (objNode.trailingComma) {
-        const commaPos = text.indexOf(",", last.end);
-        const at = commaPos >= 0 && commaPos < objNode.closeStart ? commaPos + 1 : last.end;
+        const at = last.commaAfter >= 0 ? last.commaAfter + 1 : last.end;
         return splice(text, at, at, " " + entry);
       }
       return splice(text, last.end, last.end, ", " + entry);
@@ -410,8 +421,7 @@ function insertMember(text, objNode, key, value, style) {
     const last = objNode.members[objNode.members.length - 1];
     if (objNode.trailingComma) {
       // A trailing comma is already there; reuse it instead of adding a second.
-      const commaPos = text.indexOf(",", last.end);
-      const at = commaPos >= 0 && commaPos < objNode.closeStart ? commaPos + 1 : last.end;
+      const at = last.commaAfter >= 0 ? last.commaAfter + 1 : last.end;
       return splice(text, at, at, style.eol + entryIndent + entry);
     }
     return splice(text, last.end, last.end, "," + style.eol + entryIndent + entry);
@@ -516,15 +526,34 @@ export function deletePath(text, path) {
 
   const next = parent.members[idx + 1];
   if (next) {
-    // Consume the comma that separates this member from the next one.
-    const comma = text.indexOf(",", member.end);
-    if (comma >= 0 && comma < next.start) delEnd = comma + 1;
+    // Consume the comma that separates this member from the next one. Its
+    // position is known from the parse — a text search could land inside a
+    // comment containing a comma and corrupt the file.
+    if (member.commaAfter >= 0 && member.commaAfter < next.start) delEnd = member.commaAfter + 1;
   } else if (idx > 0) {
-    // Last member: swallow the comma that precedes it.
-    delStart = parent.members[idx - 1].end;
+    // Last member: swallow the comma that precedes it. Its position is known
+    // from the parse — a text search could land inside a comment containing a
+    // comma and corrupt the file.
+    const prev = parent.members[idx - 1];
+    const commaPos = prev.commaAfter >= 0 && prev.commaAfter < member.start ? prev.commaAfter : -1;
+    const between = commaPos >= 0 ? text.slice(commaPos + 1, member.start) : "";
+    if (/\/\/|\/\*/.test(between)) {
+      // A comment between the comma and the removed member documents the
+      // *surviving* member. Cut the member and the comma in two splices so
+      // the comment stays instead of being eaten with the deletion.
+      let out = splice(text, member.start, member.end, "");
+      const ls = out.lastIndexOf("\n", Math.max(0, member.start - 1)) + 1;
+      if (!out.slice(ls, member.start).trim()) {
+        let after = member.start;
+        while (after < out.length && (out[after] === " " || out[after] === "\t")) after++;
+        if (out[after] === "\r") after++;
+        if (out[after] === "\n") out = splice(out, ls, after + 1, "");
+      }
+      return splice(out, commaPos, commaPos + 1, "");
+    }
+    delStart = commaPos >= 0 ? commaPos : prev.end;
   } else if (parent.trailingComma) {
-    const comma = text.indexOf(",", member.end);
-    if (comma >= 0 && comma < parent.closeStart) delEnd = comma + 1;
+    if (member.commaAfter >= 0 && member.commaAfter < parent.closeStart) delEnd = member.commaAfter + 1;
   }
 
   // If the removal empties its line, drop the line rather than leave whitespace.

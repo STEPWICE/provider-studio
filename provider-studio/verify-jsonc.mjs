@@ -127,6 +127,44 @@ check("comment inside empty object survives",
 check("setPath refuses to overwrite a scalar parent",
   (() => { try { setPath('{"a":1}', ["a", "b"], 2); return false; } catch { return true; } })(), "should throw");
 
+// --------------------------------------------------- commas inside comments
+
+// The separating comma is recorded at parse time (member.commaAfter). A text
+// search for "," from the member's end lands inside a comment that contains
+// one — inserting there produced text that no longer parses, and deleting
+// through it silently ate the comment. These exact shapes did that.
+{
+  const src = '{\n  "a": 1 // примечание, с запятой\n  ,\n}';
+  const added = setPath(src, ["b"], 2);
+  check("insert with a comma in the comment still parses", parseJsonc(added).ok, added);
+  check("comment survives the insert", added.includes("// примечание, с запятой"), added);
+  eq("inserted value readable", getPath(added, ["b"]), 2);
+  eq("old value intact", getPath(added, ["a"]), 1);
+}
+{
+  const src = '{\n  "a": 1,\n  /* note, with a comma */\n  "b": 2\n}';
+  const del = deletePath(src, ["b"]);
+  check("delete of last member keeps the comment between members",
+    del.includes("/* note, with a comma */"), del);
+  check("delete result parses", parseJsonc(del).ok, del);
+  eq("surviving member intact", getPath(del, ["a"]), 1);
+}
+{
+  const src = '{ "a": 1 /* , */ ,\n "b": 2 }';
+  const del = deletePath(src, ["a"]);
+  check("delete with a comma inside a block comment parses", parseJsonc(del).ok, del);
+  eq("other member intact", getPath(del, ["b"]), 2);
+}
+// A "__proto__" key must stay a real, enumerable member: plain assignment
+// would hit the prototype setter and the key would vanish from Object.keys
+// while still sitting in the file.
+{
+  const d = parseJsonc('{"provider": {"__proto__": {"npm": "x"}}}');
+  check("__proto__ key survives as an own property",
+    Object.prototype.hasOwnProperty.call(d.value.provider, "__proto__")
+    && Object.keys(d.value.provider).includes("__proto__"));
+}
+
 // ----------------------------------------------------------- mergePath
 
 // `set` on an object replaces the subtree and takes its comments and unknown

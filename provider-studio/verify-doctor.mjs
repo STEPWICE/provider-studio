@@ -3,7 +3,7 @@
 // самопроверку инструмента. Сеть не используется: опрос серверов подменяется
 // стабом, каталог models.dev для самопроверки необязателен (некритично).
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -300,6 +300,48 @@ function applyOk(configObj, label) {
   const critBad = self.checks.filter((c) => c.critical && !c.ok);
   check("критичные проверки проходят", critBad.length === 0, JSON.stringify(critBad.map((c) => c.id)));
   check("общий ok согласуется с критичными", self.ok === (critBad.length === 0));
+
+  // --------------------------------------------------- валидация каталогов плагинов
+  const tmpDir = mkdtempSync(join(tmpdir(), "ps-test-plugin-doc-"));
+  const cfgPath = join(tmpDir, "opencode.jsonc");
+  const validPlugDir = join(tmpDir, "plugins", "valid-plugin");
+  const noPkgDir = join(tmpDir, "plugins", "no-pkg-plugin");
+  const noEntryDir = join(tmpDir, "plugins", "no-entry-plugin");
+  mkdirSync(validPlugDir, { recursive: true });
+  mkdirSync(noPkgDir, { recursive: true });
+  mkdirSync(noEntryDir, { recursive: true });
+
+  writeFileSync(join(validPlugDir, "package.json"), "{}", "utf8");
+  writeFileSync(join(validPlugDir, "index.mjs"), "export default {}", "utf8");
+
+  writeFileSync(join(noPkgDir, "index.mjs"), "export default {}", "utf8");
+
+  writeFileSync(join(noEntryDir, "package.json"), "{}", "utf8");
+
+  writeFileSync(cfgPath, JSON.stringify({
+    plugin: [
+      "plugins/valid-plugin",
+      "plugins/no-pkg-plugin",
+      "plugins/no-entry-plugin",
+      "plugins/missing-plugin",
+    ],
+  }), "utf8");
+
+  const oldEnv = process.env.OPENCODE_CONFIG;
+  process.env.OPENCODE_CONFIG = cfgPath;
+  try {
+    const sc = await D.runSelfCheck({ configPath: cfgPath, catalogTimeoutMs: 1000 });
+    const byId2 = Object.fromEntries(sc.checks.map((c) => [c.id, c]));
+
+    check("valid plugin passes check", byId2["plugin-plugins/valid-plugin"]?.ok === true);
+    check("no pkg plugin fails check", byId2["plugin-plugins/no-pkg-plugin"]?.ok === false && byId2["plugin-plugins/no-pkg-plugin"]?.message.includes("package.json"));
+    check("no entry plugin fails check", byId2["plugin-plugins/no-entry-plugin"]?.ok === false && byId2["plugin-plugins/no-entry-plugin"]?.message.includes("точка входа"));
+    check("missing plugin fails check", byId2["plugin-plugins/missing-plugin"]?.ok === false && byId2["plugin-plugins/missing-plugin"]?.message.includes("не найден"));
+  } finally {
+    if (oldEnv !== undefined) process.env.OPENCODE_CONFIG = oldEnv;
+    else delete process.env.OPENCODE_CONFIG;
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
 }
 
 // ------------------------------------------------------- env без options чинится тоже

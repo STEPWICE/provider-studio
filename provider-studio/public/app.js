@@ -18,6 +18,11 @@ const state = {
   providerSearch: "",
   // Presets that pre-fill base URL / format / env var in the wizard.
   presets: [],
+  // Extra headers for the provider currently in the form (a preset may need
+  // them — AgentRouter rejects unknown clients). Kept out of the form fields
+  // because there is no headers input; sent only when non-empty so a provider
+  // with hand-written options.headers keeps them on re-save.
+  formHeaders: {},
   // Wizard progress: which step is on screen and what has been chosen.
   wizardStep: 0,
   wizardPreset: null,
@@ -40,6 +45,11 @@ const state = {
   // Probe results by provider key, filled in by a diagnostics run. Empty means
   // "not checked yet", which is rendered as a neutral dot rather than green.
   health: {},
+  // Completion evidence is per exact config provider/model, not /models reachability.
+  modelHealth: {},
+  healthWarning: "",
+  configEpoch: 0,
+  formProbeEpoch: 0,
   // The last diagnostics payload, kept so the "copy report" action can render
   // it without re-probing every provider.
   lastDiag: null,
@@ -52,6 +62,13 @@ const state = {
   // Unsaved pool textarea per provider key (memory only, never persisted):
   // switching providers no longer eats a just-pasted key list.
   poolDrafts: new Map(),
+  // Which side-column pane is showing. Only one is visible, so a long report
+  // cannot push the page down every time an action runs.
+  sideTab: "overview",
+  // Models beyond the first four are behind a "show all" disclosure.
+  modelsExpanded: false,
+  // The default model last seen from diagnostics or set through a route card.
+  currentModel: "",
 };
 
 const INPUT_TYPES = ["text", "image", "video", "audio", "pdf"];
@@ -68,17 +85,40 @@ function asArray(v) {
 // the list with the store alone, so renaming a config-only provider emptied the
 // sidebar until the next full reload.
 function mergeProviderLists(store, live) {
-  const byName = new Map();
+  // Merge by config key, not display name: an imported provider may be keyed
+  // `my_provider` while its label is something else, and keying by name showed
+  // it twice once the store record was updated.
+  const byKey = new Map();
   for (const p of [...asArray(store), ...asArray(live)]) {
-    if (p && p.name) byName.set(String(p.name), p);
+    if (!p) continue;
+    const key = String(p.key || slugifyName(p.name) || p.name || "");
+    if (!key) continue;
+    const prev = byKey.get(key);
+    // Live entries come second and win: their block is what the config holds.
+    byKey.set(key, prev ? { ...prev, ...p, name: p.name || prev.name } : p);
   }
-  return [...byName.values()];
+  return [...byKey.values()];
 }
 
 function esc(s) {
   return String(s == null ? "" : s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+/** Inline stroke icon from the sprite in index.html. */
+function icon(name, cls) {
+  return `<svg class="ico${cls ? " " + cls : ""}" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+}
+
+/** Swap the eye between "show" and "hide" without changing the input type twice. */
+function setEyeButton(btn, input) {
+  if (!btn || !input) return;
+  const shown = input.type === "text";
+  btn.innerHTML = icon(shown ? "eye-off" : "eye");
+  btn.title = shown ? "Скрыть ключ" : "Показать ключ";
+  btn.setAttribute("aria-label", btn.title);
+  btn.setAttribute("aria-pressed", String(shown));
 }
 
 async function api(path, opts) {
@@ -144,7 +184,9 @@ async function withLoading(btn, fn) {
 }
 
 async function init() {
-  const d = await apiSafe("/api/state");
+  const initialContext = configIdentity();
+  const d = await apiSafe("/api/state" + "?configPath=" + encodeURIComponent(initialContext.configPath));
+  if (!isCurrentConfig(initialContext)) return;
   if (!d || (!asArray(d.formats).length && !d.opencode)) {
     setStatus(`Сервер недоступен: ${(d && d.error) || "неизвестная ошибка"}. Запусти сервер и обнови страницу.`, "err");
     return;
@@ -154,8 +196,12 @@ async function init() {
   state.presets = asArray(d.presets);
   if (Number(d.poolMax) > 0) state.poolMax = Math.trunc(Number(d.poolMax));
   // The store file has historically held a bare object; never assume an array.
+  // Keep the store's default hint before the live list (which does not carry
+  // `setAsDefault`) overwrites that entry in the merge.
+  const storedDefault = asArray(d.providers).find((p) => p.setAsDefault && asArray(p.models).length);
   state.providers = mergeProviderLists(d.providers, d.opencode && d.opencode.providers);
   state.backups = asArray(d.backups);
+  adoptModelHealth(d, initialContext, true);
 
   const sel = $("#f-format");
   sel.innerHTML = state.formats.map((f) => `<option value="${esc(f.id)}">${esc(f.label)}</option>`).join("");
@@ -163,16 +209,21 @@ async function init() {
   updateFormatNote();
 
   $("#targets").innerHTML = state.targets.map((t) => `
-    <div class="target-item ${state.selectedTargets.has(t.id) ? "on" : ""}" data-id="${esc(t.id)}">
+    <div class="target-item ${state.selectedTargets.has(t.id) ? "on" : ""}" data-id="${esc(t.id)}" title="${esc(t.hint || t.label)}">
       <span class="dot"></span><span>${esc(t.label)}</span>
     </div>`).join("");
 
   renderTargetChips();
   renderProviderList();
+  // The store remembers the last provider marked as default; use its first
+  // model as a hint until diagnostics confirms the config's real default.
+  if (storedDefault) state.currentModel = `${slugifyName(storedDefault.name)}/${storedDefault.models[0].id}`;
+  renderRoutes();
   // Existing snapshots are part of the initial state; without this the panel
   // stayed hidden until the user created another backup, so old ones could not
   // be restored after a reload.
   renderBackups(state.backups);
+  showSideTab("overview");
 
   if (d.opencode) {
     updateConfigChip(d.opencode);
@@ -209,17 +260,47 @@ async function init() {
     if (guess && guess !== $("#f-format").value) {
       $("#f-format").value = guess;
       updateFormatNote();
+      syncAdvancedDisclosure({ open: guess !== "openai-chat" });
       toast(`Формат определён по URL: ${guess}`, "");
     }
   });
   $("#f-format").addEventListener("change", () => { state.formatTouched = true; });
   $("#btnEye").addEventListener("click", () => {
     const inp = $("#f-apikey");
-    const isPass = inp.type === "password";
-    inp.type = isPass ? "text" : "password";
-    $("#btnEye").textContent = isPass ? "\u{1F441}" : "\u{1F441}\u200D\u{1F5E8}";
+    inp.type = inp.type === "password" ? "text" : "password";
+    setEyeButton($("#btnEye"), inp);
   });
   $("#f-envname").addEventListener("input", renderKeyHint);
+  $("#f-apikey").addEventListener("input", () => {
+    setKeyFieldState($("#f-env").checked ? $("#f-envname").value.trim() : "");
+    renderKeyHint();
+  });
+  // The optional pool/format block opens itself only when it has something to
+  // say (non-default format or a draft pool), and the summary always reports it.
+  $("#advancedBox").addEventListener("toggle", syncAdvancedDisclosure);
+  $("#f-pool").addEventListener("input", syncAdvancedDisclosure);
+  $("#f-format").addEventListener("change", syncAdvancedDisclosure);
+  $("#sideTabs").addEventListener("click", (e) => {
+    const tab = e.target.closest(".side-tab");
+    if (tab) showSideTab(tab.dataset.tab);
+  });
+  $("#sideTabs").addEventListener("keydown", (e) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    const tabs = $$("#sideTabs .side-tab");
+    const cur = tabs.findIndex((t) => t.dataset.tab === state.sideTab);
+    let next = cur;
+    if (e.key === "ArrowLeft") next = (cur - 1 + tabs.length) % tabs.length;
+    if (e.key === "ArrowRight") next = (cur + 1) % tabs.length;
+    if (e.key === "Home") next = 0;
+    if (e.key === "End") next = tabs.length - 1;
+    e.preventDefault();
+    showSideTab(tabs[next].dataset.tab);
+    tabs[next].focus();
+  });
+  $("#routesPanel").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-route-model]");
+    if (b) setRouteDefault(b.dataset.routeModel, b);
+  });
   // Offer a conventional variable name, but never overwrite a manual entry.
   $("#f-name").addEventListener("input", () => {
     const box = $("#f-envname");
@@ -246,7 +327,7 @@ async function init() {
   });
   $("#f-default").addEventListener("change", renderDefaultModelPicker);
   $("#configPicker").addEventListener("change", async () => {
-    state.configPath = $("#configPicker").value;
+    selectConfig($("#configPicker").value);
     // Switching files invalidates the hash: it belongs to the previous file.
     // A scoped refresh adopts the new file's hash, chip and undo entry — the
     // old code read the unscoped state and left every write unguarded (hash "")
@@ -262,22 +343,7 @@ async function init() {
   });
   $("#btnNew").addEventListener("click", () => {
     if (confirm("Начать с чистого листа? Несохранённые правки в форме пропадут.")) {
-      stashPoolDraft();
-      state.models = [];
-      state.editingKey = "";
-      // Probe verdicts belong to the provider that produced them: keeping them
-      // would paint provider A's "✓ works" onto provider B's same-named model.
-      state.probeResults = {};
-      renderModelList();
-      $$("#f-name, #f-baseurl, #f-apikey, #f-envname").forEach(el => el.value = "");
-      clearPoolBox();
-      delete $("#f-envname").dataset.touched;
-      $("#f-format").value = "openai-chat";
-      updateFormatNote();
-      restoreDefaults();
-      state.dirty = false;
-      state.savedSnapshot = formSnapshot();
-      renderProviderList();
+      resetForm();
       toast("Форма очищена — можно добавлять новый провайдер", "");
     }
   });
@@ -340,6 +406,7 @@ async function init() {
   $("#wizEye").addEventListener("click", () => {
     const inp = $("#wiz-apikey");
     inp.type = inp.type === "password" ? "text" : "password";
+    setEyeButton($("#wizEye"), inp);
   });
   $("#wizReload").addEventListener("click", () => withLoading($("#wizReload"), loadWizardModels));
   $("#wizFreeOnly").addEventListener("click", () => {
@@ -420,18 +487,19 @@ async function init() {
   for (const sel of ["#f-name", "#f-baseurl", "#f-apikey", "#f-envname", "#f-format", "#f-pool"]) {
     $(sel).addEventListener("input", () => { state.dirty = true; });
   }
-  // A verdict earned with one key says nothing about another: editing the
-  // endpoint or the key invalidates every probe mark the list is showing.
-  for (const sel of ["#f-baseurl", "#f-apikey"]) {
-    $(sel).addEventListener("input", () => {
-      if (state.probeResults && Object.keys(state.probeResults).length) {
-        state.probeResults = {};
-        renderModelList();
-      }
-    });
+  // Invalidate even when there are no marks yet: an old in-flight response
+  // must not become evidence for the edited connection (or an edit undone).
+  for (const sel of ["#f-name", "#f-baseurl", "#f-apikey", "#f-envname"]) {
+    $(sel).addEventListener("input", invalidateProbeResults);
+  }
+  for (const sel of ["#f-env", "#f-format"]) {
+    $(sel).addEventListener("change", invalidateProbeResults);
   }
 
   restoreDefaults();
+  setEyeButton($("#btnEye"), $("#f-apikey"));
+  setEyeButton($("#wizEye"), $("#wiz-apikey"));
+  syncAdvancedDisclosure();
 }
 
 // Keeping the key out of the config is the default: only the env-var reference
@@ -453,6 +521,15 @@ function renderKeyHint() {
 
   const el = $("#keyHint");
   if (!el) return;
+  const name = $("#f-envname").value.trim();
+  const saved = $("#f-apikey").classList.contains("has-saved-key")
+    && $("#f-apikey").dataset.savedEnv === name
+    && !$("#f-apikey").value.trim() && $("#f-env").checked;
+  if (saved) {
+    el.className = "fmt-note is-saved";
+    el.textContent = `Ключ уже сохранён в ${name}. Поле намеренно пустое — введи новый только для замены.`;
+    return;
+  }
   if ($("#f-env").checked) {
     const name = $("#f-envname").value.trim();
     if (!name) {
@@ -466,6 +543,41 @@ function renderKeyHint() {
     el.className = "fmt-note warn";
     el.textContent = "Ключ будет записан в opencode-конфиг открытым текстом. Включи $ENV, чтобы этого избежать.";
   }
+}
+
+/**
+ * The field is write-only for env-backed providers: the server never returns
+ * the secret, so a reload shows an empty input. Say that in the placeholder and
+ * the hint; an unexplained blank field reads as "my key was lost".
+ */
+function setKeyFieldState(envName) {
+  const input = $("#f-apikey");
+  if (!input) return;
+  const name = String(envName || "").trim();
+  const saved = !!name && !input.value.trim();
+  input.classList.toggle("has-saved-key", saved);
+  input.dataset.savedEnv = saved ? name : "";
+  input.placeholder = saved
+    ? `Сохранён в ${name} — введи новый ключ`
+    : "Введи API-ключ";
+  input.title = saved ? `Секрет хранится в переменной ${name}; поле не показывает его повторно.` : "";
+}
+
+/** The optional block's summary and its auto-open rules. */
+function syncAdvancedDisclosure(opts = {}) {
+  const box = $("#advancedBox");
+  if (!box) return;
+  const fmt = $("#f-format");
+  const fmtLabel = fmt && fmt.selectedOptions && fmt.selectedOptions[0]
+    ? fmt.selectedOptions[0].textContent.trim()
+    : (fmt ? fmt.value : "");
+  const n = poolKeys().length;
+  const meta = $("#advancedMeta");
+  if (meta) meta.textContent = `${fmtLabel || "формат"}${n ? ` · пул: ${n}` : ""}`;
+  // Only explicit callers (load/new/URL-derived format) may open the block:
+  // opening on the `toggle` event made it impossible to close.
+  if (opts.open) box.open = true;
+  if (opts.close) box.open = false;
 }
 
 function toggleTarget(id) {
@@ -503,6 +615,11 @@ function healthDot(p) {
   }
   if (h.reach === "up" && h.fault === "key") {
     return `<span class="hdot is-warn" title="Сервер отвечает, но ключ не принят"></span>`;
+  }
+  // Any other fault (region block, WAF, plan) still means the probe failed:
+  // a green dot here would be the same false reassurance this dot exists to fix.
+  if (h.reach === "up" && h.fault) {
+    return `<span class="hdot is-warn" title="${esc(h.conn || "Сервер отвечает, но проба не прошла")}"></span>`;
   }
   if (h.reach === "up") return `<span class="hdot is-up" title="Провайдер отвечает"></span>`;
   if (h.fault === "proxy") return `<span class="hdot is-down" title="Прокси не пропустил запрос"></span>`;
@@ -545,14 +662,18 @@ function renderProviderList() {
   // clipped "GenSparkOSNOVA" to "GenSpar…" while saying nothing at all.
   const mixed = shown.some((p) => p.fromOpenCode) && shown.some((p) => !p.fromOpenCode);
   list.innerHTML = shown.map((p) => {
-    const active = state.editingKey && state.editingKey === slugifyName(p.name);
+    // The row and the config block are addressed by the real key, not by the
+    // display name: imported providers keep `key` (which may contain "_" or ".")
+    // while a name alone slugifies to something the config never had.
+    const key = p.key || slugifyName(p.name);
+    const active = state.editingKey && state.editingKey === key;
     return `
-    <div class="provider-row${active ? " is-active" : ""}" data-name="${esc(p.name)}" tabindex="0" role="button">
+    <div class="provider-row${active ? " is-active" : ""}" data-name="${esc(p.name)}" data-key="${esc(key)}" tabindex="0" role="button">
       ${healthDot(p)}
       <span class="nm" title="${esc(p.name)}">${esc(p.name)}</span>
       ${p.fromOpenCode && mixed ? `<span class="badge">opencode</span>` : ""}
-      <button class="ren" title="Переименовать ключ провайдера в конфиге" aria-label="Переименовать ${esc(p.name)}">\u270e</button>
-      <button class="del" title="Удалить провайдера полностью: из opencode-конфига и из списка" aria-label="Удалить ${esc(p.name)} полностью">\u00d7</button>
+      <button class="ren" title="Переименовать ключ провайдера в конфиге" aria-label="Переименовать ${esc(p.name)}">${icon("pencil")}</button>
+      <button class="del" title="Удалить провайдера полностью: из opencode-конфига и из списка" aria-label="Удалить ${esc(p.name)} полностью">${icon("x")}</button>
     </div>`;
   }).join("");
   list.querySelectorAll(".provider-row").forEach((row) => {
@@ -561,19 +682,26 @@ function renderProviderList() {
       $(".main").scrollTo({ top: 0, behavior: "smooth" });
     };
     row.addEventListener("click", (e) => {
-      if (e.target.classList.contains("del")) {
+      // The buttons hold an <svg>/<use>, so `e.target` is rarely the button
+      // itself. Matching only on `classList` made a click on the icon fall
+      // through to open() — the provider "could not be deleted". closest()
+      // resolves the button from whatever descendant was hit.
+      if (e.target.closest(".del")) {
         e.stopPropagation();
-        deleteEverywhere(row.dataset.name);
+        deleteEverywhere(row.dataset.name, row.dataset.key);
         return;
       }
-      if (e.target.classList.contains("ren")) {
+      if (e.target.closest(".ren")) {
         e.stopPropagation();
-        renameInConfig(row.dataset.name);
+        renameInConfig(row.dataset.name, row.dataset.key);
         return;
       }
       open();
     });
     row.addEventListener("keydown", (e) => {
+      // Enter/Space on a button must activate the button, not the row: without
+      // this the keyboard user pressed "delete" and got the edit form.
+      if (e.target !== row) return;
       if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
     });
   });
@@ -584,6 +712,33 @@ function restoreDefaults() {
   window._defaultTouched = false;
   // Env-var mode is the default so keys never land in the config file.
   setEnvMode(true);
+  syncAdvancedDisclosure({ close: true });
+}
+
+// Clears the editor back to a blank "new provider" state. Shared by the "Новый"
+// button and the delete flow: leaving a deleted provider in the form meant the
+// next "Применить" silently recreated it from stale fields.
+function resetForm() {
+  stashPoolDraft();
+  state.models = [];
+  state.modelsExpanded = false;
+  state.editingKey = "";
+  // A blank form has no preset behind it, so preset headers must not leak
+  // into the next provider.
+  state.formHeaders = {};
+  // Also invalidate pending probes, even when the user returns to this form.
+  invalidateProbeResults();
+  $$("#f-name, #f-baseurl, #f-apikey, #f-envname").forEach((el) => { el.value = ""; });
+  clearPoolBox();
+  delete $("#f-envname").dataset.touched;
+  $("#f-format").value = "openai-chat";
+  updateFormatNote();
+  setKeyFieldState("");
+  syncAdvancedDisclosure({ close: true });
+  restoreDefaults();
+  state.dirty = false;
+  state.savedSnapshot = formSnapshot();
+  renderProviderList();
 }
 
 // BAI / DeepSeek -> BAI_DEEPSEEK_API_KEY
@@ -744,19 +899,139 @@ function renderDefaultModelPicker() {
   if (prev && state.models.some((m) => m.id === prev)) sel.value = prev;
 }
 
+function configIdentity() {
+  return { configPath: state.configPath || "", configEpoch: state.configEpoch, startedAt: Date.now() };
+}
+
+function isCurrentConfig(context) {
+  return context.configPath === (state.configPath || "") && context.configEpoch === state.configEpoch;
+}
+
+function selectConfig(path) {
+  state.configPath = path || "";
+  state.configEpoch++;
+  state.modelHealth = {};
+  state.health = {};
+  state.healthWarning = "";
+  state.currentModel = "";
+  state.providers = [];
+  invalidateProbeResults();
+  renderProviderList();
+  renderRoutes();
+}
+
+function isFreshModelHealth(h, now = Date.now()) {
+  return !!h && typeof h.ok === "boolean" && Number.isFinite(h.checkedAt)
+    && Number.isFinite(h.expiresAt) && h.checkedAt <= now && h.expiresAt > now;
+}
+
+function healthCheckedTime(h) {
+  return h && Number.isFinite(h.checkedAt) ? new Date(h.checkedAt).toLocaleString("ru") : "";
+}
+
+// Ignore stale snapshots without tying configured-route health to the selected form.
+function adoptModelHealth(payload, context, replace = true) {
+  if (!isCurrentConfig(context) || !payload) return false;
+  if (payload.modelHealth && typeof payload.modelHealth === "object") {
+    const next = replace ? {} : { ...state.modelHealth };
+    for (const [key, h] of Object.entries(payload.modelHealth)) {
+      if (!h || typeof h.ok !== "boolean" || !Number.isFinite(h.checkedAt) || !Number.isFinite(h.expiresAt)) continue;
+      const old = state.modelHealth[key];
+      next[key] = old && old.checkedAt > h.checkedAt ? old : h;
+    }
+    // A /state request may have started before an in-flight completion finished.
+    if (replace) for (const [key, h] of Object.entries(state.modelHealth)) {
+      if (!next[key] && h.checkedAt > context.startedAt) next[key] = h;
+    }
+    state.modelHealth = next;
+    state.healthWarning = payload.healthWarning || "";
+  } else if (payload.healthWarning) state.healthWarning = payload.healthWarning;
+  renderRoutes();
+  scheduleHealthRefresh();
+  return true;
+}
+
+function scheduleHealthRefresh() {
+  clearTimeout(state.healthTimer);
+  const now = Date.now();
+  const times = [...Object.values(state.modelHealth), ...Object.values(state.probeResults || {})]
+    .map((h) => h.expiresAt).concat(Object.values(state.health).map((h) => h.checkedAt + 3600000))
+    .filter((t) => Number.isFinite(t) && t > now);
+  if (!times.length) return;
+  state.healthTimer = setTimeout(() => {
+    renderRoutes();
+    renderModelList();
+    scheduleHealthRefresh();
+  }, Math.min(...times) - now + 1);
+}
+
+function invalidateProbeResults() {
+  state.formProbeEpoch++;
+  state.probeResults = {};
+  const box = $("#batchStatus");
+  if (box) box.hidden = true;
+  renderModelList();
+}
+
+// No secret is persisted here: this comparable identity lives only in memory.
+function probeConnection(provider) {
+  return JSON.stringify([provider.name, provider.baseURL, provider.apiKey,
+    provider.apiFormat, provider.useEnvVar, provider.envVarName, provider.headers || {}]);
+}
+
+function captureProbeContext(provider, previousKey = state.editingKey) {
+  return { ...configIdentity(), previousKey, formProbeEpoch: state.formProbeEpoch,
+    connection: probeConnection(provider), models: new Map(state.models.map((m) => [m.id, m])) };
+}
+
+function isCurrentProbe(context, modelId) {
+  return isCurrentConfig(context) && context.formProbeEpoch === state.formProbeEpoch
+    && context.previousKey === state.editingKey && context.connection === probeConnection(collectProvider())
+    && (modelId == null || (context.models.has(modelId)
+      && state.models.some((m) => m.id === modelId && m === context.models.get(modelId))));
+}
+
+function completionVerdict(result, startedAt = Date.now()) {
+  const checkedAt = result.checkedAt || Date.now();
+  return { ...result, startedAt: result.startedAt ?? startedAt, checkedAt,
+    expiresAt: result.expiresAt || checkedAt + (result.transient || result.fault === "quota" ? 300000 : 3600000) };
+}
+
+function updateProbeVerdict(probe) {
+  const previous = state.probeResults?.[probe.id];
+  const previousStart = previous?.startedAt ?? previous?.checkedAt ?? 0;
+  if (previousStart > probe.startedAt || (previousStart === probe.startedAt && (previous?.startedOrder || 0) > (probe.startedOrder || 0))) return false;
+  state.probeResults = state.probeResults || {};
+  state.probeResults[probe.id] = probe;
+  return true;
+}
+
+function hydrateProbeResults(key) {
+  state.probeResults = {};
+  for (const m of state.models) {
+    const h = state.modelHealth[`${key}/${m.id}`];
+    if (isFreshModelHealth(h)) state.probeResults[m.id] = { ...h, id: m.id };
+  }
+  scheduleHealthRefresh();
+}
+
 async function refreshConfigState() {
   // Scoped to the viewed file, and never throws: this is awaited from a dozen
   // click handlers without their own try/catch, and a dropped connection must
   // not turn into an unhandled rejection in all of them.
-  const wantedPath = state.configPath || "";
+  const context = configIdentity();
+  const wantedPath = context.configPath;
   let d = null;
   try {
     d = await api("/api/state" + "?configPath=" + encodeURIComponent(wantedPath));
   } catch { return null; }
   // A slow answer for the file the user has since switched away from must not
   // overwrite the new file's hash — the next write would die with a false 409.
-  if ((state.configPath || "") !== wantedPath) return null;
+  if (!isCurrentConfig(context)) return null;
   if (d && d.opencode) {
+    if (state.configHash !== (d.opencode.hash || "")) state.health = {};
+    state.providers = mergeProviderLists(d.providers, d.opencode.providers);
+    renderProviderList();
     state.configHash = d.opencode.hash || "";
     state.configHasComments = !!d.opencode.comments;
     state.configKeys = asArray(d.opencode.providers).map((p) => p.key || slugifyName(p.name)).filter(Boolean);
@@ -767,6 +1042,7 @@ async function refreshConfigState() {
     const banner = $("#extChange");
     if (banner) banner.hidden = true;
   }
+  adoptModelHealth(d, context, true);
   syncUndoButton(d && d.undo);
   return d;
 }
@@ -774,13 +1050,16 @@ async function refreshConfigState() {
 // The sidebar list mirrors the server's provider store. Scoped and silent, for
 // the mutation sites that change the store as a side effect (rename, remove).
 async function refreshProviders() {
+  const context = configIdentity();
   let d = null;
   try {
-    d = await api("/api/state" + "?configPath=" + encodeURIComponent(state.configPath || ""));
+    d = await api("/api/state" + "?configPath=" + encodeURIComponent(context.configPath));
   } catch { return; }
-  if (d) {
+  if (d && isCurrentConfig(context)) {
     state.providers = mergeProviderLists(d.providers, d.opencode && d.opencode.providers);
+    adoptModelHealth(d, context, true);
     renderProviderList();
+    renderRoutes();
   }
 }
 
@@ -930,12 +1209,12 @@ async function loadConfigList() {
   const saved = recallConfigPath();
   const savedMatch = saved && configs.find((c) => c.path === saved);
   if (savedMatch) {
-    state.configPath = savedMatch.path;
+    selectConfig(savedMatch.path);
     sel.value = savedMatch.path;
     return;
   }
   const active = configs.find((c) => c.active);
-  if (active) state.configPath = active.path;
+  if (active) selectConfig(active.path);
 }
 
 // localStorage is per-origin and this app is always http://localhost:<port>, so
@@ -950,8 +1229,10 @@ function recallConfigPath() {
 // Renames just the provider key in the config, keeping the block (and its
 // comments) intact. Editing the Name field instead would rewrite the whole
 // block from the form and drop anything the form does not model.
-async function renameInConfig(name) {
-  const from = slugifyName(name);
+async function renameInConfig(name, key) {
+  // The config key, not the display name: an imported provider can be keyed
+  // `my_provider` while its label slugifies to `my-provider`.
+  const from = String(key || "").trim() || slugifyName(name);
   const input = prompt(`Новый ключ провайдера вместо «${from}»:`, from);
   if (input === null) return;
   const to = slugifyName(input);
@@ -967,31 +1248,37 @@ async function renameInConfig(name) {
     return toast(r.error || "Не удалось переименовать", "err");
   }
   if (r.hash) state.configHash = r.hash;
-  if (state.editingKey === from) state.editingKey = to;
+  if (state.editingKey === from) {
+    state.editingKey = r.providerKey || to;
+    // The form's Name is what a save turns back into a key, so leaving the old
+    // label would rename the block right back on the next Apply.
+    if ($("#f-name").value.trim() === from) $("#f-name").value = r.providerKey || to;
+  }
   await refreshConfigState();
   await refreshProviders();
   refreshBackups();
   refreshUndo();
-  toast(`Переименовано: ${from} → ${to}. Перезапусти opencode.`, "ok");
+  toast(`Переименовано: ${from} → ${r.providerKey || to}. Перезапусти opencode.`, "ok");
 }
 
 // Deletes the provider for real: from the opencode config and from this list.
 // When the provider is not in the config (a store-only row), it just drops the
 // row — there is nothing else to delete.
-async function deleteEverywhere(name) {
-  const key = slugifyName(name);
+async function deleteEverywhere(name, key) {
+  const target = String(key || "").trim() || slugifyName(name);
   const r = await apiSafe("/api/preview-remove", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ key, configPath: state.configPath }),
+    body: JSON.stringify({ key: target, configPath: state.configPath }),
   });
   if (!r.ok && !r.notFound) return toast(r.error || "Не удалось построить diff удаления", "err");
   if (!r.ok && r.notFound) {
     if (!confirm(`«${name}» нет в opencode-конфиге. Убрать из списка Provider Studio?`)) return;
     const d = await apiSafe("/api/delete", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ key: target, name }),
     });
     if (!d || !d.ok) return toast((d && d.error) || "Не удалось убрать из списка", "err");
+    if (state.editingKey === target) resetForm();
     await refreshProviders();
     return;
   }
@@ -999,8 +1286,10 @@ async function deleteEverywhere(name) {
 
   const orphaned = asArray(r.orphaned);
   const removed = asArray(r.removedKeys);
+  const envOrphans = asArray(r.envOrphans);
+  const shownKey = r.providerKey || target;
   openDiff({
-    title: `Удалить «${key}» полностью`,
+    title: `Удалить «${shownKey}» полностью`,
     meta: `<div class="diff-path">${esc(r.path || "")}</div>
       <div class="diff-stat"><span class="plus">+${r.diff ? r.diff.added : 0}</span>
       <span class="minus">-${r.diff ? r.diff.removed : 0}</span></div>`,
@@ -1008,23 +1297,29 @@ async function deleteEverywhere(name) {
     // A dangling default model stops opencode from starting, so say so up front.
     hint: (removed.length > 1 ? `Пул ключей: уйдут ${removed.length} ${plural(removed.length, "шард", "шарда", "шардов")}${r.pluginEntry ? " и плагин ротации" : ""}. ` : "")
       + (orphaned.length ? `Будет переназначено: ${orphaned.join(", ")}. ` : "")
+      + (envOrphans.length ? `Переменные окружения больше никем не используются: ${envOrphans.join(", ")} — удалить их можно в Env-аудите. ` : "")
       + "Уберёт из opencode-конфига и из списка (с бэкапом и откатом).",
     confirmLabel: "Удалить полностью",
     onConfirm: async () => {
       closeDiff();
       const res = await apiSafe("/api/remove-provider", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key, configPath: state.configPath, hash: state.configHash }),
+        body: JSON.stringify({ key: target, configPath: state.configPath, hash: state.configHash }),
       });
       if (!res.ok) {
         if (res.conflict) await refreshConfigState();
         return toast(res.error || "Не удалось удалить", "err");
       }
+      const gone = new Set([...removed, ...asArray(res.removedKeys), target, shownKey]);
+      // The editor must not keep pointing at a block that no longer exists:
+      // Apply would recreate it without the user ever asking to.
+      if (state.editingKey && gone.has(state.editingKey)) resetForm();
       renderBackups(asArray(res.backups));
       await refreshConfigState();
       await refreshProviders();
       refreshUndo();
-      toast(`Провайдер «${key}» удалён полностью. Перезапусти opencode.`, "ok");
+      const envNote = envOrphans.length ? ` Переменные ${envOrphans.join(", ")} остались — почисти их в Env-аудите.` : "";
+      toast(`Провайдер «${shownKey}» удалён полностью.${envNote} Перезапусти opencode.`, "ok");
     },
   });
 }
@@ -1035,11 +1330,14 @@ function loadProviderIntoForm(name) {
   stashPoolDraft();
   // Remember the key this provider currently has in the config: renaming the
   // display name must move that block, not leave an orphan behind.
-  state.editingKey = slugifyName(p.name);
+  state.editingKey = p.key || slugifyName(p.name);
   state.dirty = false;
-  // Probe verdicts belong to the provider that produced them: without a reset
-  // they bleed onto same-named models of the provider being loaded.
-  state.probeResults = {};
+  // The sidebar list does not carry options.headers, and leaving the previous
+  // preset's fingerprint here would inject it into someone else's provider.
+  // Empty means "not submitted", so the file's own headers survive the save.
+  state.formHeaders = {};
+  // A form switch invalidates pending row updates, but not saved route evidence.
+  invalidateProbeResults();
   $("#f-name").value = p.name || "";
   $("#f-baseurl").value = p.baseURL || "";
   // Keys are never persisted server-side, so this is empty for stored providers.
@@ -1047,9 +1345,10 @@ function loadProviderIntoForm(name) {
   $("#f-apikey").value = p.apiKey || "";
   clearPoolBox();
   restorePoolDraft();
-  if (p.apiFormat) $("#f-format").value = p.apiFormat;
+  $("#f-format").value = p.apiFormat || "openai-chat";
   updateFormatNote();
   state.models = (p.models || []).map((m) => ({ ...m }));
+  state.modelsExpanded = false;
   if (p.useEnvVar && p.envVarName) {
     $("#f-envname").value = p.envVarName;
     $("#f-envname").dataset.touched = "1"; // keep the stored name, don't re-suggest
@@ -1057,6 +1356,14 @@ function loadProviderIntoForm(name) {
   } else {
     setEnvMode(false);
   }
+  // A reload cannot show a secret the server never returned. Label the empty
+  // field as "saved in ENV" rather than leaving it looking lost.
+  setKeyFieldState(p.useEnvVar ? p.envVarName : "");
+  renderKeyHint();
+  syncAdvancedDisclosure({
+    open: (p.apiFormat && p.apiFormat !== "openai-chat") || !!($("#f-pool").value.trim()),
+  });
+  hydrateProbeResults(state.editingKey);
   renderModelList();
   // Snapshot after the fields are filled: this is the new clean point.
   state.savedSnapshot = formSnapshot();
@@ -1074,9 +1381,12 @@ function loadProviderIntoForm(name) {
  * different from the fix for a model that does not exist.
  */
 function probeMark(p) {
-  if (!p) return "";
+  if (!p || (p.expiresAt != null && !isFreshModelHealth(p))) return "";
   if (p.ok) return `<span class="pmark ok" title="Модель ответила на пробный запрос">\u2713</span> `;
   if (p.fault === "plan") return `<span class="pmark plan" title="Ключ рабочий, но модель не входит в твой тариф">\u20bd</span> `;
+  // The model is blocked for this country. The key and the model id are fine,
+  // so a red ✕ would send the user to fix the wrong thing.
+  if (p.fault === "region") return `<span class="pmark plan" title="Модель недоступна в твоём регионе — ключ рабочий, нужен прокси/VPN в поддерживаемой стране">\u26a0</span> `;
   // A gateway that refuses one request and serves the next is not a broken
   // model. Marking it with the same ✕ invites the user to delete something
   // that works: measured live, one gateway did this on ~1 request in 6.
@@ -1085,8 +1395,10 @@ function probeMark(p) {
 }
 
 function probeNote(p) {
-  if (!p || p.ok) return "";
-  return ` \u00b7 <span class="pnote">${esc(p.message || "проверка не прошла")}</span>`;
+  if (!p) return "";
+  const stale = p.expiresAt != null && !isFreshModelHealth(p);
+  const text = stale ? "проверка устарела" : p.ok ? "" : (p.message || modelFaultLabel(p.fault));
+  return text ? ` \u00b7 <span class="pnote" title="${esc(healthCheckedTime(p))}">${esc(text)}</span>` : "";
 }
 
 /**
@@ -1105,6 +1417,8 @@ async function testAllModels() {
   if (!confirm(`Отправить по одному настоящему запросу к ${ids.length} ${plural(ids.length, "модели", "моделям", "моделям")}?\n` +
     `Это реальные запросы к провайдеру — они могут стоить денег и займут время.`)) return;
 
+  const provider = collectProvider();
+  const context = captureProbeContext(provider);
   box.hidden = false;
   box.className = "batch-status";
   // A 200-model run takes minutes server-side with a single end response, so a
@@ -1114,13 +1428,18 @@ async function testAllModels() {
   const mmss = (ms) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
   const checking = (extra) => `Проверяю ${ids.length} ${plural(ids.length, "модель", "модели", "моделей")}\u2026${extra}`;
   box.textContent = checking("");
-  const ticker = setInterval(() => { box.textContent = checking(` ${mmss(Date.now() - started)}`); }, 1000);
+  const ticker = setInterval(() => {
+    if (isCurrentProbe(context)) box.textContent = checking(` ${mmss(Date.now() - started)}`);
+    else clearInterval(ticker);
+  }, 1000);
 
   const r = await apiSafe("/api/testchat-batch", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ provider: collectProvider(), modelIds: ids }),
+    body: JSON.stringify({ provider, modelIds: ids, configPath: context.configPath, previousKey: context.previousKey }),
   });
   clearInterval(ticker);
+  adoptModelHealth(r, context);
+  if (!isCurrentProbe(context)) return;
   if (!r || (!r.result && !r.ok)) {
     box.className = "batch-status err";
     box.textContent = `\u2715 ${(r && r.error) || "не удалось проверить"}`;
@@ -1128,8 +1447,12 @@ async function testAllModels() {
   }
   const res = r.result || {};
   const done = new Set();
-  state.probeResults = {};
-  for (const x of res.results || []) { state.probeResults[x.id] = x; done.add(x.id); }
+  for (const x of res.results || []) {
+    if (!isCurrentProbe(context, x.id)) continue;
+    updateProbeVerdict(completionVerdict(x, context.startedAt));
+    done.add(x.id);
+  }
+  scheduleHealthRefresh();
 
   const untested = ids.filter((id) => !done.has(id));
   // "Не работает" and "не оплачено" are different answers with different fixes,
@@ -1138,15 +1461,17 @@ async function testAllModels() {
   const results = res.results || [];
   const plan = results.filter((x) => !x.ok && x.fault === "plan").length;
   const blocked = results.filter((x) => !x.ok && x.fault === "blocked").length;
-  const broken = results.filter((x) => !x.ok && x.fault !== "plan" && x.fault !== "blocked").length;
+  const region = results.filter((x) => !x.ok && x.fault === "region").length;
+  const broken = results.filter((x) => !x.ok && x.fault !== "plan" && x.fault !== "blocked" && x.fault !== "region").length;
   const parts = [`Проверено ${res.tested || 0} из ${res.total || ids.length}`,
     `${plural(res.passed || 0, "рабочая", "рабочих", "рабочих")} ${res.passed || 0}`];
   if (plan) parts.push(`не по тарифу: ${plan}`);
+  if (region) parts.push(`недоступно в регионе: ${region}`);
   if (blocked) parts.push(`${plural(blocked, "временно отклонена", "временно отклонены", "временно отклонены")} ${blocked}`);
   if (broken) parts.push(`${plural(broken, "не отвечает", "не отвечают", "не отвечают")} ${broken}`);
   if (res.rateLimited) parts.push(`ограничений по частоте: ${res.rateLimited}`);
   // Red is reserved for something the user must fix. A model outside the plan
-  // is information, not a fault in the setup.
+  // or blocked for the country is information, not a fault in the setup.
   box.className = "batch-status " + (res.stopped ? "warn" : (res.passed ? "ok" : (broken ? "err" : "warn")));
   box.innerHTML = esc(parts.join(" \u00b7 ")) +
     (res.stopped ? `<div class="batch-stop">${esc(res.stopped.message || "")}</div>` : "") +
@@ -1163,21 +1488,26 @@ async function testAllModels() {
 async function testSingleModel(index, btn) {
   const m = state.models[index];
   if (!m || !m.id) return;
+  const modelId = m.id;
   const provider = collectProvider();
+  const context = captureProbeContext(provider);
   if (!provider.baseURL) return toast("Укажи Base URL для теста", "err");
   if (btn) setBtnLoading(btn, true);
   try {
     const r = await apiSafe("/api/testchat", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ provider, modelId: m.id }),
+      body: JSON.stringify({ provider, modelId, configPath: context.configPath, previousKey: context.previousKey }),
     });
+    adoptModelHealth(r, context);
+    if (!isCurrentProbe(context, modelId)) return;
     state.probeResults = state.probeResults || {};
-    state.probeResults[m.id] = { id: m.id, ...(r.result || { ok: false, message: (r && r.error) || "не удалось проверить" }) };
-    const p = state.probeResults[m.id];
-    toast(`${p.ok ? "✓" : "✕"} ${m.id}: ${p.message || ""}`, p.ok ? "ok" : "err");
+    const p = completionVerdict({ id: modelId, ...((r && r.result) || { ok: false, message: (r && r.error) || "не удалось проверить" }) }, context.startedAt);
+    if (!updateProbeVerdict(p)) return;
+    scheduleHealthRefresh();
+    toast(`${p.ok ? "\u2713" : "\u2715"} ${modelId}: ${p.message || ""}`, p.ok ? "ok" : "err");
   } finally {
     if (btn) setBtnLoading(btn, false);
-    renderModelList();
+    if (isCurrentProbe(context)) renderModelList();
   }
 }
 
@@ -1233,6 +1563,7 @@ function poolMark(x) {
   if (!x) return "";
   if (x.ok) return `<span class="pool-mark-ok" title="Ключ рабочий">✓</span> `;
   if (x.fault === "plan") return `<span class="pool-mark-pay" title="Ключ рабочий, но баланс/тариф не даёт ответить">₽</span> `;
+  if (x.fault === "region") return `<span class="pool-mark-bad" title="Модель недоступна в регионе — ключ рабочий">⚠</span> `;
   if (x.fault === "quota" || x.fault === "blocked" || x.transient) return `<span class="pool-mark-retry" title="Временно отклонён — при ротации будет повтор">↻</span> `;
   return `<span class="pool-mark-bad" title="Ключ не работает">✕</span> `;
 }
@@ -1413,7 +1744,6 @@ async function poolApplyNow(provider) {
 
   const resultsEl = $("#results");
   resultsEl.hidden = false;
-  syncSidePlaceholder();
   const shardLines = (res.shards || []).map((s) => `<div class="ok-line" style="color:var(--muted)">${esc(s.key)} → {env:${esc(s.envVar)}}</div>`).join("");
   resultsEl.innerHTML = `<div class="result-card"><h3>opencode · пул ключей</h3>`
     + `<div class="ok-line">✓ Применено: ${(res.shardKeys || []).length} ${plural((res.shardKeys || []).length, "шард", "шарда", "шардов")}. Модель по умолчанию: ${esc(res.defaultModel || "—")}</div>`
@@ -1426,6 +1756,7 @@ async function poolApplyNow(provider) {
       ? `<div class="err-line">✕ Нет значений: ${esc(res.missingEnv.join(", "))} — нажми «Записать пул в env», затем перезапусти службу OpenCode (кнопка «↻» рядом с переменной).</div>`
       : `<div class="ok-line" style="color:var(--muted)">Все переменные пула заданы. Если ключи писали только что — перезапусти службу OpenCode кнопкой «↻» или приложение целиком.</div>`)
     + `</div>`;
+  showReports();
   if (!(await offerPoolEnvSave(res))) toast("Пул применён. Не забудь записать ключи в env.", "ok");
 }
 
@@ -1453,7 +1784,11 @@ function renderModelList() {
     </div>`;
     return;
   }
-  list.innerHTML = state.models.map((m, i) => {
+  // A 60-model config does not need 60 rows on every glance. Show the first
+  // four, with an explicit count, and keep the write path over the full list.
+  const total = state.models.length;
+  const shown = state.modelsExpanded ? state.models : state.models.slice(0, 4);
+  let html = shown.map((m, i) => {
     const limits = (m.contextWindow || m.maxOutput)
       ? `ctx ${esc(fmtNum(m.contextWindow))} \u00b7 out ${esc(fmtNum(m.maxOutput))}`
       : "лимиты не заданы";
@@ -1470,12 +1805,22 @@ function renderModelList() {
         ${m.toolUse !== false ? `<span class="tag">tools</span>` : ""}
       </div>
       <div class="row-actions">
-        <button class="rm" data-test="${i}" title="Отправить пробный запрос к этой модели (потратит ~16 токенов)">&#x26a1;</button>
-        <button class="rm ed" data-edit="${i}" title="Редактировать">\u270e</button>
-        <button class="rm" data-i="${i}" title="Удалить">&times;</button>
+        <button class="rm" data-test="${i}" title="Отправить пробный запрос к этой модели (потратит ~16 токенов)" aria-label="Проверить ${esc(m.id)}">${icon("bolt")}</button>
+        <button class="rm ed" data-edit="${i}" title="Редактировать" aria-label="Редактировать ${esc(m.id)}">${icon("pencil")}</button>
+        <button class="rm" data-i="${i}" title="Удалить" aria-label="Удалить ${esc(m.id)}">${icon("trash")}</button>
       </div>
     </div>`;
   }).join("");
+  if (total > 4) {
+    html += `<button class="btn btn-ghost btn-sm models-more" data-models-more type="button">`
+      + `${state.modelsExpanded ? "Свернуть" : `Показать все (${total})`}</button>`;
+  }
+  list.innerHTML = html;
+  const more = list.querySelector("[data-models-more]");
+  if (more) more.onclick = () => {
+    state.modelsExpanded = !state.modelsExpanded;
+    renderModelList();
+  };
   // The delete selector names data-i explicitly: matching "every .rm that is
   // not .ed" would also catch the per-model probe button added above.
   list.querySelectorAll(".rm[data-i]").forEach((btn) => btn.addEventListener("click", () => {
@@ -1571,6 +1916,7 @@ $("#m-save").addEventListener("click", () => {
   if (dup >= 0 && dup !== state.editingModelIndex) return toast("Такая модель уже добавлена", "err");
   if (state.editingModelIndex != null) state.models[state.editingModelIndex] = model;
   else state.models.push(model);
+  if (state.models.length > 4) state.modelsExpanded = true;
   closeModal();
   renderModelList();
 });
@@ -1587,7 +1933,7 @@ function updateFormatNote() {
 function collectProvider() {
   const useEnv = $("#f-env").checked;
   const name = $("#f-name").value.trim();
-  return {
+  const out = {
     id: Date.now(),
     name,
     baseURL: $("#f-baseurl").value.trim(),
@@ -1598,6 +1944,10 @@ function collectProvider() {
     setAsDefault: $("#f-default").checked,
     models: state.models,
   };
+  // Only when the preset supplied them: an absent `headers` means "not
+  // submitted", which is what keeps hand-written options.headers alive.
+  if (state.formHeaders && Object.keys(state.formHeaders).length) out.headers = { ...state.formHeaders };
+  return out;
 }
 
 // Shared validation for both preview and apply, so the diff can never show a
@@ -1702,6 +2052,11 @@ async function preview() {
   if (r.previousKey && r.previousKey !== r.providerKey) {
     badges.push(`<span class="tag warn">переименование: ${esc(r.previousKey)} → ${esc(r.providerKey)}</span>`);
   }
+  if (r.reenabled) badges.push(`<span class="tag warn">включится снова</span>`);
+  const hint = [
+    r.defaultModel ? `Модель по умолчанию: ${r.defaultModel}` : "",
+    r.reenabled ? "Провайдер был в disabled_providers — запись уберёт его оттуда, иначе opencode его не увидит." : "",
+  ].filter(Boolean).join(" ");
   openDiff({
     title: "Что изменится в конфиге",
     meta: `<div class="diff-path">${esc(r.path || "")}</div>
@@ -1709,7 +2064,7 @@ async function preview() {
       <span class="minus">-${r.diff ? r.diff.removed : 0}</span>
       ${badges.join(" ")}</div>`,
     diff: r.diff,
-    hint: r.defaultModel ? `Модель по умолчанию: ${r.defaultModel}` : "",
+    hint,
     // Same env guard as the direct Apply button: confirming a diff must not be
     // a way to skip the check that the referenced variable exists.
     onConfirm: async () => { if (await confirmEnvKey(provider)) await applyNow(provider); },
@@ -1814,7 +2169,9 @@ async function applyNow(provider) {
   if (oc) {
     if (oc.hash) state.configHash = oc.hash;
     if (oc.ok) {
-      state.editingKey = slugifyName(provider.name);
+      // The plan may have kept an exact key (`my_provider`) or renamed the
+      // block; adopt what was actually written so the next save edits it.
+      state.editingKey = oc.providerKey || slugifyName(provider.name);
       // What is on screen now matches what is on disk: the next external-edit
       // poll must not cry wolf, and leaving must not warn.
       state.dirty = false;
@@ -1827,7 +2184,6 @@ async function applyNow(provider) {
 
   const resultsEl = $("#results");
   resultsEl.hidden = false;
-  syncSidePlaceholder();
   resultsEl.innerHTML = "";
   for (const [target, r] of Object.entries(res.results || {})) {
     const name = (state.targets.find((t) => t.id === target) || { label: target }).label;
@@ -1836,6 +2192,7 @@ async function applyNow(provider) {
     if (target === "opencode") {
       const notes = [];
       if (r.ok && r.created) notes.push("Конфиг создан с нуля.");
+      if (r.ok && r.reenabled) notes.push("Провайдер был в disabled_providers — запись убрала его оттуда, иначе opencode его не видел.");
       // Only shown if the server actually reports a loss; the patcher preserves
       // comments, so claiming otherwise would be a lie that scares users off.
       if (r.ok && r.commentsLost) notes.push("Комментарии в конфиге удалены при перезаписи — прежняя версия в бэкапе.");
@@ -1852,6 +2209,20 @@ async function applyNow(provider) {
       const liveBtn = card.querySelector("[data-test-default]");
       if (liveBtn) liveBtn.onclick = () => testDefaultModel(liveBtn.dataset.testDefault, liveBtn);
       toast(r.ok ? "Готово. Перезапусти opencode." : "opencode: " + (r.error || "ошибка"), r.ok ? "ok" : "err");
+    } else if (r.written) {
+      const notes = [];
+      if (r.ok && r.path) notes.push(`Записано: ${r.path}`);
+      if (r.ok && r.model) notes.push(`Модель по умолчанию: ${r.model}`);
+      if (r.ok && r.count) notes.push(`Моделей: ${r.count}`);
+      if (r.ok && r.backupFile) notes.push(`Бэкап: ${r.backupFile}`);
+      if (r.ok && provider.useEnvVar) notes.push(`Ключ в файл не писался — нужна переменная ${provider.envVarName}.`);
+      if (r.ok) notes.push(`Перезапусти ${name}, чтобы он перечитал конфиг.`);
+      card.innerHTML = `
+        <h3>${esc(name)}</h3>
+        ${r.ok ? `<div class="ok-line">\u2713 Конфиг записан</div>` : `<div class="err-line">\u2715 ${esc(r.error || "ошибка")}</div>`}
+        ${notes.map((n) => `<div class="ok-line" style="color:var(--muted)">${esc(n)}</div>`).join("")}
+        <div class="ok-line" style="color:var(--muted)">${esc(r.guide || "").replace(/\n/g, "<br>")}</div>`;
+      toast(r.ok ? `${name}: записано. Перезапусти приложение.` : `${name}: ${r.error || "ошибка"}`, r.ok ? "ok" : "err");
     } else {
       card.innerHTML = `
         <h3>${esc(name)}</h3>
@@ -1886,6 +2257,7 @@ async function applyNow(provider) {
     }
     resultsEl.appendChild(card);
   }
+  showReports();
 }
 
 function setStatus(msg, kind) {
@@ -1928,16 +2300,28 @@ async function testDefaultModel(fullId, btn) {
   const slash = s.indexOf("/");
   const modelId = slash < 0 ? s : s.slice(slash + 1);
   if (!modelId) return toast("Нечего проверять: нет id модели", "err");
-  const provider = collectProvider();
-  if (!provider.baseURL) return toast("Укажи Base URL для теста", "err");
+  const form = collectProvider();
+  const previousKey = slash < 0 ? state.editingKey : s.slice(0, slash);
+  // Result cards outlive the selected form. Never test A's model using B's key.
+  const provider = slash < 0 || previousKey === (state.editingKey || slugifyName(form.name)) ? form
+    : state.providers.find((p) => (p.key || slugifyName(p.name)) === previousKey);
+  if (!provider || !provider.baseURL) return toast("Загрузи провайдера для этого теста", "err");
+  const context = captureProbeContext(provider, previousKey);
   if (btn) setBtnLoading(btn, true);
   try {
     const r = await apiSafe("/api/testchat", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ provider, modelId }),
+      body: JSON.stringify({ provider, modelId, configPath: context.configPath, previousKey: context.previousKey }),
     });
-    const res = (r && r.result) || {};
-    toast(`${res.ok ? "✓" : "✕"} ${s}: ${res.message || (r && r.error) || ""}`, res.ok ? "ok" : "err");
+    adoptModelHealth(r, context);
+    if (!isCurrentConfig(context)) return;
+    const res = (r && r.result) || { ok: false, message: (r && r.error) || "не удалось проверить" };
+    if (isCurrentProbe(context, modelId)) {
+      if (!updateProbeVerdict(completionVerdict({ id: modelId, ...res }, context.startedAt))) return;
+      renderModelList();
+      scheduleHealthRefresh();
+    }
+    toast(`${res.ok ? "\u2713" : "\u2715"} ${s}: ${res.message || ""}`, res.ok ? "ok" : "err");
   } finally {
     if (btn) setBtnLoading(btn, false);
   }
@@ -1949,16 +2333,18 @@ async function testConnection() {
   setStatus("Проверяю\u2026", "");
   const r = await apiSafe("/api/test", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ provider }),
+    body: JSON.stringify({ provider, configPath: state.configPath, previousKey: state.editingKey }),
   });
   const t = r.result || {};
   // testConnection() already prefixes its own verdict. Prepending another one
   // produced a literal "✓ ✓ Ответ 200" for a healthy endpoint.
   const body = String(t.message || r.error || "");
-  const msg = /^[\u2713\u2715]/.test(body)
+  const msg = /^[\u2713\u2715\u26a0]/.test(body)
     ? body
-    : `${t.ok ? "\u2713" : "\u2715"} ${body}`;
-  toast(msg, t.ok ? "ok" : "err");
+    : `${t.ok && !t.fault ? "\u2713" : "\u2715"} ${body}`;
+  // A reachable endpoint is not a working setup: a refused key, a region block
+  // and a WAF all answer with a status while ok/fault say the probe failed.
+  toast(msg, t.ok && !t.fault ? "ok" : "err");
   if (t.url) $("#status").title = `Ответ ${t.status || ""} от ${t.url}`;
 }
 
@@ -1972,6 +2358,7 @@ async function validate() {
   el.hidden = false;
   if (!issues.length) {
     el.innerHTML = `<div class="result-card"><h3>Проверка конфига</h3><div class="ok-line">\u2713 Проблем не найдено.</div><div class="ok-line" style="color:var(--muted)">config: ${esc(r.path || "")}</div></div>`;
+    showReports();
     toast("Конфиг валиден", "ok");
     return;
   }
@@ -1981,7 +2368,7 @@ async function validate() {
       ${i.severity === "error" ? "\u2715" : "\u26a0"} ${esc(i.message)}
       ${i.fixable ? `<span class="tag">fixable</span>` : ""}</div>`).join("") +
     `<div class="ok-line" style="color:var(--muted)">config: ${esc(r.path || "")}</div></div>`;
-  syncSidePlaceholder();
+  showReports();
   toast(nErr ? "Есть ошибки в конфиге" : "Есть предупреждения", nErr ? "err" : "");
 }
 
@@ -2036,6 +2423,7 @@ async function backupNow() {
   if (r.file) {
     setBackupInfo(`\u21bb Бэкап создан: ${r.file}`);
     await refreshBackups();
+    showSideTab("backups");
   } else setBackupInfo("Бэкап не создан (конфиг отсутствует)");
 }
 
@@ -2051,10 +2439,11 @@ async function refreshBackups() {
 
 function renderBackups(backups) {
   state.backups = backups;
+  updateBackupsCount();
+  syncPaneEmptyStates();
   const el = $("#backups");
-  if (!backups.length) { el.hidden = true; syncSidePlaceholder(); return; }
+  if (!backups.length) { el.hidden = true; return; }
   el.hidden = false;
-  syncSidePlaceholder();
   // 30 строк с машинными именами никто не читает: первые 7 + раскрывашка.
   // Имя вида opencode-20261006-004608-before-remove-2.jsonc превращается в
   // «перед удалением · 12 мин назад», полное имя остаётся в tooltip.
@@ -2091,7 +2480,7 @@ function renderBackups(backups) {
     await refreshBackups();
     refreshUndo();
     $("#results").hidden = true;
-    syncSidePlaceholder();
+    showSideTab("backups");
   }));
 }
 
@@ -2117,7 +2506,7 @@ async function openDiscover() {
   $("#discoverAdd").textContent = "Добавить выбранные (0)";
   const r = await apiSafe("/api/discover", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ provider }),
+    body: JSON.stringify({ provider, configPath: state.configPath, previousKey: state.editingKey }),
   });
   const res = r.result || {};
   const st = $("#discoverStatus");
@@ -2195,9 +2584,277 @@ function backfillFromDiscovered() {
 function syncSidePlaceholder() {
   const ph = $("#sideEmpty");
   if (!ph) return;
-  const anyShown = ["#issues", "#backups", "#results"]
-    .some((sel) => { const el = $(sel); return el && !el.hidden; });
-  ph.hidden = anyShown;
+  // The overview's "quick start" only makes sense before route suggestions
+  // exist. Reports and backups live in their own panes now.
+  ph.hidden = asArray(state.routes).length > 0;
+}
+
+/** Switch the right column to one pane without touching the page scroll. */
+function showSideTab(name) {
+  const valid = ["overview", "reports", "backups"];
+  const tab = valid.includes(name) ? name : "overview";
+  state.sideTab = tab;
+  $$("#sideTabs .side-tab").forEach((b) => {
+    const on = b.dataset.tab === tab;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-selected", String(on));
+    b.tabIndex = on ? 0 : -1;
+  });
+  const panes = { overview: "#paneOverview", reports: "#paneReports", backups: "#paneBackups" };
+  for (const [id, sel] of Object.entries(panes)) {
+    const el = $(sel);
+    if (el) el.hidden = id !== tab;
+  }
+  if (tab === "reports") {
+    const dot = $("#reportsDot");
+    if (dot) dot.hidden = true;
+  }
+  syncPaneEmptyStates();
+}
+
+function syncPaneEmptyStates() {
+  const reports = $("#reportsEmpty");
+  if (reports) {
+    const has = ["#issues", "#results"].some((sel) => {
+      const el = $(sel);
+      return el && !el.hidden && el.innerHTML.trim();
+    });
+    reports.hidden = has;
+  }
+  const backups = $("#backupsEmpty");
+  if (backups) backups.hidden = asArray(state.backups).length > 0;
+}
+
+/** Actions that produce a report always land on the same tab instead of
+ *  appending a new card under the previous one. */
+function showReports() {
+  const dot = $("#reportsDot");
+  const hasOutput = ["#issues", "#results"].some((sel) => {
+    const el = $(sel);
+    return el && !el.hidden && el.innerHTML.trim();
+  });
+  if (dot) dot.hidden = !hasOutput || state.sideTab === "reports";
+  syncPaneEmptyStates();
+  if (hasOutput) showSideTab("reports");
+}
+
+function updateBackupsCount() {
+  const el = $("#backupsCount");
+  if (!el) return;
+  const n = asArray(state.backups).length;
+  el.textContent = n > 99 ? "99+" : (n ? String(n) : "");
+  el.hidden = !n;
+}
+
+/* --- Smart routes ---------------------------------------------------------
+ * OpenCode itself can only switch between configured providers by changing the
+ * top-level `model`; it does not ship a per-request router. So instead of
+ * pretending to add one, Studio ranks the models already in the config by
+ * capability and price, respects the last live health check, and makes the
+ * chosen route the default in one click. Everything stays a normal config
+ * write with a diff and a backup.
+ */
+function routeHealth(provider, modelId, now = Date.now()) {
+  const key = provider.key || slugifyName(provider.name);
+  const completion = state.modelHealth[`${key}/${modelId}`] || null;
+  const diagnostic = state.health[key] || null;
+  const fresh = isFreshModelHealth(completion, now);
+  const diagnosticFresh = !!diagnostic && Number.isFinite(diagnostic.checkedAt)
+    && diagnostic.checkedAt <= now && diagnostic.checkedAt + 3600000 > now;
+  // Connectivity cannot clear a model-specific refusal.
+  const newerDiagnostic = diagnosticFresh && (!completion || diagnostic.checkedAt > completion.checkedAt);
+  const brokenEndpoint = newerDiagnostic && (diagnostic.reach === "down" || !!diagnostic.fault);
+  const failed = fresh && (!completion.ok || !!completion.fault);
+  return { completion, diagnostic, fresh, newerDiagnostic, brokenEndpoint,
+    verified: fresh && completion.ok && !completion.fault && !brokenEndpoint,
+    bad: !!(failed || brokenEndpoint) };
+}
+
+// Blank prices coerce to zero; a name-based hint is not a declared free price.
+function modelCost(m) {
+  const price = (v) => (typeof v === "number" || (typeof v === "string" && v.trim() !== ""))
+    && Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : null;
+  const input = price(m.costInput), output = price(m.costOutput);
+  if (input != null && output != null) return Number.isFinite(input + output) ? input + output : null;
+  if (m.costInput != null || m.costOutput != null) return null;
+  return m.free === true && m.freeSource === "tier" ? 0 : null;
+}
+
+function modelFaultLabel(fault) {
+  return ({ quota: "квота", plan: "тариф", region: "регион", blocked: "блокировка",
+    model: "модель не отвечает", auth: "ключ не принят", key: "ключ не принят", nokey: "нет ключа",
+    endpoint: "ошибка endpoint", network: "нет связи", proxy: "ошибка прокси", client: "клиент отклонён" })[fault]
+    || "запрос не прошёл";
+}
+
+function routeCandidates() {
+  const out = [];
+  for (const p of asArray(state.providers)) {
+    const key = p.key || slugifyName(p.name);
+    for (const m of asArray(p.models)) {
+      if (!m || !m.id) continue;
+      const health = routeHealth(p, m.id);
+      const inTypes = asArray(m.inputTypes);
+      out.push({
+        provider: p.name,
+        key,
+        id: m.id,
+        model: m,
+        health,
+        bad: health.bad,
+        image: inTypes.includes("image"),
+        reasoning: !!m.reasoning,
+        tools: m.toolUse !== false,
+        context: Number(m.contextWindow) || 0,
+        cost: modelCost(m),
+      });
+    }
+  }
+  // The live list repeats store entries by name; keep one row per key/model.
+  const seen = new Set();
+  return out.filter((c) => {
+    const k = `${c.key}/${c.id}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+function routeQuality(c) {
+  // Static metadata only breaks ties within an evidence tier.
+  return (c.tools ? 2 : 0)
+    + (c.reasoning ? 3 : 0)
+    + Math.min(4, c.context / 262144)
+    + (c.cost === 0 ? 2.5 : c.cost == null ? 0 : Math.min(1.5, 1.5 / (1 + c.cost)));
+}
+
+function routeScore(c, kind) {
+  const base = routeQuality(c);
+  if (kind === "vision") return base + (c.image ? 12 : -20);
+  if (kind === "fast") {
+    return base
+      + (c.cost === 0 ? 6 : c.cost == null ? 0.5 : Math.min(3, 1 / (1 + c.cost)))
+      + (c.context >= 65536 ? 1.5 : 0)
+      - (c.reasoning ? 0.5 : 0);
+  }
+  return base + (c.reasoning ? 2 : 0) + (c.context >= 131072 ? 1.5 : 0);
+}
+
+function routeWhy(c, kind) {
+  const bits = [];
+  if (c.cost === 0) bits.push("бесплатная");
+  else if (c.cost != null) bits.push("платная");
+  else if (c.model.freeSource === "name" || /:free$/i.test(c.id)) bits.push("free? · цена не подтверждена");
+  else bits.push("цена ?");
+  if (c.context) bits.push(`ctx ${fmtNum(c.context)}`);
+  if (kind === "vision" && c.image) bits.push("видит картинки");
+  else {
+    if (c.reasoning) bits.push("reasoning");
+    if (c.tools) bits.push("tools");
+  }
+  return bits.join(" · ");
+}
+
+function routeState(c) {
+  const h = c.health;
+  const times = [];
+  if (h.completion) times.push(`Запрос к модели: ${healthCheckedTime(h.completion)}`);
+  if (h.newerDiagnostic) times.push(`Связь с сервером: ${healthCheckedTime(h.diagnostic)}`);
+  const title = times.join("\n");
+  if (h.bad) {
+    const fault = h.brokenEndpoint ? h.diagnostic.fault : h.completion.fault;
+    return { cls: "warn", text: `${modelFaultLabel(fault)} · крайний вариант`, title };
+  }
+  if (h.verified) return { cls: "ok", text: "проверена", title };
+  if (h.newerDiagnostic && h.diagnostic.reach === "up") {
+    return { cls: "unknown", text: "сервер доступен", title: `${title}\nОтвет /models не проверяет работу модели.` };
+  }
+  if (h.completion && !h.fresh) return { cls: "unknown", text: "проверка устарела", title };
+  return { cls: "unknown", text: "не проверена", title };
+}
+
+function routeRank(c) {
+  return c.health.verified ? 2 : c.bad ? 0 : 1;
+}
+
+function pickRoute(kind, used) {
+  const candidates = routeCandidates().filter((c) => {
+    if (used.has(`${c.key}/${c.id}`)) return false;
+    if (kind === "vision" && !c.image) return false;
+    return true;
+  });
+  // Static metadata must never outweigh evidence from a completion.
+  return candidates.sort((a, b) => routeRank(b) - routeRank(a)
+    || routeScore(b, kind) - routeScore(a, kind))[0] || null;
+}
+
+function renderRoutes() {
+  const el = $("#routesPanel");
+  if (!el) return;
+  const used = new Set();
+  const routes = [];
+  const main = pickRoute("code", used);
+  if (main) { routes.push({ kind: "Основной", c: main, why: routeWhy(main, "code") }); used.add(`${main.key}/${main.id}`); }
+  const fast = pickRoute("fast", used);
+  if (fast) { routes.push({ kind: "Быстрый", c: fast, why: routeWhy(fast, "fast") }); used.add(`${fast.key}/${fast.id}`); }
+  const vision = pickRoute("vision", used);
+  if (vision) { routes.push({ kind: "С картинками", c: vision, why: routeWhy(vision, "vision") }); used.add(`${vision.key}/${vision.id}`); }
+  // Reserve obeys exactly the same evidence ranking, never just static scores.
+  const reserve = pickRoute("code", used);
+  if (reserve) routes.push({ kind: "Резерв", c: reserve, why: routeWhy(reserve, "code") });
+
+  state.routes = routes;
+  if (!routes.length && !state.healthWarning) {
+    el.hidden = true;
+    el.innerHTML = "";
+    syncSidePlaceholder();
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = `<div class="result-card route-card">
+    <div class="route-title"><h3>${icon("route")}Умные маршруты</h3><span class="tag">подбор</span></div>
+    <div class="diag-sub">Сначала проверенные запросом модели, затем непроверенные, ошибки — в крайнем случае. Проверка действует 1 ч, временные ошибки и квоты — 5 мин; история хранится до 7 дней. Доступность сервера не доказывает работу модели. Кнопка меняет только model — с бэкапом и откатом.</div>
+    ${state.healthWarning ? `<div class="diag-sub warn-line">${esc(state.healthWarning)}</div>` : ""}
+    ${routes.map((r) => {
+      const c = r.c;
+      const hs = routeState(c);
+      const full = `${c.key}/${c.id}`;
+      const current = state.currentModel === full;
+      return `<div class="route-row">
+        <div class="route-line">
+          <span class="route-kind">${esc(r.kind)}</span>
+          <span class="route-health ${hs.cls}" title="${esc(hs.title)}">${hs.cls === "ok" ? icon("check") : ""}${esc(hs.text)}</span>
+        </div>
+        <div class="route-model" title="${esc(full)}">${esc(c.key)}<span>/</span>${esc(c.id)}</div>
+        <div class="route-why">${esc(r.why)}</div>
+        <div class="route-actions">
+          ${current ? `<span class="tag current">${icon("check")}текущая</span>`
+            : `<button class="btn btn-mini" data-route-model="${esc(full)}" type="button">${icon("route")}Сделать основной</button>`}
+        </div>
+      </div>`;
+    }).join("")}
+  </div>`;
+  syncSidePlaceholder();
+}
+
+async function setRouteDefault(model, btn) {
+  if (!model) return;
+  if (btn) setBtnLoading(btn, true);
+  try {
+    const r = await apiSafe("/api/set-default-model", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, configPath: state.configPath, hash: state.configHash }),
+    });
+    if (r && r.conflict) await refreshConfigState();
+    if (!r || !r.ok) return toast((r && r.error) || "Не удалось сменить маршрут", "err");
+    state.currentModel = model;
+    if (r.hash) state.configHash = r.hash;
+    refreshUndo();
+    renderRoutes();
+    toast(`Основной маршрут: ${model}`, "ok");
+  } finally {
+    if (btn) setBtnLoading(btn, false);
+  }
 }
 
 /** "$0.97" style price, trimmed so cheap models do not render as "$0.07000". */
@@ -2219,18 +2876,20 @@ function money(v) {
  */
 function priceTag(m) {
   const per = " за 1M токенов";
-  if (m.free) {
-    const guess = m.freeSource === "name";
+  const cost = modelCost(m);
+  if (cost === 0) {
     const why = m.freeSource === "tier" ? `провайдер помечает тариф как «${m.tier || "free"}»`
-      : m.freeSource === "price" ? "провайдер указал нулевую цену"
-      : "предположение по названию модели — проверь у провайдера";
-    return `<span class="tag free" title="${esc(why)}">free${guess ? "?" : ""}</span>`;
+      : "провайдер указал нулевую цену";
+    return `<span class="tag free" title="${esc(why)}">free</span>`;
   }
-  if (m.costInput != null && m.costOutput != null) {
-    const label = `${money(m.costInput)} / ${money(m.costOutput)}`;
-    return `<span class="tag paid" title="Вход ${money(m.costInput)}${per}, выход ${money(m.costOutput)}${per}">${esc(label)}</span>`;
+  if (cost != null) {
+    const input = money(Number(m.costInput)), output = money(Number(m.costOutput));
+    return `<span class="tag paid" title="Вход ${input}${per}, выход ${output}${per}">${esc(`${input} / ${output}`)}</span>`;
   }
-  if (m.tier) return `<span class="tag paid" title="Тариф провайдера">${esc(m.tier)}</span>`;
+  if (m.freeSource === "name" || /:free$/i.test(m.id || "")) {
+    return `<span class="tag free" title="Предположение по названию модели — цена не подтверждена">free?</span>`;
+  }
+  if (m.tier && !m.free) return `<span class="tag paid" title="Тариф провайдера">${esc(m.tier)}</span>`;
   // Silence is not "free": say outright that the price is unknown.
   return `<span class="tag unknown" title="Провайдер не сообщил цену — уточни у него">цена ?</span>`;
 }
@@ -2333,6 +2992,10 @@ function modelFromDiscovered(src) {
     outputTypes: ["text"],
     reasoning: !!src.reasoning,
     toolUse: src.toolUse !== false,
+    ...(src.free !== undefined
+      ? { free: !!src.free, freeSource: src.freeSource || "unknown" }
+      : {}),
+    ...(src.tier ? { tier: src.tier } : {}),
     // The provider told us what this costs; dropping it on the floor means
     // opencode cannot show spend for a model we had the price of. Only
     // carried when actually known — an unknown price must not become 0,
@@ -2667,17 +3330,22 @@ async function setEnvFromField(name, value, el, btnSel = "#wizSetEnvBtn") {
 function wizardProvider() {
   const useEnv = $("#wiz-env").checked;
   const name = $("#wiz-name").value.trim();
-  return {
+  const preset = state.wizardPreset;
+  const out = {
     id: Date.now(),
     name,
     baseURL: $("#wiz-baseurl").value.trim(),
     apiKey: $("#wiz-apikey").value.trim(),
-    apiFormat: (state.wizardPreset && state.wizardPreset.apiFormat) || detectFormatFromURL($("#wiz-baseurl").value) || "openai-chat",
+    apiFormat: (preset && preset.apiFormat) || detectFormatFromURL($("#wiz-baseurl").value) || "openai-chat",
     useEnvVar: useEnv,
     envVarName: useEnv ? ($("#wiz-envname").value.trim() || suggestEnvName(name)) : "",
     setAsDefault: true,
     models: [],
   };
+  // A preset may ship headers its gateway demands (client fingerprint). They
+  // ride along to discovery and to the final write.
+  if (preset && preset.headers && Object.keys(preset.headers).length) out.headers = { ...preset.headers };
+  return out;
 }
 
 // Two runs can be in flight at once (step 2 auto-loads, then "Обновить" is
@@ -2782,6 +3450,7 @@ function renderWizardSummary() {
   const btn = $("#wizChatTest");
   if (btn) {
     btn.onclick = async () => {
+      const context = configIdentity();
       const out = $("#wizChatResult");
       setBtnLoading(btn, true);
       out.className = "chat-probe";
@@ -2789,8 +3458,10 @@ function renderWizardSummary() {
       try {
         const r = await apiSafe("/api/testchat", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ provider: p, modelId: firstModel }),
+          body: JSON.stringify({ provider: p, modelId: firstModel, configPath: context.configPath, previousKey: slugifyName(p.name) }),
         });
+        adoptModelHealth(r, context);
+        if (!isCurrentConfig(context) || probeConnection(p) !== probeConnection(wizardProvider())) return;
         const res = (r && r.result) || {};
         out.className = "chat-probe " + (res.ok ? "is-ok" : "is-bad");
         out.textContent = res.message || (r && r.error) || "не удалось проверить";
@@ -2814,11 +3485,14 @@ function finishWizard() {
 
   state.models = [...state.wizSelected]
     .map((id) => modelFromDiscovered(state.wizModels.find((m) => m.id === id) || { id }));
+  state.modelsExpanded = false;
   // A wizard run creates a provider, so nothing is being renamed.
   state.editingKey = "";
-  // Same reset as loading a provider: old probe marks would otherwise paint
-  // onto the freshly picked models.
-  state.probeResults = {};
+  // Headers come from the preset, not from a form field: carry them through
+  // so the diff that gets confirmed actually contains them.
+  state.formHeaders = p.headers ? { ...p.headers } : {};
+  // Same reset as loading a provider, including old in-flight requests.
+  invalidateProbeResults();
   $("#f-name").value = p.name;
   $("#f-baseurl").value = p.baseURL;
   $("#f-apikey").value = p.apiKey;
@@ -2830,6 +3504,10 @@ function finishWizard() {
   $("#f-envname").value = p.envVarName;
   $("#f-envname").dataset.touched = "1";
   setEnvMode(p.useEnvVar);
+  setKeyFieldState(p.useEnvVar ? p.envVarName : "");
+  syncAdvancedDisclosure({
+    open: (p.apiFormat && p.apiFormat !== "openai-chat") || !!($("#f-pool").value.trim()),
+  });
   $("#f-default").checked = true;
   renderModelList();
   $("#f-defaultmodel").value = state.models[0].id;
@@ -2853,6 +3531,9 @@ function reachBadge(p) {
   // a credential that does not exist.
   if (p.reach === "up" && p.fault === "nokey") return `<span class="warn-line">\u26a0 нет ключа</span>`;
   if (p.reach === "up" && p.fault === "key") return `<span class="warn-line">\u26a0 ключ не принят</span>`;
+  // A client-whitelist gate (AgentRouter and friends) rejects the request before
+  // it reads the key: saying "ключ не принят" here would blame a working token.
+  if (p.reach === "up" && p.fault === "client") return `<span class="warn-line">\u26a0 клиент не в whitelist</span>`;
   if (p.reach === "up" || (p.reach == null && p.ok)) {
     return `<span class="ok-line">\u2713 доступен${p.viaProxy ? " (прокси)" : ""}</span>`;
   }
@@ -2876,14 +3557,18 @@ function reachBadge(p) {
 function rankDefaultCandidates(providers) {
   const usable = asArray(providers).filter((p) => !p.isDefault && asArray(p.models).length);
   const healthy = usable.filter((p) => p.reach === "up" && !p.fault);
-  const authBroken = usable.filter((p) => p.reach === "up" && (p.fault === "key" || p.fault === "nokey"));
+  const authBroken = usable.filter((p) => p.reach === "up" && (p.fault === "key" || p.fault === "nokey" || p.fault === "client"));
   return { healthy, authBroken, alive: [...healthy, ...authBroken] };
 }
 if (typeof window !== "undefined") window.rankDefaultCandidates = rankDefaultCandidates;
 
 async function diagnose() {
+  const context = configIdentity();
+  const configHash = state.configHash;
   setStatus("Проверяю\u2026", "");
-  const r = await apiSafe("/api/diagnostics" + "?configPath=" + encodeURIComponent(state.configPath || ""));
+  const r = await apiSafe("/api/diagnostics" + "?configPath=" + encodeURIComponent(context.configPath));
+  if (!isCurrentConfig(context) || configHash !== state.configHash || state.lastDiagAt > context.startedAt) return;
+  state.lastDiagAt = context.startedAt;
   if (!r || (!r.ok && !asArray(r.providers).length && !asArray(r.issues).length)) {
     setStatus("", "");
     return toast((r && r.error) || "Диагностика не удалась", "err");
@@ -2891,18 +3576,20 @@ async function diagnose() {
   // Kept for the copyable report: re-probing on every copy would burn quota
   // and take a minute on a dozen providers.
   state.lastDiag = r;
+  if (r.model) state.currentModel = String(r.model);
   const issues = asArray(r.issues);
   const providers = asArray(r.providers);
   // Feed the sidebar dots from the same probe results, so the list and the
   // panel can never disagree about who is up.
   state.health = {};
   for (const p of providers) {
-    state.health[p.key] = { reach: p.reach, fault: p.fault, ok: p.ok };
+    state.health[p.key] = { reach: p.reach, fault: p.fault, ok: p.ok, checkedAt: context.startedAt };
   }
   renderProviderList();
+  renderRoutes();
+  scheduleHealthRefresh();
   const el = $("#issues");
   el.hidden = false;
-  syncSidePlaceholder();
   let html = `<div class="result-card"><h3>Диагностика</h3>`;
   html += `<div class="ok-line" style="color:var(--muted)">Модель по умолчанию: ${esc(r.model || "\u2014")}</div>`;
   html += `<div class="ok-line" style="color:var(--muted)">config: ${esc(r.path || "")}</div>`;
@@ -3067,6 +3754,7 @@ async function diagnose() {
   const badProvider = providers.some((p) =>
     p.reach === "down" || p.fault === "key" || p.fault === "nokey" || (p.reach == null && !p.ok));
   const hasErr = issues.some((i) => i.severity === "error") || badProvider;
+  showReports();
   toast(hasErr ? "Диагностика: есть проблемы" : "Диагностика: всё в порядке", hasErr ? "err" : "ok");
 }
 
@@ -3124,14 +3812,35 @@ async function runEnvAudit() {
     }
   }
   html += `<div class="diag-sect">Действия</div>
-    <div class="diag-fix"><button class="btn btn-mini" id="envAuditRerun" type="button">Обновить</button></div>`;
+    <div class="diag-fix"><button class="btn btn-mini" id="envAuditRerun" type="button">Обновить</button>`
+    + (orphaned.length ? ` <button class="btn btn-mini" id="envAuditCleanAll" type="button">Очистить сирот</button>` : "")
+    + `</div>`;
   html += `</div>`;
   el.innerHTML = html;
+  showReports();
   const rerun = $("#envAuditRerun");
   if (rerun) rerun.onclick = () => runEnvAudit();
+  const cleanAll = $("#envAuditCleanAll");
+  if (cleanAll) cleanAll.onclick = () => cleanAllOrphans(cleanAll);
   el.querySelectorAll("[data-env-remove]").forEach((b) => {
     b.onclick = () => removeOrphanEnv(b.dataset.envRemove, b);
   });
+}
+
+async function cleanAllOrphans(btn) {
+  if (!confirm("Удалить все неиспользуемые переменные-сироты из окружения пользователя?")) return;
+  if (btn) setBtnLoading(btn, true);
+  try {
+    const r = await apiSafe("/api/env-clean-orphans", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ configPath: state.configPath }),
+    });
+    if (!r || !r.ok) return toast((r && r.error) || "Не удалось очистить сирот", "err");
+    toast(`Удалено переменных: ${(r.removed || []).length}`, "ok");
+    await runEnvAudit();
+  } finally {
+    if (btn) setBtnLoading(btn, false);
+  }
 }
 
 async function removeOrphanEnv(name, btn) {
@@ -3420,7 +4129,7 @@ async function renderDigest(force) {
   const el = $("#issues");
   el.hidden = false;
   el.innerHTML = `<div class="result-card"><h3>Халява</h3><div class="ok-line" style="color:var(--muted)">Загружаю…</div></div>`;
-  syncSidePlaceholder();
+  showReports();
   const r = await apiSafe("/api/digest" + (force ? "?refresh=1" : ""));
   if (!r || (!r.ok && !asArray(r.perks).length && !asArray(r.news).length)) {
     el.innerHTML = `<div class="result-card"><h3>Халява</h3>`
@@ -3501,6 +4210,7 @@ function paintDigest() {
   }
   html += `</div>`;
   el.innerHTML = html;
+  showReports();
   el.querySelectorAll("[data-df]").forEach((ch) => ch.addEventListener("click", () => {
     state.digestFilter = ch.dataset.df;
     paintDigest();

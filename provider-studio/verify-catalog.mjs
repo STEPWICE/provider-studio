@@ -71,6 +71,8 @@ eq("a bare name matches", C.lookupModel(cat, "shared-model").matchedBy, "name");
 // ":free" marks a tier, not a different model.
 eq("a :free suffix still matches", C.lookupModel(cat, "shared-model:free").matchedBy, "name");
 eq("an unknown id matches nothing", C.lookupModel(cat, "no-such-model").matchedBy, null);
+// Gateways differ in case ("GPT-4o" vs "gpt-4o"); it is the same model.
+eq("a case-different name still matches", C.lookupModel(cat, "SHARED-Model").matchedBy, "name");
 
 // ---------------------------------------------------------------- suggestions
 const s = C.suggestSpecs(cat, "vendor/shared-model");

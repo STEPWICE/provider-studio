@@ -185,10 +185,23 @@ export function fileStamp(path) {
   return { exists: true, size: st.size, mtime: st.mtimeMs, hash };
 }
 
+function sleepSync(ms) {
+  if (ms <= 0) return;
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {}
+  }
+}
+
 /**
  * Writes via a temp file in the same directory, then renames.
  * A crash or a full disk mid-write leaves the original config intact instead of
  * truncated — the difference between a recoverable failure and a lost config.
+ *
+ * Windows file locking: on EBUSY, EPERM, EACCES during renameSync, retries up
+ * to 8 times with exponential backoff (25-200ms) and jitter before throwing.
  */
 export function writeFileAtomic(path, text) {
   const target = resolve(path);
@@ -197,7 +210,23 @@ export function writeFileAtomic(path, text) {
   const tmp = join(dir, `.${basenameSafe(target)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
   try {
     writeFileSync(tmp, text, "utf8");
-    renameSync(tmp, target);
+    const maxAttempts = 8;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        renameSync(tmp, target);
+        break;
+      } catch (err) {
+        const code = err?.code;
+        const isLock = code === "EBUSY" || code === "EPERM" || code === "EACCES";
+        if (!isLock || attempt === maxAttempts - 1) {
+          throw err;
+        }
+        const base = Math.min(200, 25 * (2 ** attempt));
+        const jitter = Math.floor(Math.random() * (base * 0.3));
+        const delay = Math.min(200, base + jitter);
+        sleepSync(delay);
+      }
+    }
   } catch (e) {
     // rename across a locked target can fail; never leave the temp file behind
     try { if (existsSync(tmp)) unlinkSync(tmp); } catch {}

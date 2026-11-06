@@ -166,6 +166,27 @@ check("api_key snake case is masked", !maskSecretsInLine('"api_key": "sk-abcdefg
 check("masking is case-insensitive on the field", !maskSecretsInLine('"ApiKey": "sk-abcdefghijkl"').includes("sk-abcdefghijkl"));
 eq("masking tolerates null", maskSecretsInLine(null), "");
 check("a short key is fully masked", !/abc/.test(maskSecretsInLine('"apiKey": "abc"')), maskSecretsInLine('"apiKey": "abc"'));
+// Anthropic-style auth travels in x-api-key; leaving it unmasked leaked the
+// whole class of keys this tool writes into options.headers.
+check("an x-api-key field is masked", !maskSecretsInLine('"x-api-key": "sk-ant-abcdefghijkl"').includes("abcdefghijkl"));
+// An inline object carries several secrets on one line; masking only the
+// first match showed the rest.
+check("every secret on the line is masked", (() => {
+  const out = maskSecretsInLine('{ "apiKey": "sk-aaaaaaaaaaaa", "token": "bbbbbbbbbbbb" }');
+  return !out.includes("aaaaaaaaaaaa") && !out.includes("bbbbbbbbbbbb");
+})());
+// The key name appearing inside an earlier string value used to be found
+// instead of the real field, masking the note and leaving the key visible.
+check("a same-named word in a string is not the field", (() => {
+  const out = maskSecretsInLine('"note": "про apiKey: тут", "apiKey": "sk-realkeyvalue"');
+  return out.includes("про apiKey: тут") && !out.includes("sk-realkeyvalue");
+})());
+// An escaped quote inside the value is not the closing quote: cutting there
+// leaves the tail of the secret unmasked.
+check("escaped quotes do not unmask the tail", (() => {
+  const out = maskSecretsInLine('"apiKey": "sk-\\"quotedtail12345"');
+  return !out.includes("quotedtail12345");
+})());
 
 const secretDiff = maskDiff(diffLines('{"apiKey": "sk-oldsecretvalue"}', '{"apiKey": "sk-newsecretvalue"}'));
 check("masking applies across a whole diff",

@@ -26,6 +26,15 @@ import { IS_WINDOWS, home } from "./paths.mjs";
 /** Env var names we accept — matches what opencode's `{env:...}` allows. */
 export const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/** Системные переменные, защищённые от изменения и удаления. */
+export const PROTECTED_ENV_VARS = new Set([
+  "PATH", "TEMP", "TMP", "COMSPEC", "SYSTEMROOT", "WINDIR", "USERPROFILE", "HOMEDRIVE",
+]);
+
+export function isProtectedEnvVar(name) {
+  return PROTECTED_ENV_VARS.has(String(name || "").trim().toUpperCase());
+}
+
 const USER_ENV_KEY = "HKCU\\Environment";
 const MACHINE_ENV_KEY =
   "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
@@ -188,13 +197,23 @@ export function lookupEnv(name, { useCache = true } = {}) {
   }
 
   const winner = found[0] || null;
+  // Where the value actually persists, which is the only thing that survives a
+  // restart. A variable present in both this process and HKCU is a *user*
+  // variable that this process happens to inherit — reporting it as "process"
+  // hid the fact that the persistent copy was written and told the user
+  // nothing about durability.
+  const durable = found.find((f) => f.scope === "user" || f.scope === "machine") || null;
   const result = {
     name: clean,
     set: Boolean(winner),
-    scope: winner ? winner.scope : null,
+    scope: durable ? durable.scope : (winner ? winner.scope : null),
     length: winner ? winner.value.length : 0,
     value: winner ? winner.value : "",
     scopes: found.map((f) => f.scope),
+    // inherited — a program launched right now would see it.
+    inherited: found.some((f) => f.scope === "process"),
+    // durable — it survives a reboot, so a *newly started* opencode will see it.
+    durable: Boolean(durable),
   };
   cache.set(clean, { at: Date.now(), result });
   return result;
@@ -254,10 +273,44 @@ function expandUser(p) {
 }
 
 /** The command that creates the variable, for error messages the user can act on. */
-export function setEnvCommand(name) {
+export function setEnvCommand(name, value = "<ключ>") {
   const clean = String(name || "NAME").trim() || "NAME";
-  return IS_WINDOWS ? `setx ${clean} "<ключ>"` : `export ${clean}="<ключ>"`;
+  const val = String(value ?? "<ключ>");
+  if (IS_WINDOWS) {
+    if (val.length > SETX_MAX_LENGTH) {
+      return `powershell -Command "[Environment]::SetEnvironmentVariable('${clean}', '${val.replace(/'/g, "''")}', 'User')"`;
+    }
+    return `setx ${clean} "${val}"`;
+  }
+  return `export ${clean}="${val.replace(/(["\\$`])/g, "\\$1")}"`;
 }
+
+/**
+ * The command that makes a *running* OpenCode see a variable written after it
+ * started.
+ *
+ * This is the trap behind the "Provide your ... API key" / 401-after-setx
+ * reports: OpenCode Desktop keeps a background service (`opencode serve
+ * --service`) alive for hours, and a process keeps the environment it was born
+ * with. `setx` updates the registry; closing and reopening the window does not
+ * replace the service. Only a service restart (or a reboot) does.
+ *
+ * Caveat: `service` exists only in the CLI shipped with OpenCode Desktop. An
+ * older global install prints its help page instead, which is why the UI's
+ * restart button resolves the bundled CLI itself rather than trusting PATH.
+ */
+export const OPENCODE_RESTART_COMMAND = "opencode service restart";
+
+/**
+ * One sentence about the service, for places that just wrote a variable.
+ * Kept next to the command so the UI, endpoints and docs cannot drift apart.
+ */
+export function opencodeRestartHint() {
+  return `OpenCode запускается фоновой службой и не видит переменные, записанные после её старта. ` +
+    `Перезапусти службу (кнопка «↻ перезапустить OpenCode» рядом) — или приложение OpenCode целиком, ` +
+    `либо компьютер.`;
+}
+
 
 /**
  * Creates or updates a persistent user-scope variable.
@@ -279,14 +332,19 @@ export function setUserEnvVar(name, value) {
   if (!ENV_NAME_RE.test(clean)) {
     return { ok: false, error: `Недопустимое имя переменной: «${clean || "(пусто)"}»` };
   }
+  if (isProtectedEnvVar(clean)) {
+    return { ok: false, error: "Переменная защищена от изменения" };
+  }
   const val = String(value ?? "").trim();
   if (!val) return { ok: false, error: "Пустое значение — переменную создавать нечего" };
   // setx silently truncates past 1024 characters, producing a key that looks
   // set and fails every request.
   if (val.length > SETX_MAX_LENGTH) {
+    const cmd = `powershell -Command "[Environment]::SetEnvironmentVariable('${clean}', 'VAL', 'User')"`;
     return {
       ok: false,
-      error: `Значение длиннее ${SETX_MAX_LENGTH} символов — setx обрежет его. Задай переменную через «Свойства системы».`,
+      error: `Значение длиннее ${SETX_MAX_LENGTH} символов — setx обрежет его. Задай переменную через PowerShell: ${cmd}`,
+      command: cmd,
     };
   }
   if (!IS_WINDOWS) {
@@ -341,7 +399,8 @@ export function keyRefProblem(apiKey) {
     }
     return (
       `переменная ${r.envVarName} не задана — opencode подставит пустую строку ` +
-      `и провайдер ответит 401. Задай её: ${setEnvCommand(r.envVarName)}`
+      `и провайдер ответит 401. Задай её: ${setEnvCommand(r.envVarName)}, ` +
+      `затем перезапусти службу OpenCode (кнопка «↻» рядом с переменной или перезапуск приложения)`
     );
   }
   if (!r.isRef && !r.value) return "API-ключ не задан";
@@ -351,3 +410,95 @@ export function keyRefProblem(apiKey) {
 // `setx` silently truncates at 1024 characters, which corrupts long keys (some
 // JWT-style tokens exceed it) in a way that looks like an invalid key.
 export const SETX_MAX_LENGTH = 1024;
+
+/** Names that look like API-key holders, for the orphan cleanup. */
+export const KEY_LIKE_RE = /(?:API_KEY|_KEY|TOKEN|SECRET)(?:_\d+)?$|^[A-Z0-9_]*_API_KEY(?:_[A-Za-z0-9]+)?$/i;
+
+/**
+ * Lists value names stored under HKCU\Environment (user scope), without values.
+ * Used by the env audit to find variables no provider references anymore.
+ * Returns [] on non-Windows or when the registry cannot be read.
+ */
+export function listUserEnvNames({ fresh = true } = {}) {
+  if (!IS_WINDOWS) return [];
+  if (fresh) clearEnvCache();
+  const dump = readRegistryDump(USER_ENV_KEY, { fresh });
+  if (!dump) return [];
+  const out = [];
+  for (const lower of dump.keys()) {
+    // The dump map is keyed lowercased; recover display case from process.env
+    // when available, otherwise upper-case (env names are case-insensitive
+    // on Windows and conventionally upper-case).
+    const fromProc = Object.keys(process.env).find((k) => k.toLowerCase() === lower);
+    out.push(fromProc || lower.toUpperCase());
+  }
+  return out.sort();
+}
+
+/**
+ * Deletes a persistent user-scope variable (the "очистка" for orphaned keys).
+ *
+ * Guarded: refuses invalid names, key-like allowlist outside of explicit
+ * force, and — unless force — names still referenced by the given config text.
+ * Never touches process.env copies of other variables; the deleted name is
+ * removed from this process too so later lookups stop seeing a stale copy.
+ */
+export function removeUserEnvVar(name, { allowReferenced = false, referenced = [] } = {}) {
+  const clean = String(name || "").trim();
+  if (!ENV_NAME_RE.test(clean)) {
+    return { ok: false, error: `Недопустимое имя переменной: «${clean || "(пусто)"}»` };
+  }
+  if (isProtectedEnvVar(clean)) {
+    return { ok: false, error: "Переменная защищена от изменения" };
+  }
+  if (!IS_WINDOWS) {
+    return {
+      ok: false,
+      error: "Автоматическое удаление поддерживается только в Windows.",
+      command: `unset ${clean}`,
+      manual: true,
+    };
+  }
+  const refSet = new Set((Array.isArray(referenced) ? referenced : []).map((n) => String(n).toLowerCase()));
+  if (!allowReferenced && refSet.has(clean.toLowerCase())) {
+    return { ok: false, error: `Переменная ${clean} используется в конфиге — сначала убери ссылку {env:${clean}}` };
+  }
+  try {
+    execFileSync("reg", ["delete", USER_ENV_KEY, "/v", clean, "/f"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10000,
+      windowsHide: true,
+    });
+  } catch (e) {
+    return { ok: false, error: `Не удалось удалить ${clean}: переменная не найдена или нет доступа` };
+  }
+  delete process.env[clean];
+  clearEnvCache();
+  return { ok: true, name: clean };
+}
+
+/**
+ * Обнаружение переменных-призраков (ключи в HKCU\Environment, не используемые в активных провайдерах/шардах).
+ */
+export function findGhostEnvVars({ referenced = [] } = {}) {
+  const refSet = new Set((Array.isArray(referenced) ? referenced : []).map((n) => String(n).toLowerCase()));
+  return listUserEnvNames().filter(
+    (n) => KEY_LIKE_RE.test(n) && !refSet.has(String(n).toLowerCase()) && !isProtectedEnvVar(n),
+  );
+}
+
+/**
+ * Очистка переменных-призраков.
+ */
+export function cleanGhostEnvVars({ referenced = [] } = {}) {
+  const ghosts = findGhostEnvVars({ referenced });
+  const removed = [];
+  const errors = [];
+  for (const name of ghosts) {
+    const r = removeUserEnvVar(name, { referenced });
+    if (r.ok) removed.push(name);
+    else errors.push({ name, error: r.error });
+  }
+  return { ok: true, removed, errors };
+}

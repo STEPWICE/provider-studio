@@ -408,6 +408,10 @@ const costGaps = [];
     const priced = build({ id: "m1", costInput: 2.5, costOutput: 10, costCacheRead: 0.25, costCacheWrite: 1 });
     if (priced.costInput !== 2.5 || priced.costOutput !== 10) costGaps.push("a known price is lost on the way into the config");
     if (priced.costCacheRead !== 0.25 || priced.costCacheWrite !== 1) costGaps.push("cache pricing is lost on the way into the config");
+    const namedFree = build({ id: "deepseek-v4.1-flash:free", free: true, freeSource: "name" });
+    if (namedFree.free !== true || namedFree.freeSource !== "name") costGaps.push("a name-based free hint is lost on the way into the form");
+    const tierFree = build({ id: "m-free", free: true, freeSource: "tier", tier: "free" });
+    if (tierFree.free !== true || tierFree.freeSource !== "tier" || tierFree.tier !== "free") costGaps.push("provider-declared free-tier metadata is lost on the way into the form");
     // Unknown must stay absent, not become 0 — 0 reads as "free" and would
     // under-report spend for a model that actually bills.
     const unpriced = build({ id: "m2" });
@@ -461,6 +465,20 @@ const probeGaps = [];
   // reads as a wall of broken models.
   if (!/fault === "blocked"\).length/.test(js)) probeGaps.push("the batch summary does not count temporary blocks separately");
   if (!/x\.fault !== "plan" && x\.fault !== "blocked"/.test(js)) probeGaps.push("temporary blocks are counted as broken models");
+  for (const [name, next] of [
+    ["testAllModels", "testSingleModel"],
+    ["testSingleModel", "poolKeys"],
+    ["testDefaultModel", "testConnection"],
+    ["testConnection", "validate"],
+    ["openDiscover", "renderDiscoverList"],
+  ]) {
+    const start = js.indexOf(`function ${name}`);
+    const body = start < 0 ? "" : js.slice(start, js.indexOf(`function ${next}`, start));
+    const direct = /configPath: state\.configPath/.test(body) && /previousKey: state\.editingKey/.test(body);
+    const captured = /captureProbeContext\(/.test(body)
+      && /configPath: context\.configPath/.test(body) && /previousKey: context\.previousKey/.test(body);
+    if (!direct && !captured) probeGaps.push(`${name} does not identify the selected config and exact provider key`);
+  }
 }
 console.log(probeGaps.length ? `PROBE REPORT GAPS: ${probeGaps.join("; ")}` : "probe results keep working, unpaid, blocked and dead apart");
 
@@ -557,11 +575,45 @@ const deleteGaps = [];
   if (/class="wipe"/.test(js)) deleteGaps.push("a split list-only/config-only delete still exists");
   if (!/function deleteEverywhere/.test(js)) deleteGaps.push("no deleteEverywhere - rows cannot fully delete");
   const start = js.indexOf("async function deleteEverywhere");
-  const del = start < 0 ? "" : js.slice(start, start + 3000);
+  const del = start < 0 ? "" : js.slice(start, start + 5000);
   if (!/preview-remove/.test(del)) deleteGaps.push("full delete skips the diff preview");
   if (!/remove-provider/.test(del)) deleteGaps.push("full delete never removes from the config");
   if (!/"\/api\/delete"/.test(del)) deleteGaps.push("store-only rows have no delete path");
   if (!/notFound/.test(del)) deleteGaps.push("the config/store split is not distinguished");
+
+  // The regression that made deleting impossible: the row buttons contain an
+  // <svg><use>, so e.target is the icon, not the button. Matching on
+  // e.target.classList let the click fall through to open() and the provider
+  // was "undeletable" while every static check stayed green.
+  const renderAt = js.indexOf("function renderProviderList");
+  const rows = renderAt < 0 ? "" : js.slice(renderAt, renderAt + 4500);
+  if (!/e\.target\.closest\("\.del"\)/.test(rows)) {
+    deleteGaps.push("the delete click does not use closest('.del') — clicking the icon opens the provider");
+  }
+  if (!/e\.target\.closest\("\.ren"\)/.test(rows)) {
+    deleteGaps.push("the rename click does not use closest('.ren')");
+  }
+  if (/e\.target\.classList\.contains\("(?:del|ren)"\)/.test(js)) {
+    deleteGaps.push("a row action still matches e.target.classList — an icon click would miss it");
+  }
+  if (!/data-key="\$\{esc\(key\)\}"/.test(rows)) deleteGaps.push("the row carries no exact config key");
+  if (!/deleteEverywhere\(row\.dataset\.name, row\.dataset\.key\)/.test(rows)) {
+    deleteGaps.push("deleteEverywhere does not receive the exact key");
+  }
+  if (!/renameInConfig\(row\.dataset\.name, row\.dataset\.key\)/.test(rows)) {
+    deleteGaps.push("renameInConfig does not receive the exact key");
+  }
+  if (!/e\.target !== row/.test(rows)) deleteGaps.push("Enter/Space on a row button activates the row instead of the button");
+  // The form must not keep a deleted provider loaded: the next Apply would
+  // recreate it from stale fields without the user asking.
+  if (!/state\.editingKey && gone\.has\(state\.editingKey\)\) resetForm\(\)/.test(del)
+    && !/gone\.has\(state\.editingKey\)/.test(del)) {
+    deleteGaps.push("the form is not reset after deleting the provider it shows");
+  }
+  const actionIconRule = (css.match(/\.provider-row \.ren \.ico[^{]*\{[^}]*\}/) || [""])[0];
+  if (!/pointer-events:\s*none/.test(actionIconRule)) {
+    deleteGaps.push("row action icons can swallow the click (no pointer-events:none)");
+  }
 }
 console.log(deleteGaps.length ? `DELETE GAPS: ${deleteGaps.join("; ")}` : "delete removes the provider everywhere");
 
@@ -616,11 +668,309 @@ const polishGaps = [];
 }
 console.log(polishGaps.length ? `POLISH GAPS: ${polishGaps.join("; ")}` : "key preview, preset filter, dialogs and small screens are covered");
 
+// Execute the shipped functions, with only browser/network boundaries stubbed.
+function appFunctionSource(name) {
+  const match = new RegExp(`^(?:async )?function ${name}\\(`, "m").exec(js);
+  if (!match) throw new Error(`Missing app function: ${name}`);
+  const end = js.indexOf("\n}", match.index);
+  if (end < 0) throw new Error(`Unclosed app function: ${name}`);
+  return js.slice(match.index, end + 2);
+}
+
+function appFunctions(names, dependencies) {
+  return new Function(...Object.keys(dependencies),
+    `${names.map(appFunctionSource).join("\n")}\nreturn {${names.join(",")}};`)(...Object.values(dependencies));
+}
+
+const routeGaps = [];
+{
+  const check = (ok, message) => { if (!ok) routeGaps.push(message); };
+  try {
+    const now = Date.UTC(2026, 10, 10, 12);
+    class Clock extends Date { static now() { return now; } }
+    const fresh = (ok, fault = null, age = 1000) => ({ ok, fault, reach: "up", transient: false,
+      checkedAt: now - age, expiresAt: now + 300000 });
+    const state = { providers: [], health: {}, modelHealth: {}, healthWarning: "", currentModel: "unchanged/model" };
+    const panel = { hidden: true, innerHTML: "" };
+    const f = appFunctions(["asArray", "esc", "fmtNum", "money", "isFreshModelHealth", "healthCheckedTime",
+      "modelCost", "modelFaultLabel", "routeHealth", "routeCandidates", "routeQuality", "routeScore",
+      "routeWhy", "routeState", "routeRank", "pickRoute", "renderRoutes", "priceTag"], {
+      state, Date: Clock, $: (id) => id === "#routesPanel" ? panel : null,
+      slugifyName: (s) => String(s).toLowerCase(), icon: () => "", syncSidePlaceholder: () => {},
+    });
+    const weak = { id: "working", inputTypes: ["text", "image"], toolUse: false, contextWindow: 1000, costInput: 40, costOutput: 80 };
+    const strong = { id: "unchecked", inputTypes: ["text", "image"], toolUse: true, reasoning: true,
+      contextWindow: 2000000, costInput: 0, costOutput: 0 };
+    const provider = (models) => ({ key: "exact_key", name: "Different label", models });
+    state.providers = [provider([strong, weak])];
+    state.modelHealth = { "exact_key/working": fresh(true) };
+    for (const kind of ["code", "fast", "vision"]) {
+      check(f.pickRoute(kind, new Set())?.id === "working", `${kind}: unchecked metadata outranks a verified completion`);
+    }
+    const sibling = f.routeCandidates().find((c) => c.id === "unchecked");
+    check(!sibling.health.verified && f.routeState(sibling).cls === "unknown", "completion health bleeds onto a sibling model");
+    state.providers.push({ key: "other", name: "Different label", models: [weak] });
+    check(!f.routeCandidates().find((c) => c.key === "other").health.verified, "completion health is matched by display name, not exact key");
+
+    for (const fault of ["quota", "plan", "region", "blocked", "model", "auth", "endpoint", "key", "nokey", "network", null]) {
+      state.providers = [provider([{ ...strong, id: "failed" }, { ...weak, id: "unchecked" }])];
+      state.modelHealth = { "exact_key/failed": fresh(false, fault) };
+      // Even a newer successful /models call cannot erase a refused completion.
+      state.health = { exact_key: { reach: "up", ok: true, fault: null, checkedAt: now - 500 } };
+      for (const kind of ["code", "fast", "vision"]) {
+        check(f.pickRoute(kind, new Set())?.id === "unchecked", `${fault}/${kind}: failed completion outranks unchecked`);
+      }
+      const failed = f.routeCandidates().find((c) => c.id === "failed");
+      check(f.routeRank(failed) === 0 && f.routeState(failed).cls !== "ok", `${fault}: reach=up is treated as a working model`);
+      const fallback = f.pickRoute("code", new Set(["exact_key/unchecked"]));
+      check(fallback?.id === "failed" && /крайний вариант/.test(f.routeState(fallback).text), `${fault}: no labelled last-resort fallback`);
+    }
+
+    state.providers = [provider([{ ...weak, id: "stale" }, { ...weak, id: "unknown" }])];
+    state.health = {};
+    for (const ok of [true, false]) {
+      state.modelHealth = { "exact_key/stale": { ...fresh(ok, ok ? null : "plan"), checkedAt: now - 7200000, expiresAt: now - 1 } };
+      const [stale, unknown] = f.routeCandidates();
+      check(f.routeRank(stale) === f.routeRank(unknown) && f.routeScore(stale, "code") === f.routeScore(unknown, "code"),
+        `expired ${ok ? "success" : "failure"} changes ranking`);
+      check(f.routeState(stale).text === "проверка устарела" && !!f.routeState(stale).title, "stale completion lacks its label/check-time tooltip");
+    }
+    state.modelHealth = {};
+    state.health = { exact_key: { reach: "up", ok: true, fault: null, checkedAt: now - 500 } };
+    const connected = f.routeCandidates()[0];
+    check(f.routeRank(connected) === 1 && f.routeState(connected).cls === "unknown"
+      && f.routeState(connected).text === "сервер доступен", "/models 200 is incorrectly proof that a model works");
+
+    state.providers = [provider([weak, strong])];
+    state.modelHealth = { "exact_key/working": fresh(true) };
+    state.health = { exact_key: { reach: "down", fault: "endpoint", checkedAt: now - 2000 } };
+    check(f.routeCandidates()[0].health.verified, "older diagnostics override a newer completion");
+    state.health.exact_key.checkedAt = now - 500;
+    check(f.routeCandidates()[0].bad && !f.routeCandidates()[0].health.verified, "new broken endpoint cannot demote an older successful completion");
+    state.health.exact_key.checkedAt = now - 7200000;
+    check(f.routeCandidates()[0].health.verified, "expired diagnostics demote a fresh completion");
+    state.providers = [provider([{ ...weak, inputTypes: ["text"] }])];
+    check(f.pickRoute("vision", new Set()) === null, "verification bypasses vision capability filtering");
+
+    const unknownPrices = [{}, { costInput: "", costOutput: "" }, { costInput: " ", costOutput: 0 },
+      { costInput: 0 }, { costOutput: 0 }, { costInput: NaN, costOutput: 0 }, { costInput: Infinity, costOutput: 0 },
+      { costInput: "Infinity", costOutput: 0 }, { costInput: -1, costOutput: 1 }, { costInput: false, costOutput: false },
+      { costInput: Number.MAX_VALUE, costOutput: Number.MAX_VALUE }];
+    for (const m of unknownPrices) {
+      check(f.modelCost(m) === null && /цена \?/.test(f.priceTag(m)), `unknown/nonfinite/half price is not unknown: ${JSON.stringify(m)}`);
+    }
+    for (const m of [{ costInput: 0, costOutput: 0 }, { costInput: "0", costOutput: "0" }, { free: true, freeSource: "tier", tier: "free" }]) {
+      check(f.modelCost(m) === 0 && />free</.test(f.priceTag(m)), "declared zero price/free tier is not supported");
+    }
+    const hint = { id: "vendor/model:free", free: true, freeSource: "name" };
+    check(f.modelCost(hint) === null && /free\?/.test(f.priceTag(hint)), "name-only free hint is declared free");
+    state.providers = [provider([hint])];
+    const hintWhy = f.routeWhy(f.routeCandidates()[0], "code");
+    check(/free\?/.test(hintWhy) && !/бесплатная/.test(hintWhy), "route claims name-only free as confirmed free");
+    check(f.modelCost({ ...hint, costInput: 2, costOutput: 3 }) === 5, "a free-name hint overrides actual billed prices");
+
+    // Four verified candidates are weaker than the remaining unchecked/failed
+    // ones. All four cards, including reserve, must use the same ordering.
+    state.providers = [provider([0, 1, 2, 3].map((i) => ({ ...weak, id: `good${i}` })).concat(strong, { ...strong, id: "bad" }))];
+    state.health = {};
+    state.modelHealth = Object.fromEntries([0, 1, 2, 3].map((i) => [`exact_key/good${i}`, fresh(true)]));
+    state.modelHealth["exact_key/bad"] = fresh(false, "quota");
+    state.healthWarning = "history <read-only>";
+    const before = JSON.stringify(state.providers);
+    f.renderRoutes();
+    check(state.routes.length === 4 && state.routes.every((r) => r.c.health.verified), "reserve bypasses evidence ranking");
+    check(state.routes[3]?.kind === "Резерв", "reserve card is missing");
+    check(/1 ч/.test(panel.innerHTML) && /5 мин/.test(panel.innerHTML) && /7 дней/.test(panel.innerHTML), "route note does not explain freshness/history limits");
+    check(panel.innerHTML.includes("history &lt;read-only&gt;"), "healthWarning is hidden or not HTML-escaped");
+    check(JSON.stringify(state.providers) === before && state.currentModel === "unchanged/model", "rendering routes mutates the live model/config");
+  } catch (e) { routeGaps.push(e.stack || String(e)); }
+}
+console.log(routeGaps.length ? `ROUTE HEALTH GAPS: ${routeGaps.join("; ")}` : "routes rank exact-model completions, expiry, connectivity and honest prices consistently");
+
+const healthAsyncGaps = [];
+{
+  const check = (ok, message) => { if (!ok) healthAsyncGaps.push(message); };
+  const now = Date.now();
+  const record = (ok) => ({ ok, reach: "up", fault: ok ? null : "plan", transient: false, checkedAt: now, expiresAt: now + 3600000 });
+  function harness() {
+    const state = { configPath: "config-A", configHash: "hash-A", configEpoch: 0, formProbeEpoch: 0,
+      editingKey: "", models: [], health: {}, modelHealth: {}, probeResults: {}, formHeaders: {},
+      providers: [
+        { key: "alpha_key", name: "Alpha", baseURL: "https://alpha.test/v1", apiFormat: "openai-chat", useEnvVar: true, envVarName: "ALPHA_KEY", models: [{ id: "vendor/shared" }, { id: "stale" }] },
+        { key: "beta_key", name: "Beta", baseURL: "https://beta.test/v1", apiFormat: "openai-chat", useEnvVar: true, envVarName: "BETA_KEY", models: [{ id: "vendor/shared" }] },
+      ],
+    };
+    const nodes = new Map(), calls = [], toasts = [];
+    let routeRenders = 0;
+    const $ = (id) => {
+      if (!nodes.has(id)) nodes.set(id, { value: "", checked: false, hidden: true, dataset: {}, innerHTML: "", textContent: "" });
+      return nodes.get(id);
+    };
+    const api = (path, options) => new Promise((resolve) => calls.push({ path, body: options?.body ? JSON.parse(options.body) : null, resolve }));
+    const noop = () => {};
+    const f = appFunctions(["asArray", "esc", "plural", "mergeProviderLists", "suggestEnvName", "collectProvider", "configIdentity", "isCurrentConfig", "selectConfig",
+      "isFreshModelHealth", "healthCheckedTime", "adoptModelHealth", "invalidateProbeResults", "probeConnection", "captureProbeContext", "isCurrentProbe",
+      "completionVerdict", "updateProbeVerdict", "hydrateProbeResults", "probeMark", "probeNote", "modelFaultLabel", "loadProviderIntoForm", "testSingleModel", "testAllModels", "testDefaultModel",
+      "refreshConfigState", "refreshProviders"], {
+      state, $, api, apiSafe: api, slugifyName: (s) => String(s || "").toLowerCase(),
+      renderRoutes: () => { routeRenders++; }, renderProviderList: noop, renderModelList: noop,
+      scheduleHealthRefresh: noop, setBtnLoading: (b, on) => { b.disabled = on; },
+      toast: (...args) => toasts.push(args), confirm: () => true, setInterval: () => 1, clearInterval: noop,
+      stashPoolDraft: noop, clearPoolBox: noop, restorePoolDraft: noop, updateFormatNote: noop,
+      setEnvMode: (on) => { $("#f-env").checked = on; }, setKeyFieldState: noop, renderKeyHint: noop,
+      syncAdvancedDisclosure: noop, formSnapshot: () => "snapshot", renderKeyPreview: noop,
+      updateConfigChip: noop, syncUndoButton: noop,
+    });
+    f.loadProviderIntoForm("Alpha");
+    return { state, $, calls, toasts, f, renders: () => routeRenders };
+  }
+  try {
+    const h = harness();
+    h.state.modelHealth = { "alpha_key/vendor/shared": record(true), "beta_key/vendor/shared": record(false),
+      "alpha_key/stale": { ...record(true), checkedAt: now - 7200000, expiresAt: now - 1 } };
+    h.f.loadProviderIntoForm("Alpha");
+    check(h.state.probeResults["vendor/shared"]?.ok && !h.state.probeResults.stale, "configured form does not hydrate only fresh model evidence");
+    check(h.f.probeMark(h.state.modelHealth["alpha_key/stale"]) === ""
+      && /проверка устарела/.test(h.f.probeNote(h.state.modelHealth["alpha_key/stale"])), "expired rows can retain a green mark");
+    const btn = {};
+    const pending = h.f.testSingleModel(0, btn);
+    check(h.calls[0].body.configPath === "config-A" && h.calls[0].body.previousKey === "alpha_key"
+      && h.calls[0].body.modelId === "vendor/shared", "single probe does not capture exact config/key/model identity");
+    h.f.loadProviderIntoForm("Beta");
+    h.calls[0].resolve({ ok: true, result: { ok: true }, modelHealth: { "alpha_key/vendor/shared": record(true) } });
+    await pending;
+    check(h.state.probeResults["vendor/shared"]?.ok === false, "old response paints another provider's same-id row");
+    check(h.state.modelHealth["alpha_key/vendor/shared"]?.ok && h.renders() > 0, "form switching discards same-config route evidence");
+    check(btn.disabled === false, "probe button remains loading after a discarded response");
+
+    for (const id of ["#f-baseurl", "#f-apikey", "#f-envname", "#f-env", "#f-format"]) {
+      const h = harness();
+      const pending = h.f.testSingleModel(0);
+      if (id === "#f-env") h.$(id).checked = !h.$(id).checked;
+      else h.$(id).value += "-edited";
+      // The identity guard must work even before an input listener has run.
+      h.calls[0].resolve({ ok: true, result: { ok: true }, modelHealth: { "alpha_key/vendor/shared": record(true) } });
+      await pending;
+      check(!h.state.probeResults["vendor/shared"], `${id}: old completion marks an edited connection`);
+      check(h.state.modelHealth["alpha_key/vendor/shared"]?.ok, `${id}: unsaved form edit discards valid configured route health`);
+    }
+    {
+      const h = harness();
+      const pending = h.f.testSingleModel(0);
+      h.f.invalidateProbeResults(); // Edit and undo back to identical field values.
+      h.calls[0].resolve({ ok: true, result: { ok: true }, modelHealth: {} });
+      await pending;
+      check(!h.state.probeResults["vendor/shared"], "edit-then-undo accepts an old in-flight row verdict");
+    }
+    for (const change of ["replace-row", "change-id"]) {
+      const h = harness();
+      const pending = h.f.testSingleModel(0);
+      if (change === "replace-row") h.state.models[0] = { id: "vendor/shared" };
+      else h.state.models[0].id = "other-model";
+      h.calls[0].resolve({ ok: true, result: { ok: true }, modelHealth: {} });
+      await pending;
+      check(!Object.keys(h.state.probeResults).length, `${change}: old response marks a different/re-added model`);
+    }
+    for (const back of [false, true]) {
+      const h = harness();
+      const pending = h.f.testSingleModel(0);
+      h.f.selectConfig("config-B");
+      if (back) h.f.selectConfig("config-A");
+      h.calls[0].resolve({ ok: true, result: { ok: true }, modelHealth: { "alpha_key/vendor/shared": record(true) }, healthWarning: "old warning" });
+      await pending;
+      check(!Object.keys(h.state.modelHealth).length && !Object.keys(h.state.probeResults).length && !h.state.healthWarning,
+        `config switch${back ? " and back" : ""}: old response leaks health/warnings/row marks`);
+    }
+    {
+      const h = harness();
+      const pending = h.f.testAllModels();
+      check(h.calls[0].body.configPath === "config-A" && h.calls[0].body.previousKey === "alpha_key", "batch probe loses config/key identity");
+      h.f.loadProviderIntoForm("Beta");
+      h.calls[0].resolve({ ok: true, result: { results: [{ id: "vendor/shared", ok: true }] }, modelHealth: { "alpha_key/vendor/shared": record(true) } });
+      await pending;
+      check(!Object.keys(h.state.probeResults).length && h.$("#batchStatus").hidden, "old batch response replaces another form's rows/status");
+      check(h.state.modelHealth["alpha_key/vendor/shared"]?.ok, "batch does not refresh same-config routes independently of the form");
+    }
+    {
+      const h = harness();
+      const pending = h.f.testAllModels();
+      h.calls[0].resolve({ ok: true, result: { tested: 2, passed: 1, results: [{ id: "vendor/shared", ok: true }, { id: "stale", ok: false, fault: "quota" }] },
+        modelHealth: { "alpha_key/vendor/shared": record(true) }, healthWarning: "history unavailable" });
+      await pending;
+      check(h.state.probeResults["vendor/shared"]?.ok && h.state.probeResults.stale?.ok === false, "batch persistence warning replaces actual probe verdicts");
+      check(h.state.probeResults.stale.expiresAt - h.state.probeResults.stale.checkedAt === 300000, "quota row does not expire in five minutes");
+      check(h.state.probeResults["vendor/shared"].expiresAt - h.state.probeResults["vendor/shared"].checkedAt === 3600000, "successful row does not expire in one hour");
+    }
+    {
+      const h = harness();
+      const pending = h.f.testSingleModel(0);
+      h.calls[0].resolve({ ok: true, result: { ok: true, message: "completed" }, modelHealth: {}, healthWarning: "read-only history" });
+      await pending;
+      check(h.state.probeResults["vendor/shared"]?.ok && h.toasts.at(-1)?.[1] === "ok", "failed persistence replaces a successful live verdict");
+      check(!Object.keys(h.state.modelHealth).length && h.state.healthWarning === "read-only history", "client invents persistence for an excluded/unconfigured model");
+    }
+    {
+      const h = harness();
+      const older = h.f.testSingleModel(0);
+      const newer = h.f.testAllModels();
+      h.calls[1].resolve({ ok: true, result: { results: [{ id: "vendor/shared", ok: false, fault: "key", startedAt: now + 1, startedOrder: 2, checkedAt: now + 2, expiresAt: now + 3600002 }] } });
+      await newer;
+      h.calls[0].resolve({ ok: true, result: { ok: true, startedAt: now, startedOrder: 1, checkedAt: now + 3, expiresAt: now + 3600003 } });
+      await older;
+      check(h.state.probeResults["vendor/shared"]?.fault === "key", "a late single success overwrites a newer batch failure in the row");
+      h.f.updateProbeVerdict(h.f.completionVerdict({ id: "vendor/shared", ok: true, startedAt: now + 1, startedOrder: 1 }));
+      check(h.state.probeResults["vendor/shared"]?.fault === "key", "same-millisecond probe ordering is not respected");
+      const timed = h.f.completionVerdict({ ok: false, transient: true, checkedAt: now - 60000, expiresAt: now + 240000 });
+      check(timed.checkedAt === now - 60000 && timed.expiresAt === now + 240000, "receiving a delayed response extends its validity");
+    }
+    {
+      const h = harness();
+      h.f.loadProviderIntoForm("Beta");
+      const pending = h.f.testDefaultModel("alpha_key/vendor/shared", {});
+      check(h.calls[0].body.provider.name === "Alpha" && h.calls[0].body.previousKey === "alpha_key"
+        && h.calls[0].body.configPath === "config-A" && h.calls[0].body.modelId === "vendor/shared", "old apply card tests the currently selected provider instead of its own");
+      h.calls[0].resolve({ ok: true, result: { ok: true }, modelHealth: { "alpha_key/vendor/shared": record(true) } });
+      await pending;
+      check(!Object.keys(h.state.probeResults).length && h.state.modelHealth["alpha_key/vendor/shared"]?.ok, "default-model response bleeds row marks or loses route evidence");
+    }
+    for (const method of ["refreshConfigState", "refreshProviders"]) {
+      const h = harness();
+      const pending = h.f[method]();
+      check(h.calls[0].path.includes("configPath=config-A"), `${method}: read is not scoped`);
+      h.f.selectConfig("config-B");
+      h.calls[0].resolve({ providers: [{ key: "old", name: "old" }], modelHealth: { "alpha_key/vendor/shared": record(true) }, opencode: { hash: "old-hash", providers: [] } });
+      await pending;
+      check(!h.state.providers.length && !Object.keys(h.state.modelHealth).length, `${method}: an old config response overwrites the selected config`);
+      const next = h.f[method]();
+      h.calls[1].resolve({ providers: [{ key: "new", name: "new" }], modelHealth: { "new/m": record(true) }, opencode: { hash: "new-hash", providers: [] } });
+      await next;
+      check(h.state.providers[0]?.key === "new" && h.state.modelHealth["new/m"]?.ok, `${method}: does not hydrate selected-config model history`);
+    }
+    {
+      const h = harness();
+      const context = h.f.configIdentity();
+      const latest = { ...record(false), checkedAt: now + 1000 };
+      h.state.modelHealth = { "alpha_key/vendor/shared": latest, "removed/m": record(true) };
+      h.f.adoptModelHealth({ modelHealth: { "alpha_key/vendor/shared": record(true) } }, context, true);
+      check(h.state.modelHealth["alpha_key/vendor/shared"].ok === false && !h.state.modelHealth["removed/m"], "state refresh resurrects older evidence or ignores server-side filtering");
+    }
+    check(/adoptModelHealth\(d, initialContext/.test(appFunctionSource("init")), "initial state does not hydrate model history");
+    for (const name of ["testConnection", "openDiscover"]) {
+      check(!/adoptModelHealth|completionVerdict|state\.modelHealth/.test(appFunctionSource(name)), `${name} counts connectivity/discovery as completion`);
+    }
+    const init = appFunctionSource("init");
+    check(/\["#f-name", "#f-baseurl", "#f-apikey", "#f-envname"\][\s\S]{0,100}invalidateProbeResults/.test(init)
+      && /\["#f-env", "#f-format"\][\s\S]{0,100}invalidateProbeResults/.test(init), "connection fields do not invalidate row verdicts on input/change");
+    check(/checkedAt: context\.startedAt/.test(appFunctionSource("diagnose")) && /isCurrentConfig\(context\)/.test(appFunctionSource("diagnose")), "diagnostics lack timestamp/config guards");
+  } catch (e) { healthAsyncGaps.push(e.stack || String(e)); }
+}
+console.log(healthAsyncGaps.length ? `ASYNC HEALTH GAPS: ${healthAsyncGaps.join("; ")}` : "history hydration and live probe responses respect form/model/config identities");
+
 const failed = missingIds.length + missingClasses.length + badClick.length + leaks.length +
   unreachable.length + phantom.length + guards.length + lies.length +
   typeGaps.length + fieldGaps.length + unstyled.length + wizGaps.length +
   (ruleGap ? 1 : 0) + presetGaps.length + rankGaps.length + layoutGaps.length + costGaps.length +
   freeGaps.length + probeGaps.length + singleGaps.length + maskGaps.length + undoGaps.length + deleteGaps.length +
-  smartGaps.length + polishGaps.length + enrichGaps.length;
+  smartGaps.length + polishGaps.length + enrichGaps.length + routeGaps.length + healthAsyncGaps.length;
 console.log(`\n${failed ? "FAIL" : "OK"} — ${failed} issue(s)`);
 if (failed) process.exitCode = 1;

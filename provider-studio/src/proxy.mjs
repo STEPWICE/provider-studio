@@ -289,7 +289,10 @@ export async function proxyFetch(target, { headers = {}, timeoutMs = 10000, prox
     let timer = null;
 
     const req = mod.request(options, (res) => {
-      let body = "";
+      // Chunks are kept as Buffers and decoded once at the end: a multi-byte
+      // UTF-8 character split across TCP chunks becomes U+FFFD if each chunk
+      // is coerced to a string on its own (body += d does exactly that).
+      const chunks = [];
       let size = 0;
       let truncated = false;
       const fail = async () => {
@@ -308,13 +311,14 @@ export async function proxyFetch(target, { headers = {}, timeoutMs = 10000, prox
           res.destroy();
           return;
         }
-        body += d;
+        chunks.push(d);
       });
       const finish = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         if (socket) socket.end();
+        const body = new TextDecoder().decode(Buffer.concat(chunks));
         const status = res.statusCode || 0;
         resolve({
           ok: status >= 200 && status < 300,
@@ -327,7 +331,17 @@ export async function proxyFetch(target, { headers = {}, timeoutMs = 10000, prox
         });
       };
       res.on("end", finish);
-      res.on("close", () => { if (truncated) finish(); });
+      res.on("close", () => {
+        if (settled) return;
+        if (truncated) { finish(); return; }
+        // The socket closed before "end": the body is incomplete, and handing
+        // it out as if it were whole would mislabel a transport failure as a
+        // provider answer (e.g. invalid JSON). Reject so callers can retry.
+        settled = true;
+        clearTimeout(timer);
+        if (socket) socket.destroy();
+        reject(new Error("Соединение оборвалось до конца ответа"));
+      });
     });
     req.on("error", (e) => {
       if (settled) return;

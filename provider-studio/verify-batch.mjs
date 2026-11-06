@@ -23,6 +23,25 @@ check("success is not a rate limit", B.isRateLimited({ ok: true }) === false);
 check("nothing is not a rate limit", B.isRateLimited(null) === false);
 // "rate" must not be matched inside unrelated words.
 check("the word 'accurate' is not a rate limit", B.isRateLimited({ message: "not accurate enough" }) === false);
+// The throttling verdicts rescue.mjs actually emits: 403/400 carry
+// fault "quota". Matching the message text instead drifted apart once
+// already — "Слишком частые запросы" never matched "слишком часто".
+check("a quota fault is a rate limit",
+  B.isRateLimited({ ok: false, status: 403, fault: "quota", message: "Слишком частые запросы (403) — ключ рабочий" }));
+check("a transient quota fault is a rate limit",
+  B.isRateLimited({ ok: false, status: 400, fault: "quota", transient: true, message: "Слишком частые запросы (400)" }));
+check("a key fault is not a rate limit", B.isRateLimited({ ok: false, status: 401, fault: "key" }) === false);
+{
+  // The live shape that motivated the classification fix: a gateway throttling
+  // with bare 403s must slow and then stop the run — not churn through the
+  // whole list marking working models dead.
+  const clk = fakeClock();
+  const r = await B.runBatch(ids(8), async () => (
+    { ok: false, status: 403, fault: "quota", transient: true, message: "Слишком частые запросы (403)" }
+  ), { concurrency: 1, gapMs: 0, wait: clk.wait });
+  check("quota-throttled run stops early", !!r.stopped && r.stopped.reason === "rate-limited", JSON.stringify(r.stopped));
+  check("not every model was burned through", r.tested < 8, `tested=${r.tested}`);
+}
 
 check("a 401 is account-wide", B.isAccountWideFailure({ status: 401 }));
 check("a key fault is account-wide", B.isAccountWideFailure({ fault: "key" }));
@@ -32,6 +51,9 @@ check("a 404 is not account-wide", B.isAccountWideFailure({ status: 404 }) === f
 // models" for one model and 200 for another on the same key. That is a
 // per-model entitlement, so it must not abort the run.
 check("a plan restriction is not account-wide", B.isAccountWideFailure({ status: 403, fault: "plan" }) === false);
+// A region block is about the model and the country, not about the account, so
+// the rest of the list still deserves a probe.
+check("a region restriction is not account-wide", B.isAccountWideFailure({ status: 403, fault: "region" }) === false);
 check("an unclassified 403 does not abort the run", B.isAccountWideFailure({ status: 403 }) === false);
 // Pins the precedence rather than the current status codes: an explicit "this
 // is about the plan" must win even if the transport reports 401, so that

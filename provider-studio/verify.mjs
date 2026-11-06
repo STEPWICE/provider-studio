@@ -65,7 +65,8 @@ const childEnv = {
 // through as the literal string "undefined" on some platforms, which is very
 // much "set" and would invert the test it is meant to support.
 delete childEnv.PS_VERIFY_KEY_ABSENT;
-const child = spawn(process.execPath, ["server.mjs"], {
+const child = spawn(process.execPath, [join(process.cwd(), "server.mjs")], {
+  cwd: work,
   env: childEnv,
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -73,11 +74,11 @@ let serverLog = "";
 child.stdout.on("data", (d) => (serverLog += d));
 child.stderr.on("data", (d) => (serverLog += d));
 
-async function waitUp(ms = 8000) {
+async function waitUp(ms = 8000, base = BASE) {
   const until = Date.now() + ms;
   while (Date.now() < until) {
     try {
-      const r = await fetch(`${BASE}/api/state`);
+      const r = await fetch(`${base}/api/state`);
       if (r.ok) return true;
     } catch { /* retry */ }
     await new Promise((r) => setTimeout(r, 150));
@@ -335,6 +336,41 @@ try {
     !afterPool.providers.some((p) => p.name === "Pool Victim"),
     JSON.stringify(afterPool.providers.map((p) => p.name)));
 
+  // ---- a pool head with a non-slug key keeps every shard exact ----
+  // Config keys may be `my_pool`; slugifying the shard suffix used to write
+  // `my-pool-2` beside `my_pool`, and the next save left the old shard behind.
+  const exactPool = await (await post("/api/pool-apply", {
+    provider: {
+      key: "my_pool", name: "Exact Pool", baseURL: "https://exact.example/v1",
+      apiFormat: "openai-chat", setAsDefault: false, models: [{ id: "m1" }],
+    },
+    keys: ["sk-exact-pool-key-one-12345", "sk-exact-pool-key-two-67890"],
+    envBase: "PS_EXACT_POOL_KEY",
+    previousKey: "my_pool",
+  })).json();
+  check("an exact pool key keeps every shard exact",
+    exactPool.ok === true
+      && JSON.stringify(exactPool.shardKeys) === JSON.stringify(["my_pool", "my_pool-2"]),
+    JSON.stringify(exactPool).slice(0, 300));
+  const cfgExactPool = readConfigFile();
+  check("both exact shard blocks are in the config",
+    !!cfgExactPool.provider?.my_pool && !!cfgExactPool.provider?.["my_pool-2"],
+    JSON.stringify(Object.keys(cfgExactPool.provider || {})));
+  check("no slug twin was created",
+    cfgExactPool.provider?.["my-pool-2"] === undefined,
+    JSON.stringify(Object.keys(cfgExactPool.provider || {})));
+  const exactPoolRm = await (await post("/api/preview-remove", { key: "my_pool" })).json();
+  check("an exact pool key expands to every shard",
+    exactPoolRm.ok === true
+      && JSON.stringify([...exactPoolRm.removedKeys].sort()) === JSON.stringify(["my_pool", "my_pool-2"]),
+    JSON.stringify(exactPoolRm).slice(0, 300));
+  const exactPoolGone = await (await post("/api/remove-provider", { key: "my_pool" })).json();
+  check("an exact pool key removes every shard",
+    exactPoolGone.ok === true
+      && !readConfigFile().provider?.my_pool
+      && !readConfigFile().provider?.["my_pool-2"],
+    JSON.stringify(exactPoolGone).slice(0, 300));
+
   // ---- non-ASCII bodies must survive the request decode ----
   const uni = await (await post("/api/preview", {
     provider: {
@@ -358,11 +394,82 @@ try {
     !JSON.stringify(leaky.diff || {}).includes("sk-plaintext-must-not-appear-in-diff"),
     JSON.stringify(leaky.diff || {}).slice(0, 400));
 
+  // ---- /api/state must not hand out plaintext keys ----
+  // The endpoint is an unauthenticated GET polled every few seconds: anything
+  // running as another local user could otherwise read every key in the file.
+  const PLAIN = "sk-plaintext-fixture-key-12345";
+  const mk = await (await post("/api/apply", {
+    provider: {
+      name: "Mask Fixture", baseURL: "https://mask.example/v1", apiFormat: "openai-chat",
+      apiKey: PLAIN, useEnvVar: false, setAsDefault: false,
+      models: [{ id: "mm-1" }],
+    },
+    targets: ["opencode"],
+  })).json();
+  check("plaintext-key apply succeeds", mk.ok === true, JSON.stringify(mk).slice(0, 300));
+  const stateWithKey = await (await get("/api/state")).json();
+  const maskRow = (stateWithKey.opencode.providers || []).find((p) => p.key === "mask-fixture");
+  check("state hands out the mask, not the key",
+    !!maskRow && maskRow.apiKey === "••••2345" && maskRow.apiKeyMasked === true,
+    JSON.stringify(maskRow && { apiKey: maskRow.apiKey, apiKeyMasked: maskRow.apiKeyMasked }));
+  check("the raw key is nowhere in the state payload",
+    !JSON.stringify(stateWithKey).includes(PLAIN), "plaintext key leaked into /api/state");
+
+  // Echoing the mask back on save must resolve to the real key — writing the
+  // mask itself into the config would brick the provider.
+  const reapply = await (await post("/api/apply", {
+    provider: {
+      name: "Mask Fixture", key: "mask-fixture", baseURL: "https://mask.example/v2", apiFormat: "openai-chat",
+      apiKey: "••••2345", useEnvVar: false, setAsDefault: false,
+      models: [{ id: "mm-1" }, { id: "mm-2" }],
+    },
+    targets: ["opencode"],
+  })).json();
+  check("a masked echo applies cleanly", reapply.ok === true, JSON.stringify(reapply).slice(0, 300));
+  check("a masked apply never echoes the resolved plaintext key",
+    !JSON.stringify(reapply).includes(PLAIN), "plaintext key leaked into /api/apply");
+  {
+    const c = readConfigFile();
+    check("the real key survives the masked round trip",
+      c.provider?.["mask-fixture"]?.options?.apiKey === PLAIN,
+      c.provider?.["mask-fixture"]?.options?.apiKey);
+    check("the rest of the masked edit still landed",
+      c.provider?.["mask-fixture"]?.options?.baseURL === "https://mask.example/v2"
+      && !!c.provider?.["mask-fixture"]?.models?.["mm-2"]);
+  }
+
+  // A mask that matches nothing means the config moved on: refuse, don't
+  // write the mask as the key and don't delete the real one.
+  const staleMask = await (await post("/api/apply", {
+    provider: {
+      name: "Mask Fixture", key: "mask-fixture", baseURL: "https://mask.example/v2", apiFormat: "openai-chat",
+      apiKey: "••••zzzz", useEnvVar: false, setAsDefault: false,
+      models: [{ id: "mm-1" }],
+    },
+    targets: ["opencode"],
+  })).json();
+  check("a stale mask is refused, not written", staleMask.ok === false, JSON.stringify(staleMask).slice(0, 200));
+  check("the real key survives the refused write",
+    readConfigFile().provider?.["mask-fixture"]?.options?.apiKey === PLAIN);
+
+  // ---- API hygiene: unknown targets and unknown routes ----
+  const badTarget = await (await post("/api/apply", {
+    provider: { name: "X", baseURL: "https://x.example/v1", models: [{ id: "m" }] },
+    targets: ["__proto__"],
+  })).json();
+  check("an unknown target is rejected", badTarget.ok === false, JSON.stringify(badTarget).slice(0, 200));
+  const noRoute = await get("/api/definitely-not-a-route");
+  check("unknown /api routes answer 404", noRoute.status === 404, String(noRoute.status));
+  const noRouteJson = await noRoute.json();
+  check("the 404 is JSON, not text/plain", noRouteJson.ok === false, JSON.stringify(noRouteJson).slice(0, 120));
+
   // ---- secrets never persisted in the local store ----
   const storeRaw = readFileSync(STORE, "utf8");
   check("store file is an array after migration", Array.isArray(JSON.parse(storeRaw)), storeRaw.slice(0, 120));
   check("store never holds an API key", !storeRaw.includes("sk-secret-should-not-persist") && !storeRaw.includes("sk-should-never-persist"),
     "key leaked into data/providers.json");
+  check("the mask fixture's key never reaches the store either",
+    !storeRaw.includes(PLAIN), "key leaked into data/providers.json");
 
   // ---- Kilo manifest must not carry the key ----
   const kilo = applyRes.results?.kilo;
@@ -616,6 +723,27 @@ try {
     await post("/api/test", { provider: { baseURL: stubURL, apiKey: "{env:PS_VERIFY_KEY_SET}", apiFormat: "openai-chat" } });
     check("/api/test resolves an {env:VAR} left in the key field",
       seen[0]?.headers.authorization === "Bearer sk-verify-value", JSON.stringify(seen[0]?.headers));
+
+    const ALT_CONFIG = join(work, "opencode.json");
+    const ALT_KEY = "sk-alternate-config-key-12345";
+    writeFileSync(ALT_CONFIG, JSON.stringify({
+      provider: {
+        my_pool: {
+          npm: "@ai-sdk/openai-compatible",
+          options: { baseURL: stubURL, apiKey: ALT_KEY },
+          models: { "stub-model": {} },
+        },
+      },
+    }), "utf8");
+    seen.length = 0;
+    const alternate = await (await post("/api/discover", {
+      configPath: ALT_CONFIG,
+      previousKey: "my_pool",
+      provider: { name: "Exact Pool", baseURL: stubURL, apiKey: "••••2345", apiFormat: "openai-chat" },
+    })).json();
+    check("a masked probe resolves against the selected config and exact previous key",
+      alternate.result?.ok === true && seen[0]?.headers.authorization === `Bearer ${ALT_KEY}`,
+      JSON.stringify({ result: alternate.result, headers: seen[0]?.headers }));
   } finally {
     await new Promise((r) => stub.close(r));
   }
@@ -662,11 +790,33 @@ try {
   // of the completion request rather than mocking the layer under test.
   {
     let seen = null;
+    let holdNextChat = null;
+    let holdModel = "good-model";
+    let nextGoodStatus = 200;
     const chatStub = http.createServer((rq, rs) => {
       let raw = "";
       rq.on("data", (d) => { raw += d; });
       rq.on("end", () => {
         seen = { url: rq.url, method: rq.method, auth: rq.headers.authorization || "", xkey: rq.headers["x-api-key"] || "", body: raw };
+        if (raw.includes(`"model":"${holdModel}"`) && holdNextChat) {
+          const held = holdNextChat;
+          holdNextChat = null;
+          held(rs);
+          return;
+        }
+        if (/"model":"good-model"/.test(raw) && nextGoodStatus !== 200) {
+          rs.writeHead(nextGoodStatus, { "content-type": "application/json" });
+          nextGoodStatus = 200;
+          rs.end(JSON.stringify({ error: { message: "Invalid API key" } }));
+          return;
+        }
+        if (/reset-model/.test(raw)) { rq.socket.destroy(); return; }
+        const outage = raw.match(/outage-(502|503)/);
+        if (outage) {
+          rs.writeHead(Number(outage[1]), { "content-type": "application/json" });
+          rs.end(JSON.stringify({ error: { message: "Upstream unavailable" } }));
+          return;
+        }
         if (/no-such-model/.test(raw)) {
           rs.writeHead(404, { "content-type": "application/json" });
           rs.end(JSON.stringify({ error: { message: "The model does not exist" } }));
@@ -769,6 +919,28 @@ try {
         if (/premium-model/.test(raw)) {
           rs.writeHead(403, { "content-type": "application/json" });
           rs.end(JSON.stringify({ error: { message: "Access restricted. Deposit required to unlock premium models." } }));
+          return;
+        }
+        // Live case (OpenRouter, stealth/crouton-alpha): HTTP 403 whose visible
+        // message is the useless "Provider returned error"; the real cause sits
+        // in error.metadata.raw. Read only error.message and every such refusal
+        // was filed as a rejected key.
+        if (/region-model/.test(raw)) {
+          rs.writeHead(403, { "content-type": "application/json" });
+          rs.end(JSON.stringify({
+            error: {
+              message: "Provider returned error",
+              code: 403,
+              metadata: { raw: "This model is not available in your region.", provider_name: "Stealth" },
+            },
+          }));
+          return;
+        }
+        // Live case (OpenRouter without a proxy from this machine): the WAF
+        // answers 403 with a plain-string error before the provider is reached.
+        if (/waf-model/.test(raw)) {
+          rs.writeHead(403, { "content-type": "application/json" });
+          rs.end(JSON.stringify({ success: false, error: "Access denied by security policy." }));
           return;
         }
         // A 403 that really is about the credential must keep saying so.
@@ -927,6 +1099,31 @@ try {
     check("the provider's own wording is kept",
       /Deposit required/.test(premium.result?.message || ""), premium.result?.message);
 
+    // OpenRouter's nested reason. The visible message alone ("Provider returned
+    // error") says nothing and used to be blamed on the key.
+    const region = await (await post("/api/testchat", {
+      provider: { baseURL: chatURL, apiKey: "sk-chat", apiFormat: "openai-chat" },
+      modelId: "region-model",
+    })).json();
+    check("a region block is classified as a region fault, not a bad key",
+      region.result?.fault === "region", JSON.stringify(region.result));
+    check("the region verdict says the key is fine",
+      /ключ рабочий/.test(region.result?.message || ""), region.result?.message);
+    check("the upstream reason from error.metadata.raw is shown",
+      /not available in your region/i.test(region.result?.message || ""), region.result?.message);
+
+    // A WAF rejection happens before the provider reads the key, so it must not
+    // be reported as a rejected credential.
+    const waf = await (await post("/api/testchat", {
+      provider: { baseURL: chatURL, apiKey: "sk-chat", apiFormat: "openai-chat" },
+      modelId: "waf-model",
+    })).json();
+    check("a WAF block is classified as blocked, not a bad key",
+      waf.result?.fault === "blocked" && waf.result?.transient === true, JSON.stringify(waf.result));
+    check("the WAF verdict names the real cause",
+      /защит/i.test(waf.result?.message || "") && /не при чём|не на ключ/i.test(waf.result?.message || ""),
+      waf.result?.message);
+
     // An empty wallet arrives as a 400. Blaming the model sends the user to
     // delete an entry that would work the moment the account is topped up.
     const broke = await (await post("/api/testchat", {
@@ -1013,6 +1210,191 @@ try {
     })).json();
     check("a live-fire request without a model is refused",
       noModel.result?.ok === false && /модел/i.test(noModel.result?.message || ""), JSON.stringify(noModel.result));
+
+    {
+      const HEALTH = join(DATA, "model-health.json");
+      const ALT_CONFIG = join(work, "opencode.json");
+      const originalMain = readConfigText();
+      const fixture = {
+        provider: {
+          my_pool: {
+            npm: "@ai-sdk/openai-compatible", name: "A different display name",
+            options: { baseURL: chatURL, apiKey: "sk-chat" },
+            models: { "good-model": {}, "quota-model": {}, "bad-key-model": {}, "untested-model": {}, "queued-model": {}, "reset-model": {}, "outage-502": {}, "outage-503": {} },
+          },
+          sibling: {
+            npm: "@ai-sdk/openai-compatible",
+            options: { baseURL: chatURL, apiKey: "sk-chat" }, models: { "good-model": {} },
+          },
+        },
+      };
+      const saveFixture = () => writeFileSync(ALT_CONFIG, JSON.stringify(fixture));
+      const scopedState = async () => (await get("/api/state?configPath=" + encodeURIComponent(ALT_CONFIG))).json();
+      const payload = {
+        configPath: ALT_CONFIG, previousKey: "my_pool",
+        provider: { name: "A different display name", baseURL: chatURL, apiKey: "sk-chat", apiFormat: "openai-chat" },
+      };
+      saveFixture();
+      await post("/api/test", payload);
+      check("endpoint connectivity never creates model-completion health",
+        Object.keys((await scopedState()).modelHealth || {}).length === 0);
+      const live = await (await post("/api/testchat", { ...payload, modelId: "good-model" })).json();
+      const health = live.modelHealth?.["my_pool/good-model"];
+      check("a completion returns persistent health under the exact config key", health?.ok === true, JSON.stringify(live));
+      check("a successful completion is fresh for one hour",
+        health?.checkedAt > 0 && health.expiresAt - health.checkedAt === 60 * 60 * 1000, JSON.stringify(health));
+      check("a completion certifies neither sibling models nor another provider",
+        Object.keys(live.modelHealth || {}).join() === "my_pool/good-model", JSON.stringify(live.modelHealth));
+      check("completion health survives a fresh state read", (await scopedState()).modelHealth?.["my_pool/good-model"]?.ok === true);
+      check("model health does not leak into another selected config",
+        Object.keys((await (await get("/api/state")).json()).modelHealth || {}).length === 0);
+      check("probes leave both selected and default configs untouched",
+        readConfigText() === originalMain && readFileSync(ALT_CONFIG, "utf8") === JSON.stringify(fixture));
+      const persisted = readFileSync(HEALTH, "utf8");
+      check("history contains no key, URL, upstream message or response text",
+        !["sk-chat", chatURL, "pong", "message", "apiKey", "baseURL"].some((s) => persisted.includes(s)), persisted);
+
+      const reopened = spawn(process.execPath, [join(process.cwd(), "server.mjs")], {
+        cwd: work, env: { ...childEnv, PORT: "6001" }, stdio: "ignore",
+      });
+      try {
+        const freshBase = "http://127.0.0.1:6001";
+        const ready = await waitUp(8000, freshBase);
+        const reopenedState = ready ? await (await fetch(freshBase + "/api/state?configPath=" + encodeURIComponent(ALT_CONFIG))).json() : {};
+        check("a fresh server process restores model health from disk", reopenedState.modelHealth?.["my_pool/good-model"]?.ok === true);
+      } finally {
+        if (reopened.exitCode === null && reopened.signalCode === null) {
+          const exited = new Promise((resolve) => reopened.once("exit", resolve));
+          reopened.kill();
+          await exited;
+        }
+      }
+
+      const quotaProbe = await (await post("/api/testchat", { ...payload, modelId: "quota-model" })).json();
+      const quotaHealth = quotaProbe.modelHealth?.["my_pool/quota-model"];
+      check("a quota refusal is retained as a failure, not reachable success",
+        quotaHealth?.ok === false && quotaHealth.fault === "quota", JSON.stringify(quotaHealth));
+      check("quota refusals expire after five minutes",
+        quotaHealth?.expiresAt - quotaHealth?.checkedAt === 5 * 60 * 1000, JSON.stringify(quotaHealth));
+      const batch = await (await post("/api/testchat-batch", {
+        ...payload, modelIds: ["bad-key-model", "untested-model"], concurrency: 1, gapMs: 1,
+      })).json();
+      check("batch history records the attempted failure", batch.modelHealth?.["my_pool/bad-key-model"]?.fault === "key", JSON.stringify(batch));
+      check("batch history does not mark skipped models as failed",
+        batch.result?.tested === 1 && !batch.modelHealth?.["my_pool/untested-model"], JSON.stringify(batch));
+      check("batch history preserves unrelated successful probes", batch.modelHealth?.["my_pool/good-model"]?.ok === true);
+
+      for (const [field, replacement] of [["baseURL", chatURL + "/other"], ["apiKey", "changed-key"]]) {
+        const saved = fixture.provider.my_pool.options[field];
+        fixture.provider.my_pool.options[field] = replacement;
+        saveFixture();
+        check(`changing the configured ${field} invalidates completion health`,
+          Object.keys((await scopedState()).modelHealth || {}).length === 0);
+        fixture.provider.my_pool.options[field] = saved;
+        saveFixture();
+      }
+      fixture.provider.my_pool.npm = "@ai-sdk/anthropic";
+      saveFixture();
+      check("changing the configured API format invalidates completion health", Object.keys((await scopedState()).modelHealth || {}).length === 0);
+      fixture.provider.my_pool.npm = "@ai-sdk/openai-compatible";
+      saveFixture();
+      await post("/api/testchat", { ...payload, modelId: "good-model", provider: { ...payload.provider, apiKey: "unsaved-key" } });
+      check("a probe with an unsaved credential cannot replace configured health",
+        (await scopedState()).modelHealth?.["my_pool/good-model"]?.checkedAt === health.checkedAt);
+      await post("/api/testchat", { ...payload, modelId: "unsaved-model" });
+      check("a probe of an unsaved model is not offered as a configured route", !(await scopedState()).modelHealth?.["my_pool/unsaved-model"]);
+
+      const historyRows = JSON.parse(readFileSync(HEALTH, "utf8"));
+      const goodRow = historyRows.find((r) => r.id === "good-model");
+      const now = Date.now();
+      goodRow.checkedAt = now - 2 * 60 * 60 * 1000;
+      goodRow.startedAt = goodRow.checkedAt - 1;
+      writeFileSync(HEALTH, JSON.stringify(historyRows));
+      const stale = (await scopedState()).modelHealth?.["my_pool/good-model"];
+      check("expired health remains dated rather than becoming a new successful check", stale?.expiresAt < now && stale.checkedAt === goodRow.checkedAt);
+      goodRow.checkedAt = now - 8 * 24 * 60 * 60 * 1000;
+      goodRow.startedAt = goodRow.checkedAt - 1;
+      writeFileSync(HEALTH, JSON.stringify(historyRows));
+      check("history older than seven days is discarded", !(await scopedState()).modelHealth?.["my_pool/good-model"]);
+
+      writeFileSync(HEALTH, "{broken history");
+      const brokenHistory = await scopedState();
+      check("damaged history does not break state or imply healthy models",
+        !!brokenHistory.opencode && !!brokenHistory.healthWarning && Object.keys(brokenHistory.modelHealth || {}).length === 0);
+      const unsavedHealth = await (await post("/api/testchat", { ...payload, modelId: "good-model" })).json();
+      check("a history write failure does not hide a successful completion", unsavedHealth.result?.ok === true && !!unsavedHealth.healthWarning);
+      check("damaged history is not silently overwritten", readFileSync(HEALTH, "utf8") === "{broken history");
+      writeFileSync(HEALTH, "[]");
+
+      const heldOlder = new Promise((resolve) => { holdNextChat = resolve; });
+      const olderProbe = post("/api/testchat", { ...payload, modelId: "good-model" });
+      const olderReply = await heldOlder;
+      nextGoodStatus = 401;
+      const newerProbe = await (await post("/api/testchat", { ...payload, modelId: "good-model" })).json();
+      olderReply.writeHead(200, { "content-type": "application/json" });
+      olderReply.end(JSON.stringify({ choices: [{ message: { content: "pong" } }] }));
+      await olderProbe;
+      check("a slow older success cannot overwrite a newer failed probe",
+        newerProbe.modelHealth?.["my_pool/good-model"]?.fault === "key"
+          && (await scopedState()).modelHealth?.["my_pool/good-model"]?.fault === "key");
+      writeFileSync(HEALTH, "[]");
+      holdModel = "queued-model";
+      const heldQueue = new Promise((resolve) => { holdNextChat = resolve; });
+      const queuedBatch = post("/api/testchat-batch", { ...payload, modelIds: ["queued-model", "good-model"], concurrency: 1, gapMs: 1 });
+      const queuedReply = await heldQueue;
+      holdModel = "good-model";
+      const heldSingle = new Promise((resolve) => { holdNextChat = resolve; });
+      const overlappingSingle = post("/api/testchat", { ...payload, modelId: "good-model" });
+      const singleReply = await heldSingle;
+      nextGoodStatus = 401;
+      queuedReply.writeHead(200, { "content-type": "application/json" });
+      queuedReply.end(JSON.stringify({ choices: [{ message: { content: "pong" } }] }));
+      await queuedBatch;
+      singleReply.writeHead(200, { "content-type": "application/json" });
+      singleReply.end(JSON.stringify({ choices: [{ message: { content: "pong" } }] }));
+      await overlappingSingle;
+      check("batch ordering uses each model's actual start, not the batch start",
+        (await scopedState()).modelHealth?.["my_pool/good-model"]?.fault === "key");
+      writeFileSync(HEALTH, "[]");
+      const heldChanged = new Promise((resolve) => { holdNextChat = resolve; });
+      const changedProbe = post("/api/testchat", { ...payload, modelId: "good-model" });
+      const changedReply = await heldChanged;
+      fixture.provider.my_pool.options.apiKey = "changed-during-probe";
+      saveFixture();
+      changedReply.writeHead(200, { "content-type": "application/json" });
+      changedReply.end(JSON.stringify({ choices: [{ message: { content: "pong" } }] }));
+      const changedResult = await (await changedProbe).json();
+      check("an in-flight probe cannot certify credentials changed before its response",
+        changedResult.result?.ok === true && Object.keys(changedResult.modelHealth || {}).length === 0
+          && readFileSync(HEALTH, "utf8") === "[]");
+
+      const keyFile = join(work, "health-probe-key");
+      const fileRef = `{file:${keyFile}}`;
+      writeFileSync(keyFile, "sk-file-health-original");
+      fixture.provider.my_pool.options.apiKey = fileRef;
+      saveFixture();
+      const filePayload = { ...payload, provider: { ...payload.provider, apiKey: fileRef }, modelId: "good-model" };
+      const fileProbe = await (await post("/api/testchat", filePayload)).json();
+      check("file-backed credentials are resolved before matching history",
+        fileProbe.modelHealth?.["my_pool/good-model"]?.ok === true && seen.auth === "Bearer sk-file-health-original");
+      writeFileSync(keyFile, "sk-file-health-rotated");
+      check("rotating the contents of a key file invalidates history", Object.keys((await scopedState()).modelHealth || {}).length === 0);
+      const anonymousProbe = await (await post("/api/testchat", { ...filePayload, provider: { ...payload.provider, apiKey: "" } })).json();
+      check("an anonymous probe cannot match file-backed credentials", Object.keys(anonymousProbe.modelHealth || {}).length === 0);
+      await post("/api/testchat", filePayload);
+      check("rotated file-backed credentials can earn fresh health", (await scopedState()).modelHealth?.["my_pool/good-model"]?.ok === true);
+      check("key-file contents never reach history", !/sk-file-health/.test(readFileSync(HEALTH, "utf8")));
+
+      fixture.provider.my_pool.options.apiKey = "sk-chat";
+      saveFixture();
+      for (const modelId of ["outage-502", "outage-503", "reset-model"]) {
+        const failure = await (await post("/api/testchat", { ...payload, modelId })).json();
+        const h = failure.modelHealth?.[`my_pool/${modelId}`];
+        check(`${modelId} is transient for both the live row and persisted history`,
+          failure.result?.transient === true && h?.ok === false && h.transient === true && h.expiresAt - h.checkedAt === 300000,
+          JSON.stringify(failure));
+      }
+    }
 
     await new Promise((r) => chatStub.close(r));
   }
@@ -1275,6 +1657,25 @@ try {
       JSON.stringify(refused).slice(0, 200));
     check("the external edit survives the refused undo",
       readConfigText().includes("undo-guard-external"), readConfigText().slice(-300));
+
+    const MALFORMED_EXTERNAL = "{ external malformed edit";
+    writeFileSync(CONFIG, MALFORMED_EXTERNAL, "utf8");
+    const malformedUndo = await (await post("/api/undo", {})).json();
+    check("undo refuses an external edit even when the current JSONC is malformed",
+      malformedUndo.ok === false, JSON.stringify(malformedUndo).slice(0, 200));
+    check("malformed external bytes survive the refused undo",
+      readConfigText() === MALFORMED_EXTERNAL, readConfigText());
+
+    const backupState = await (await get("/api/state")).json();
+    const snapshot = (backupState.backups || []).find((b) => b.origin === CONFIG);
+    check("a valid snapshot is available for the malformed-restore test", !!snapshot);
+    const malformedRestore = await (await post("/api/restore", { file: snapshot?.file })).json();
+    check("restore snapshots a malformed current file before replacing it",
+      malformedRestore.ok === true && !!malformedRestore.preFile,
+      JSON.stringify(malformedRestore).slice(0, 200));
+    check("the pre-restore snapshot preserves the malformed bytes exactly",
+      !!malformedRestore.preFile && readFileSync(malformedRestore.preFile, "utf8") === MALFORMED_EXTERNAL,
+      malformedRestore.preFile || "no pre-restore snapshot");
   }
 
   {
@@ -1319,8 +1720,82 @@ try {
       Object.keys(readConfigFile().provider || {}));
   }
 } finally {
-  child.kill();
+  if (child.exitCode === null && child.signalCode === null) {
+    const exited = new Promise((r) => child.once("exit", r));
+    child.kill();
+    await exited;
+  }
   rmSync(work, { recursive: true, force: true });
+}
+
+// ---- V2 without the server: exact keys, and the empty-map flip ----
+// Deleting the last V2 provider leaves `providers: {}` behind. That used to be
+// read as a V1 document, so the next save wrote a legacy block V2 ignores.
+// Config keys may also be `my_provider` / `dot.name`, which slugify() rewrites.
+{
+  const dir = mkdtempSync(join(tmpdir(), "ps-verify-v2-"));
+  const cfgPath = join(dir, "opencode.jsonc");
+  const previous = process.env.OPENCODE_CONFIG;
+  process.env.OPENCODE_CONFIG = cfgPath;
+  try {
+    const { planProvidersRemoval, planProviderChange, commitPlan, readConfigAtPath } =
+      await import("./src/opencode.mjs");
+    const block = (envName) => ({
+      package: "@ai-sdk/openai-compatible",
+      settings: { baseURL: "https://v2.example/v1", apiKey: `{env:${envName}}` },
+      models: { m: { name: "m" } },
+    });
+    writeFileSync(cfgPath, JSON.stringify({
+      $schema: "https://opencode.ai/config.json",
+      providers: { my_provider: block("MY_KEY"), "dot.name": block("DOT_KEY") },
+      model: "my_provider/m",
+    }, null, 2), "utf8");
+
+    const rmDot = planProvidersRemoval(["dot.name"], { configPath: cfgPath });
+    check("a dotted key is removable from a V2 file",
+      rmDot.ok === true && rmDot.providerKeys?.[0] === "dot.name",
+      JSON.stringify(rmDot).slice(0, 300));
+
+    const rm = planProvidersRemoval(["my_provider"], { configPath: cfgPath });
+    check("an underscore key is removable from a V2 file",
+      rm.ok === true && rm.providerKeys?.[0] === "my_provider",
+      JSON.stringify(rm).slice(0, 300));
+    if (rm.ok) writeFileSync(cfgPath, rm.after, "utf8");
+
+    const afterDelete = readConfigAtPath(cfgPath);
+    check("the delete actually removed the block",
+      !afterDelete.config?.providers?.my_provider,
+      JSON.stringify(Object.keys(afterDelete.config?.providers || {})));
+    check("the remaining dotted block survives",
+      !!afterDelete.config?.providers?.["dot.name"],
+      JSON.stringify(Object.keys(afterDelete.config?.providers || {})));
+
+    const rmLast = planProvidersRemoval(["dot.name"], { configPath: cfgPath });
+    if (rmLast.ok) writeFileSync(cfgPath, rmLast.after, "utf8");
+    check("the file is left with an empty providers map",
+      /"providers"\s*:\s*\{\s*\}/.test(readFileSync(cfgPath, "utf8")),
+      readFileSync(cfgPath, "utf8"));
+
+    const add = planProviderChange(
+      { name: "fresh", baseURL: "https://fresh.example/v1", apiFormat: "openai-chat", useEnvVar: true,
+        envVarName: "FRESH_KEY", models: [{ id: "m1" }] },
+      { configPath: cfgPath, setAsDefault: false },
+    );
+    check("adding after the empty map succeeds", add.ok === true, JSON.stringify(add).slice(0, 300));
+    if (add.ok) commitPlan(add, { backup: () => "verify-backup" });
+    const afterAdd = readConfigAtPath(cfgPath);
+    check("the new provider lands in the V2 map",
+      !!afterAdd.config?.providers?.fresh,
+      JSON.stringify(Object.keys(afterAdd.config?.providers || {})));
+    const rawAdd = readFileSync(cfgPath, "utf8");
+    check("no legacy provider block is created",
+      !/"provider"\s*:/.test(rawAdd), rawAdd.slice(0, 400));
+    check("the empty providers map keeps the document V2",
+      /"providers"\s*:/.test(rawAdd), rawAdd.slice(0, 400));
+  } finally {
+    process.env.OPENCODE_CONFIG = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 const pad = Math.max(...results.map((r) => r.name.length));

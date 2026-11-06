@@ -33,7 +33,9 @@ import { SCHEMA_URL } from "./opencode.mjs";
 export { SCHEMA_URL };
 const ANTHROPIC_VERSION = "2023-06-01";
 
-const PROVIDER_FIELD_SET = new Set([...PROVIDER_FIELDS, "type", "$schema"]);
+// No "$schema" here: it belongs to the config root, and inside a provider
+// block opencode rejects the whole file over it.
+const PROVIDER_FIELD_SET = new Set([...PROVIDER_FIELDS, "type"]);
 const SPECIFIC_PROVIDER_FIELDS = new Set(["apiKey", "baseURL"]);
 const MODEL_FIELD_SET = new Set(MODEL_FIELDS);
 const VALID_MODALITIES = new Set(MODALITIES);
@@ -177,13 +179,15 @@ function normaliseKeyValue(apiKey, key, changes, fixes, skipped, existingEnv) {
   const decoded = decodeApiKey(apiKey);
   if (decoded.useEnvVar) return apiKey;
   // Открытый ключ в файле, который коммитят и показывают. См. комментарий
-  // в fixApiKeyValue: в конфиге остаётся ссылка, значение задаётся вручную.
+  // в fixApiKeyValue: в конфиге остаётся ссылка. Значение не теряется:
+  // при применении сервер записывает его в переменную окружения сам
+  // (на Windows), а где нельзя — даёт готовую команду.
   if (decoded.apiKey.length > 0) {
     const envName = suggestEnvVarName(key);
     ensureEnvHas(key, changes, envName, existingEnv);
     fixes.push({
       id: "plaintext-key", provider: key,
-      message: `Провайдер «${key}»: ключ вынесен в переменную ${envName} — задай её вручную, старый ключ из файла стёрт`,
+      message: `Провайдер «${key}»: ключ вынесен в переменную ${envName} — при применении значение записывается в окружение автоматически, из файла оно стирается (копия остаётся в бэкапе)`,
       needsEnvSetup: true, envVar: envName,
     });
     return `{env:${envName}}`;
@@ -641,8 +645,12 @@ export async function planRefresh(config, { providerKeys = null, prune = false, 
     if (!base) {
       return { key, ok: false, skipped: true, message: `Провайдер «${key}»: нет своего Base URL — адрес берётся из npm-пакета, обновлять нечего` };
     }
-    const decoded = decodeApiKey(p.options?.apiKey);
-    const apiKey = decoded.useEnvVar ? (lookupEnv(decoded.envVarName)?.value || "") : decoded.apiKey;
+    // resolveKeyRef, not decodeApiKey+lookupEnv: the pair re-implements the
+    // reference mini-language and forgets {file:…} — a file-backed key would
+    // refresh the model list with no credential at all while "Проверить"
+    // against the same provider works.
+    const resolved = resolveKeyRef(p.options?.apiKey);
+    const apiKey = resolved.resolved === false ? "" : String(resolved.value || "");
     let res;
     try {
       res = await fetchModels({ baseURL: base, apiKey, apiFormat: detectApiFormat(p) });
@@ -762,6 +770,54 @@ export async function runSelfCheck({ configPath = "", catalogTimeoutMs = 8000 } 
             ? (issues.length ? `Ошибок нет, предупреждений: ${issues.length}` : "Проблем не найдено")
             : `Ошибок: ${errs}, предупреждений: ${issues.length - errs} — запусти «Исправить автоматически»`,
           false);
+
+        // Валидация каталогов плагинов из config.plugin
+        const pluginList = Array.isArray(doc.value?.plugin)
+          ? doc.value.plugin
+          : (Array.isArray(doc.value?.plugins) ? doc.value.plugins : []);
+        for (const entry of pluginList) {
+          const ref = typeof entry === "string"
+            ? entry
+            : (entry && typeof entry === "object" && typeof entry.package === "string")
+              ? entry.package
+              : (Array.isArray(entry) && typeof entry[0] === "string")
+                ? entry[0]
+                : "";
+          if (!ref) continue;
+          const isPath = /^\.{0,2}[\\/]/.test(ref) || /^[A-Za-z]:[\\/]/.test(ref) || ref.includes("/") || ref.includes("\\");
+          if (!isPath) continue;
+
+          const configDir = dirname(resolved);
+          const pluginDirPath = (await import("node:path")).isAbsolute(ref)
+            ? ref
+            : (await import("node:path")).resolve(configDir, ref);
+          const exists = existsSync(pluginDirPath);
+          let isDir = false;
+          try {
+            isDir = exists && (await import("node:fs")).statSync(pluginDirPath).isDirectory();
+          } catch {}
+
+          const hasPkg = isDir && existsSync(join(pluginDirPath, "package.json"));
+          const hasEntry = isDir && (
+            existsSync(join(pluginDirPath, "index.mjs")) ||
+            existsSync(join(pluginDirPath, "index.js"))
+          );
+
+          const pluginOk = isDir && hasPkg && hasEntry;
+          let pluginMsg = "";
+          if (!exists) {
+            pluginMsg = `Каталог плагина не найден: ${pluginDirPath}`;
+          } else if (!isDir) {
+            pluginMsg = `Плагин должен быть каталогом, а не файлом: ${pluginDirPath}`;
+          } else if (!hasPkg) {
+            pluginMsg = `В каталоге плагина ${ref} отсутствует package.json`;
+          } else if (!hasEntry) {
+            pluginMsg = `В каталоге плагина ${ref} отсутствует точка входа (index.mjs или index.js)`;
+          } else {
+            pluginMsg = `Плагин ${ref} валиден (package.json и точка входа найдены)`;
+          }
+          push(`plugin-${ref}`, `Плагин «${ref}»`, pluginOk, pluginMsg, false);
+        }
       }
       // Проверяется именно запись, а не чтение: раньше здесь был fileStamp,
       // который только читал файл, а проверка называлась «Запись конфига».
