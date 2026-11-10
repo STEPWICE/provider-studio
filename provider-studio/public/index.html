@@ -64,7 +64,7 @@
       <header class="topbar">
         <div class="topbar-title">
           <h1>Настройки моделей</h1>
-          <p class="muted">Подключи любой API — проверим, что он отвечает, покажем diff и запишем аккуратно, с бэкапом.</p>
+          <p class="muted">Подключи любой API — мы проверим, что он отвечает, и аккуратно сохраним. Ничего не запишется без твоего подтверждения.</p>
         </div>
         <div class="topbar-right">
           <select id="configPicker" class="config-picker" aria-label="Какой конфиг править" title="Какой файл конфигурации править"></select>
@@ -75,7 +75,7 @@
       <!-- Shown when the config file changed on disk after this page read it.
            Without it the next write fails with a 409 that looks like a bug. -->
       <div class="ext-change" id="extChange" hidden>
-        <span>Конфиг изменился извне — запись со старым хешем будет отклонена.</span>
+        <span>Этот файл уже изменился в другом месте — обнови, чтобы не потерять правки.</span>
         <button class="btn btn-mini" id="extChangeBtn" type="button">Обновить</button>
       </div>
 
@@ -90,7 +90,7 @@
             <span class="card-eyebrow">Подключение</span>
             <h2>Провайдер и модели</h2>
           </div>
-          <span class="card-hint">Запись в конфиг — только после проверки diff</span>
+          <span class="card-hint">Мы ничего не запишем без твоего подтверждения</span>
         </div>
         <!-- Провайдер -->
         <div class="card-head">

@@ -257,8 +257,19 @@ export function validateConfig(input) {
       `перенеси их в «providers» или удали`,
       { fixable: false }));
   }
-  if (!config.provider || typeof config.provider !== "object" || Array.isArray(config.provider)) {
-    issues.push(issue("error", "no-provider", "Нет блока provider — добавь провайдера"));
+  // A document with no providers AND no model references is opencode's default
+  // state: there is nothing that can be wrong, and opencode starts fine with
+  // it. Reporting that as an error turned the whole panel red after a
+  // "remove all providers" run. A dangling reference is a different story.
+  const providerCount = config.provider && typeof config.provider === "object" && !Array.isArray(config.provider)
+    ? Object.keys(config.provider).length
+    : 0;
+  if (!providerCount) {
+    const refs = referencedModels(config);
+    if (refs.length) {
+      issues.push(issue("error", "no-provider",
+        `Нет блока provider — ссылки на модели (${refs.join(", ")}) не к чему привязать: добавь провайдера или убери их`));
+    }
     return issues;
   }
 
@@ -704,6 +715,26 @@ function validateModel(key, mid, m, issues) {
   }
 }
 
+// Model ids named by a config that no provider block backs. Both spellings of
+// the agent map are checked: V1 files use `agent`, V2 files use `agents`.
+function referencedModels(config) {
+  const refs = [];
+  for (const field of ["model", "small_model"]) {
+    const value = config[field];
+    if (typeof value === "string" && value.trim()) refs.push(`${field}: ${value}`);
+  }
+  for (const field of ["agent", "agents"]) {
+    const agents = config[field];
+    if (!agents || typeof agents !== "object" || Array.isArray(agents)) continue;
+    for (const [name, a] of Object.entries(agents)) {
+      if (a && typeof a === "object" && typeof a.model === "string" && a.model.trim()) {
+        refs.push(`${field}.${name}: ${a.model}`);
+      }
+    }
+  }
+  return refs;
+}
+
 // A default model pointing at something that does not exist stops opencode from
 // starting, so it is reported per field.
 function validateDefaultModel(config, issues) {
@@ -721,7 +752,9 @@ function validateDefaultModel(config, issues) {
       continue;
     }
     const [prov, ...rest] = value.split("/");
-    const mdl = rest.join("/");
+    // `provider/model#variant`: the variant pins a reasoning effort, it is
+    // not part of the model id — strip it before the lookup.
+    const mdl = rest.join("/").split("#")[0];
     const target = config.provider?.[prov]?.models?.[mdl];
     if (!target) {
       issues.push(issue("warn", field === "model" ? "bad-default" : "bad-small-model",
@@ -1523,10 +1556,18 @@ function extractPricing(m, id) {
   }
   const p = (m.pricing && typeof m.pricing === "object") ? m.pricing : null;
   const unit = p?.unit || m.pricing_unit || "";
-  const costInput = perMillion(p?.input ?? p?.prompt ?? m.input_price ?? m.price_input, unit);
-  const costOutput = perMillion(p?.output ?? p?.completion ?? m.output_price ?? m.price_output, unit);
-  const cacheRead = perMillion(p?.cache_read ?? p?.input_cache_read, unit);
-  const cacheWrite = perMillion(p?.cache_write ?? p?.input_cache_write, unit);
+  // Some gateways name the fields `input_usd_per_1m` (TokenHarbor) — the
+  // `_per_1m_` marker in the key is the unit declaration, so those values
+  // pass through perMillion already normalised to $/1M.
+  const per1m = (v) => (v != null && String(v).trim() !== "" ? Number(v) : null);
+  const costInput = perMillion(p?.input ?? p?.prompt ?? p?.input_usd_per_1m ?? m.input_price ?? m.price_input, unit)
+    ?? per1m(p?.input_usd_per_1m);
+  const costOutput = perMillion(p?.output ?? p?.completion ?? p?.output_usd_per_1m ?? m.output_price ?? m.price_output, unit)
+    ?? per1m(p?.output_usd_per_1m);
+  const cacheRead = perMillion(p?.cache_read ?? p?.input_cache_read ?? p?.cache_read_usd_per_1m, unit)
+    ?? per1m(p?.cache_read_usd_per_1m);
+  const cacheWrite = perMillion(p?.cache_write ?? p?.input_cache_write ?? p?.cache_write_usd_per_1m, unit)
+    ?? per1m(p?.cache_write_usd_per_1m);
 
   const tier = String(m.access_tier ?? m.tier ?? m.plan ?? "").trim();
   let free = false;
@@ -1620,6 +1661,23 @@ function statedCapabilities(m) {
   return out;
 }
 
+/**
+ * Reasoning effort tiers stated by the gateway (OpenRouter shape):
+ * `reasoning.supported_efforts: ["minimal","low",...]`,
+ * `reasoning.default_effort: "max"`, `reasoning.mandatory: true`.
+ * Returns { efforts, defaultEffort } — empty when the gateway says nothing,
+ * which must stay distinct from "no efforts supported".
+ */
+export function extractEfforts(m) {
+  const r = m && typeof m === "object" ? m.reasoning : null;
+  if (!r || typeof r !== "object") return { efforts: [], defaultEffort: "" };
+  const raw = Array.isArray(r.supported_efforts) ? r.supported_efforts
+    : Array.isArray(r.efforts) ? r.efforts : [];
+  const efforts = raw.map((x) => String(x || "").trim()).filter(Boolean);
+  const defaultEffort = String(r.default_effort || "").trim();
+  return { efforts, defaultEffort };
+}
+
 /** Normalises a /models response (several shapes) into a flat model list. */
 export function parseModels(json) {
   let arr = [];
@@ -1670,6 +1728,9 @@ export function parseModels(json) {
     if (declared && typeof declared.tools === "boolean" || stated.toolUse !== null) declaredFields.push("toolUse");
     if (declared && typeof declared.vision === "boolean") declaredFields.push("vision");
     if (stated.temperature) declaredFields.push("temperature");
+    const { efforts, defaultEffort } = extractEfforts(m);
+    const variants = efforts.map((e) => ({ id: e, settings: { reasoningEffort: e } }));
+    if (efforts.length) declaredFields.push("reasoningEfforts");
     const rawName = m && typeof m === "object"
       ? (typeof m.display_name === "string" && m.display_name.trim() ? m.display_name.trim()
         : (typeof m.name === "string" && m.name.trim() ? m.name.trim() : id))
@@ -1696,6 +1757,9 @@ export function parseModels(json) {
       vision: caps.vision,
       toolUse,
       temperature: stated.temperature === true ? true : undefined,
+      reasoningEfforts: efforts,
+      defaultEffort,
+      variants,
       // Which of the above the endpoint stated itself. Everything not listed
       // here is inference and may be replaced by a better source.
       declaredFields,

@@ -232,7 +232,9 @@ export function planDefaultModelChange(modelId, opts = {}) {
   if (loaded.created) return { ok: false, error: "Конфиг не найден", configPath: loaded.path };
 
   const providerKey = target.slice(0, slash);
-  const modelName = target.slice(slash + 1);
+  // `provider/model#variant`: the variant pins a reasoning effort, it is
+  // not part of the model id — strip it before the block lookup.
+  const modelName = target.slice(slash + 1).split("#")[0];
   const block = loaded.config?.provider?.[providerKey];
   if (!block) {
     return { ok: false, error: `Провайдера «${providerKey}» нет в конфиге`, configPath: loaded.path };

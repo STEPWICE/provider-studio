@@ -118,7 +118,9 @@ export function smartAudit(config) {
   const slash = def.indexOf("/");
   if (slash > 0) {
     const defProv = def.slice(0, slash);
-    const defId = def.slice(slash + 1);
+    // `provider/model#variant`: the variant pins a reasoning effort, the
+    // priced model id is the part before `#`.
+    const defId = def.slice(slash + 1).split("#")[0];
     const sources = (byId.get(defId) || []).filter((s) => s.price);
     if (sources.length >= 2) {
       const sorted = [...sources].sort((a, b) => a.price.total - b.price.total);

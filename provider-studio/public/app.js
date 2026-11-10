@@ -16,6 +16,12 @@ const state = {
   discoverSearch: "",
   // Filter for the saved-provider sidebar list.
   providerSearch: "",
+  // Providers hidden by opencode via disabled_providers (key set).
+  disabledProviders: new Set(),
+  // Saved key-pool of the provider currently in the form: names only, never
+  // values. The textarea holds only a fresh draft; this is what shows the
+  // pool that is already on disk (config shards + env names).
+  savedPool: [],
   // Presets that pre-fill base URL / format / env var in the wizard.
   presets: [],
   // Extra headers for the provider currently in the form (a preset may need
@@ -229,6 +235,7 @@ async function init() {
     updateConfigChip(d.opencode);
     state.configHasComments = !!d.opencode.comments;
     state.configHash = d.opencode.hash || "";
+    state.disabledProviders = new Set(asArray(d.opencode.disabled_providers).map(String));
   }
   await loadConfigList();
   // loadConfigList may have restored a remembered non-default file; adopt its
@@ -534,11 +541,19 @@ function renderKeyHint() {
     const name = $("#f-envname").value.trim();
     if (!name) {
       el.className = "fmt-note";
-      el.textContent = "Укажи имя переменной — в конфиг попадёт ссылка {env:ИМЯ}, а не сам ключ.";
+      el.textContent = "Ключ надёжно спрячем вне конфига — укажи, где он будет жить.";
+      return;
+    }
+    // Typed text looks like "replace the key", but the apply step writes only
+    // the reference: the secret stays in the old variable. Warn instead of
+    // silently keeping the old key.
+    if ($("#f-apikey").value.trim()) {
+      el.className = "fmt-note warn";
+      el.textContent = `Введённый ключ не запишется в конфиг — туда уйдёт {env:${name}}. Чтобы заменить ключ, обнови переменную: «Задать сейчас» рядом с именем, либо setx.`;
       return;
     }
     el.className = "fmt-note";
-    el.textContent = `В конфиг запишется {env:${name}}; значение берётся из переменной окружения.`;
+    el.textContent = `Ключ спрячется в ${name} — в конфиге будет только ссылка.`;
   } else {
     el.className = "fmt-note warn";
     el.textContent = "Ключ будет записан в opencode-конфиг открытым текстом. Включи $ENV, чтобы этого избежать.";
@@ -667,10 +682,12 @@ function renderProviderList() {
     // while a name alone slugifies to something the config never had.
     const key = p.key || slugifyName(p.name);
     const active = state.editingKey && state.editingKey === key;
+    const disabled = state.disabledProviders && state.disabledProviders.has(key);
     return `
     <div class="provider-row${active ? " is-active" : ""}" data-name="${esc(p.name)}" data-key="${esc(key)}" tabindex="0" role="button">
       ${healthDot(p)}
       <span class="nm" title="${esc(p.name)}">${esc(p.name)}</span>
+      ${disabled ? `<span class="badge" title="Провайдер в disabled_providers — opencode его не видит, хотя эндпоинт отвечает">откл</span>` : ""}
       ${p.fromOpenCode && mixed ? `<span class="badge">opencode</span>` : ""}
       <button class="ren" title="Переименовать ключ провайдера в конфиге" aria-label="Переименовать ${esc(p.name)}">${icon("pencil")}</button>
       <button class="del" title="Удалить провайдера полностью: из opencode-конфига и из списка" aria-label="Удалить ${esc(p.name)} полностью">${icon("x")}</button>
@@ -1031,6 +1048,7 @@ async function refreshConfigState() {
   if (d && d.opencode) {
     if (state.configHash !== (d.opencode.hash || "")) state.health = {};
     state.providers = mergeProviderLists(d.providers, d.opencode.providers);
+    state.disabledProviders = new Set(asArray(d.opencode.disabled_providers).map(String));
     renderProviderList();
     state.configHash = d.opencode.hash || "";
     state.configHasComments = !!d.opencode.comments;
@@ -1057,6 +1075,7 @@ async function refreshProviders() {
   } catch { return; }
   if (d && isCurrentConfig(context)) {
     state.providers = mergeProviderLists(d.providers, d.opencode && d.opencode.providers);
+    if (d.opencode) state.disabledProviders = new Set(asArray(d.opencode.disabled_providers).map(String));
     adoptModelHealth(d, context, true);
     renderProviderList();
     renderRoutes();
@@ -1343,8 +1362,10 @@ function loadProviderIntoForm(name) {
   // Keys are never persisted server-side, so this is empty for stored providers.
   // The pool is write-only for the same reason: raw keys never come back.
   $("#f-apikey").value = p.apiKey || "";
+  state.savedPool = (p.pool && Array.isArray(p.pool.names)) ? p.pool.names : [];
   clearPoolBox();
   restorePoolDraft();
+  renderSavedPool();
   $("#f-format").value = p.apiFormat || "openai-chat";
   updateFormatNote();
   state.models = (p.models || []).map((m) => ({ ...m }));
@@ -1361,7 +1382,7 @@ function loadProviderIntoForm(name) {
   setKeyFieldState(p.useEnvVar ? p.envVarName : "");
   renderKeyHint();
   syncAdvancedDisclosure({
-    open: (p.apiFormat && p.apiFormat !== "openai-chat") || !!($("#f-pool").value.trim()),
+    open: (p.apiFormat && p.apiFormat !== "openai-chat") || !!($("#f-pool").value.trim()) || state.savedPool.length > 1,
   });
   hydrateProbeResults(state.editingKey);
   renderModelList();
@@ -1547,7 +1568,17 @@ function renderPoolCount() {
   const lines = String($("#f-pool").value || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const unique = new Set(lines);
   const n = poolKeys();
-  if (!n.length) { el.textContent = ""; return; }
+  if (!n.length) {
+    // No fresh draft: show what is already saved, not an empty field that
+    // reads as "pool was lost".
+    if (state.savedPool && state.savedPool.length > 1) {
+      el.textContent = `Сохранено: ${state.savedPool.length} ключей`;
+      renderSavedPool();
+    } else {
+      el.textContent = "";
+    }
+    return;
+  }
   const parts = [`${plural(n.length, "Ключ", "Ключа", "Ключей")}: ${n.length}`];
   const dupes = lines.length - unique.size;
   // Duplicates and over-limit keys are not the same thing: calling both
@@ -1593,6 +1624,19 @@ function renderPoolResults(results) {
   const passed = asArray(results).filter((x) => x.ok).length;
   const total = asArray(results).length;
   box.innerHTML = `<div class="muted">${plural(passed, "Живой", "Живых", "Живых")}: ${passed} из ${total}</div>` + rows;
+}
+
+// Saved pool is names-only: values never leave the server. Shows the shards
+// already on disk so an empty draft textarea does not look like a lost pool.
+function renderSavedPool() {
+  const box = $("#poolStatus");
+  if (!box) return;
+  const sp = state.savedPool || [];
+  if (poolKeys().length || sp.length < 2) { if (!poolKeys().length && sp.length < 2) { box.hidden = true; } return; }
+  box.hidden = false;
+  box.innerHTML = `<div class="muted">Сохранено в пуле: ${sp.length} ключей — `
+    + sp.map((s) => `${esc(s.envVarName || s.key)} ${s.set ? "\u2713" : "\u2715 не задана"}`).join(", ") + `</div>`
+    + `<div class="muted">Значения ключей не показываются. Введи новый список выше, чтобы заменить пул.</div>`;
 }
 
 // Write-only поле: сырые ключи никогда не возвращаются с сервера, поэтому при
@@ -1779,8 +1823,8 @@ function renderModelList() {
   const list = $("#modelList");
   if (!state.models.length) {
     list.innerHTML = `<div class="empty-models">
-      <b>Моделей пока нет.</b><br>
-      Нажми «Обнаружить модели», чтобы получить список с сервера, или добавь вручную.
+      <b>Пока пусто.</b><br>
+      Нажми «Обнаружить» — подберём модели с сервера за тебя, или добавь одну вручную.
     </div>`;
     return;
   }
@@ -1800,9 +1844,9 @@ function renderModelList() {
       </div>
       <div class="tags">
         ${priceTag(m)}
-        ${(m.inputTypes || []).map((t) => `<span class="tag ${t === "image" ? "vis" : ""}">${esc(t)}</span>`).join("")}
-        ${m.reasoning ? `<span class="tag reason">reasoning</span>` : ""}
-        ${m.toolUse !== false ? `<span class="tag">tools</span>` : ""}
+        ${(m.inputTypes || []).map((t) => `<span class="tag ${t === "image" ? "vis" : ""}" title="${esc(t)}">${esc(t === "text" ? "текст" : t === "image" ? "картинки" : t === "video" ? "видео" : t === "audio" ? "аудио" : t === "pdf" ? "документы" : t)}</span>`).join("")}
+        ${m.reasoning ? `<span class="tag reason" title="reasoning">рассуждает</span>` : ""}
+        ${m.toolUse !== false ? `<span class="tag" title="tools">инструменты</span>` : ""}
       </div>
       <div class="row-actions">
         <button class="rm" data-test="${i}" title="Отправить пробный запрос к этой модели (потратит ~16 токенов)" aria-label="Проверить ${esc(m.id)}">${icon("bolt")}</button>
@@ -2746,11 +2790,12 @@ function routeWhy(c, kind) {
   else if (c.cost != null) bits.push("платная");
   else if (c.model.freeSource === "name" || /:free$/i.test(c.id)) bits.push("free? · цена не подтверждена");
   else bits.push("цена ?");
-  if (c.context) bits.push(`ctx ${fmtNum(c.context)}`);
+  if (c.context >= 262144) bits.push("большой контекст");
+  else if (c.context) bits.push(`ctx ${fmtNum(c.context)}`);
   if (kind === "vision" && c.image) bits.push("видит картинки");
   else {
-    if (c.reasoning) bits.push("reasoning");
-    if (c.tools) bits.push("tools");
+    if (c.reasoning) bits.push("рассуждает");
+    if (c.tools) bits.push("умеет инструменты");
   }
   return bits.join(" · ");
 }
@@ -2813,7 +2858,8 @@ function renderRoutes() {
   el.hidden = false;
   el.innerHTML = `<div class="result-card route-card">
     <div class="route-title"><h3>${icon("route")}Умные маршруты</h3><span class="tag">подбор</span></div>
-    <div class="diag-sub">Сначала проверенные запросом модели, затем непроверенные, ошибки — в крайнем случае. Проверка действует 1 ч, временные ошибки и квоты — 5 мин; история хранится до 7 дней. Доступность сервера не доказывает работу модели. Кнопка меняет только model — с бэкапом и откатом.</div>
+    <div class="diag-sub">Подобрали подходящие модели — кнопка «Сделать основной» просто поменяет выбор по умолчанию.</div>
+    <div class="diag-sub muted" title="Проверка действует 1 ч, временные ошибки и квоты — 5 мин; история хранится до 7 дней. Доступность сервера не доказывает работу модели.">Сначала проверенные запросом модели, затем непроверенные, ошибки — в крайнем случае.</div>
     ${state.healthWarning ? `<div class="diag-sub warn-line">${esc(state.healthWarning)}</div>` : ""}
     ${routes.map((r) => {
       const c = r.c;
@@ -3800,6 +3846,10 @@ async function runEnvAudit() {
         ? `<span class="diag-meta">✓ ${v.length} симв., ${where}</span>`
         : `<span class="diag-meta">✕ не задана</span>`)
       + `</div>`;
+    const held = asArray(v.referencedBy);
+    if (held.length) {
+      html += `<div class="diag-sub muted">держится: ${held.map(esc).join(", ")} — чтобы убрать переменную, удали соответствующий провайдер/шард в списке, затем повтори аудит</div>`;
+    }
   }
   html += `<div class="diag-sect">Сироты — заданы, но ничто не ссылается (${orphaned.length})</div>`;
   if (!orphaned.length) {

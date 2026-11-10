@@ -277,7 +277,9 @@ function collectReferencedEnv(config) {
       }
       if (Array.isArray(p?.pool?.shards)) {
         for (const s of p.pool.shards) {
-          const sEnv = String(s?.envVarName || s?.env || s || "").trim();
+          // shards stores provider keys ("openrouter-2"), not env vars — string
+          // entries are keys and would otherwise pollute the env audit.
+          const sEnv = (s && typeof s === "object") ? String(s.envVarName || s.env || "").trim() : "";
           if (sEnv && ENV_NAME_RE.test(sEnv) && !names.has(sEnv.toLowerCase())) {
             names.set(sEnv.toLowerCase(), sEnv);
           }
@@ -906,6 +908,10 @@ const server = http.createServer(async (req, res) => {
           // meantime is refused instead of silently overwritten.
           hash: cfg.hash || "",
           providers: cfg.config ? openCodeProviderList(cfg.config) : [],
+          // Which providers opencode currently hides/includes: the sidebar
+          // shows a badge so a disabled provider does not look healthy.
+          disabled_providers: cfg.config && Array.isArray(cfg.config.disabled_providers) ? cfg.config.disabled_providers : [],
+          enabled_providers: cfg.config && Array.isArray(cfg.config.enabled_providers) ? cfg.config.enabled_providers : [],
         },
       });
     }
@@ -1338,9 +1344,32 @@ const server = http.createServer(async (req, res) => {
       clearEnvCache();
       const referenced = collectReferencedEnv(cfg.config);
       const refSet = new Set(referenced.map((n) => n.toLowerCase()));
+      // Who keeps each variable alive: provider keys whose block references it.
+      // Without this, "can't delete" reads as a bug instead of a chain the user
+      // can unwind (remove the shard provider, the variable turns into an orphan).
+      const referencedBy = new Map();
+      for (const [pkey, p] of Object.entries(cfg.config?.provider || {})) {
+        if (!p || typeof p !== "object") continue;
+        const raw = p.options?.apiKey ?? p.apiKey;
+        const d = typeof raw === "string" && raw.trim() ? decodeApiKey(raw.trim()) : null;
+        const names = [];
+        if (d && d.useEnvVar && d.envVarName) names.push(d.envVarName);
+        if (Array.isArray(p.env)) {
+          for (const e of p.env) {
+            const c = String(e || "").trim();
+            if (ENV_NAME_RE.test(c)) names.push(c);
+          }
+        }
+        for (const nm of names) {
+          const lk = nm.toLowerCase();
+          if (!referencedBy.has(lk)) referencedBy.set(lk, []);
+          const arr = referencedBy.get(lk);
+          if (!arr.includes(pkey)) arr.push(pkey);
+        }
+      }
       const vars = referenced.map((name) => {
         const info = lookupEnv(name, { useCache: false });
-        return { name, set: info.set, length: info.length, scope: info.scope, scopes: info.scopes };
+        return { name, set: info.set, length: info.length, scope: info.scope, scopes: info.scopes, referencedBy: referencedBy.get(name.toLowerCase()) || [] };
       });
       const orphaned = listUserEnvNames().filter(
         (n) => KEY_LIKE_RE.test(n) && !refSet.has(String(n).toLowerCase()) && !isProtectedEnvVar(n),
@@ -2206,7 +2235,42 @@ function decodeOpenProvider(key, p) {
 }
 
 function openCodeProviderList(config) {
-  return Object.entries(config.provider || {})
-    .filter(([, p]) => isCustomProviderBlock(p))
-    .map(([key, p]) => decodeOpenProvider(key, p));
+  const entries = Object.entries(config.provider || {})
+    .filter(([, p]) => isCustomProviderBlock(p));
+  // Pool families: head "openrouter" owns shards "openrouter-2", "openrouter-3"…
+  // on the same endpoint (buildPoolShards). Only the head carries `pool`, so
+  // the form can show "сохранено в пуле N" instead of an empty textarea.
+  const keySet = new Map(entries.map(([k, p]) => [k, p]));
+  const baseOf = (p) => {
+    const b = String(p?.options?.baseURL || p?.baseURL || "").trim().replace(/\/+$/, "").toLowerCase();
+    return b || null;
+  };
+  const poolOf = (headKey, headP) => {
+    const base = baseOf(headP);
+    if (!base) return null;
+    const members = [{ key: headKey, p: headP }];
+    let n = 2;
+    for (;;) {
+      const k = `${headKey}-${n}`;
+      const p = keySet.get(k);
+      if (!p || baseOf(p) !== base) break;
+      members.push({ key: k, p });
+      n++;
+      if (n > 64) break; // sanity bound; pool ceiling is 20 anyway
+    }
+    if (members.length < 2) return null;
+    const names = members.map(({ key, p }) => {
+      const d = decodeApiKey(p.options?.apiKey ?? p.apiKey);
+      const envVarName = d.useEnvVar && d.envVarName ? d.envVarName : "";
+      const info = envVarName ? lookupEnv(envVarName) : null;
+      return { key, envVarName, set: !!(info && info.set), length: info ? info.length : 0 };
+    });
+    return { count: names.length, names };
+  };
+  return entries.map(([key, p]) => {
+    const entry = decodeOpenProvider(key, p);
+    const pool = poolOf(key, p);
+    if (pool) entry.pool = pool;
+    return entry;
+  });
 }

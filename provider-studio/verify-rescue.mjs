@@ -116,7 +116,11 @@ function has(config, id) {
 
 check("a non-object config is rejected", has(null, "not-object") && has("x", "not-object"));
 check("an array config is rejected", has([], "not-object"));
-check("a missing provider block is reported", has({}, "no-provider"));
+check("a default config without providers has nothing to report", ids({}).length === 0);
+check("a model reference without providers is an error",
+  R.validateConfig({ model: "a/b" }).some((i) => i.id === "no-provider" && i.severity === "error"));
+check("an empty providers map without models is silent",
+  ids({ providers: {} }).length === 0);
 // The referenced variable is set, so this config is genuinely complete: an
 // unset variable is itself an error now (see the env-missing checks below), so
 // leaving it unset here would no longer be testing structural validity.

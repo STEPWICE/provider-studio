@@ -63,6 +63,72 @@ export const MODEL_FIELDS = [
 ];
 
 /**
+ * Parses a model reference in any of the shapes opencode accepts:
+ *   "provider/model"            → { provider, model, variant: "" }
+ *   "provider/model#variant"    → { provider, model, variant }
+ *   { providerID, model, variant } (object form)
+ *
+ * The model id itself may contain slashes (`stealth/crouton-alpha`), so the
+ * split is on the FIRST slash only and the variant is split on `#`.
+ * The `#variant` string form is used for writes because it stays a string —
+ * every `startsWith(provider + "/")` check in the codebase keeps working —
+ * while the object form would need a parallel parser everywhere.
+ */
+export function parseModelRef(value) {
+  if (value && typeof value === "object") {
+    const provider = String(value.providerID || value.provider || "").trim();
+    const model = String(value.model || "").trim();
+    const variant = String(value.variant || "").trim();
+    return { provider, model, variant, raw: provider && model ? buildModelRef(provider, model, variant) : "" };
+  }
+  const raw = String(value || "").trim();
+  if (!raw) return { provider: "", model: "", variant: "", raw: "" };
+  const slash = raw.indexOf("/");
+  if (slash <= 0) return { provider: raw, model: "", variant: "", raw };
+  const provider = raw.slice(0, slash);
+  const rest = raw.slice(slash + 1);
+  const hash = rest.indexOf("#");
+  const model = hash >= 0 ? rest.slice(0, hash) : rest;
+  const variant = hash >= 0 ? rest.slice(hash + 1).trim() : "";
+  return { provider, model, variant, raw };
+}
+
+/** Builds the string form of a model reference, with `#variant` when given. */
+export function buildModelRef(provider, model, variant) {
+  const p = String(provider || "").trim();
+  const m = String(model || "").trim();
+  const v = String(variant || "").trim();
+  if (!p || !m) return "";
+  return v ? `${p}/${m}#${v}` : `${p}/${m}`;
+}
+
+/** Normalises variants to the V2 shape: [{ id, settings: { reasoningEffort } }]. */
+export function normaliseVariants(input, reasoningEfforts) {
+  const out = [];
+  const seen = new Set();
+  const push = (id, effort) => {
+    const vid = String(id || "").trim();
+    if (!vid || seen.has(vid)) return;
+    seen.add(vid);
+    out.push({ id: vid, settings: { reasoningEffort: String(effort || vid).trim() || vid } });
+  };
+  if (Array.isArray(input)) {
+    for (const v of input) {
+      if (typeof v === "string") { push(v, v); continue; }
+      if (v && typeof v === "object") {
+        const id = v.id || v.name || v.settings?.reasoningEffort || "";
+        const effort = v.settings?.reasoningEffort || v.reasoningEffort || id;
+        push(id, effort);
+      }
+    }
+  }
+  if (!out.length && Array.isArray(reasoningEfforts) && reasoningEfforts.length) {
+    for (const e of reasoningEfforts) push(e, e);
+  }
+  return out;
+}
+
+/**
  * Which form inputs control which config key.
  *
  * A config key may only be deleted when the form actually carried its input and
@@ -83,6 +149,8 @@ const MODEL_KEY_INPUTS = {
   family: ["family"],
   status: ["status"],
   headers: ["headers"],
+  variants: ["variants", "reasoningEfforts"],
+  capabilities: ["reasoningEfforts"],
 };
 
 /** Config keys under this tool's control for a given submitted model form. */
@@ -252,6 +320,20 @@ export function buildModelEntry(m) {
 
   const headers = normaliseHeaders(m.headers);
   if (Object.keys(headers).length) entry.headers = headers;
+
+  // Reasoning efforts / variants (V2). Without this, discovery of e.g.
+  // stealth/crouton-alpha drops `supported_efforts` on the floor and every
+  // shard ends up with no way to pick an effort. The effort list travels in
+  // `capabilities.reasoning.effort` (read back by capabilitiesFromLegacy in
+  // schema.mjs) and the selectable entries in `variants`.
+  const efforts = Array.isArray(m.reasoningEfforts)
+    ? m.reasoningEfforts.map((e) => String(e || "").trim()).filter(Boolean)
+    : [];
+  const variants = normaliseVariants(m.variants, efforts);
+  if (variants.length) entry.variants = variants;
+  if (efforts.length && m.reasoning) {
+    entry.capabilities = { reasoning: { supported: true, effort: [...new Set(efforts)] } };
+  }
 
   return { id, entry };
 }
@@ -466,10 +548,26 @@ export function buildProviderChanges(provider, opts = {}) {
   }
 
   // ---- default model
+  // `defaultVariant` (form field or opt) pins the default reasoning effort,
+  // e.g. "low" for stealth/crouton-alpha: fastest tier that still reasons,
+  // instead of the gateway default ("max"). Only written when the chosen
+  // model actually offers that variant — an unknown variant would make
+  // opencode fall back unpredictably.
   const chosen = trimmed(defaultModelId);
-  const defaultModel = chosen && wanted.has(chosen) ? chosen : [...wanted.keys()][0];
-  if (setAsDefault && defaultModel) {
-    changes.push({ op: "set", path: ["model"], value: `${providerKey}/${defaultModel}` });
+  const defaultModelIdOnly = chosen && wanted.has(chosen) ? chosen : [...wanted.keys()][0];
+  const wantedVariant = trimmed(opts.defaultVariant) || trimmed(provider.defaultVariant) || "";
+  let defaultVariant = "";
+  if (wantedVariant && defaultModelIdOnly && wanted.has(defaultModelIdOnly)) {
+    const form = wanted.get(defaultModelIdOnly).form || {};
+    const offered = normaliseVariants(form.variants, form.reasoningEfforts).map((v) => v.id);
+    const priorVariants = prior?.models?.[defaultModelIdOnly]?.variants;
+    const priorOffered = Array.isArray(priorVariants) ? priorVariants.map((v) => (typeof v === "string" ? v : v?.id)).filter(Boolean) : [];
+    if (offered.includes(wantedVariant) || priorOffered.includes(wantedVariant)) defaultVariant = wantedVariant;
+  }
+  const defaultModel = defaultModelIdOnly;
+  const defaultModelRef = buildModelRef(providerKey, defaultModelIdOnly, defaultVariant);
+  if (setAsDefault && defaultModelRef) {
+    changes.push({ op: "set", path: ["model"], value: defaultModelRef });
   } else if (renaming) {
     // A rename must follow through to the pointer, or the default model breaks.
     const current = trimmed(existingConfig?.model);
@@ -482,7 +580,7 @@ export function buildProviderChanges(provider, opts = {}) {
     }
   }
 
-  return { ok: true, providerKey, previousKey: renaming ? oldKey : "", defaultModel, changes, reenabled };
+  return { ok: true, providerKey, previousKey: renaming ? oldKey : "", defaultModel, defaultModelRef, defaultVariant, changes, reenabled };
 }
 
 /**
@@ -755,5 +853,20 @@ export function modelEntryToForm(id, entry) {
   if (typeof e.status === "string") out.status = e.status;
   if (typeof e.temperature === "boolean") out.temperature = e.temperature;
   if (e.headers && typeof e.headers === "object") out.headers = { ...e.headers };
+  // Reasoning efforts: V2 keeps them in capabilities.reasoning.effort, the
+  // selectable entries in `variants`. Both must round-trip, otherwise a
+  // re-save strips the effort picker the user had.
+  if (caps?.reasoning && typeof caps.reasoning === "object" && Array.isArray(caps.reasoning.effort) && caps.reasoning.effort.length) {
+    out.reasoningEfforts = caps.reasoning.effort.map((x) => String(x).trim()).filter(Boolean);
+  }
+  if (Array.isArray(e.variants) && e.variants.length) {
+    out.variants = e.variants;
+    if (!out.reasoningEfforts?.length) {
+      const fromVariants = e.variants
+        .map((v) => (typeof v === "string" ? v : v?.settings?.reasoningEffort || v?.id || ""))
+        .map((x) => String(x).trim()).filter(Boolean);
+      if (fromVariants.length) out.reasoningEfforts = fromVariants;
+    }
+  }
   return out;
 }

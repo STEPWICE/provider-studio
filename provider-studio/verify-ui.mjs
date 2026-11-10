@@ -816,7 +816,7 @@ const healthAsyncGaps = [];
       renderRoutes: () => { routeRenders++; }, renderProviderList: noop, renderModelList: noop,
       scheduleHealthRefresh: noop, setBtnLoading: (b, on) => { b.disabled = on; },
       toast: (...args) => toasts.push(args), confirm: () => true, setInterval: () => 1, clearInterval: noop,
-      stashPoolDraft: noop, clearPoolBox: noop, restorePoolDraft: noop, updateFormatNote: noop,
+      stashPoolDraft: noop, clearPoolBox: noop, restorePoolDraft: noop, renderSavedPool: noop, updateFormatNote: noop,
       setEnvMode: (on) => { $("#f-env").checked = on; }, setKeyFieldState: noop, renderKeyHint: noop,
       syncAdvancedDisclosure: noop, formSnapshot: () => "snapshot", renderKeyPreview: noop,
       updateConfigChip: noop, syncUndoButton: noop,

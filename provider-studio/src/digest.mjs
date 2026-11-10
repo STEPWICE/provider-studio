@@ -89,15 +89,27 @@ export function normaliseNews(n) {
   };
 }
 
-/** Делит perks на живые и просроченные. Неизвестный статус — живой: лучше показать лишнее, чем спрятать действующее. */
+/** Делит perks на живые и просроченные. Неизвестный статус — живой: лучше показать лишнее, чем спрятать действующее.
+ * Просрочка по дате ends при живом статусе тоже скрывается: кэш живёт дольше самих акций,
+ * и «успей до 2026-10-03» в ноябре иначе выглядит как действующая халява. */
 export function splitPerks(list) {
   const live = [];
   let ended = 0;
   for (const p of Array.isArray(list) ? list : []) {
-    if (String(p?.status || "").toLowerCase() === "ended") ended++;
+    if (String(p?.status || "").toLowerCase() === "ended" || isPastEnd(p?.ends)) ended++;
     else live.push(normalisePerk(p));
   }
   return { live, ended };
+}
+
+function isPastEnd(ends) {
+  const s = clean(ends);
+  if (!s) return false;
+  // Date-only means valid through that day; a datetime compares as-is.
+  let t = Date.parse(s);
+  if (Number.isNaN(t)) return false;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) t += 24 * 60 * 60 * 1000 - 1;
+  return t < Date.now();
 }
 
 function readCache() {

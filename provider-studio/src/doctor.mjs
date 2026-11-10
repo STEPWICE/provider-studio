@@ -427,7 +427,8 @@ function fixDefaultModels(cfg, changes, fixes, skipped) {
   } else if (typeof cfg.model === "string" && cfg.model.includes("/")) {
     const slash = cfg.model.indexOf("/");
     const pk = cfg.model.slice(0, slash);
-    const mn = cfg.model.slice(slash + 1);
+    // `provider/model#variant`: variant pins a reasoning effort, not the id.
+    const mn = cfg.model.slice(slash + 1).split("#")[0];
     if (!isPlainObject(providers[pk]) || !(mn && Object.prototype.hasOwnProperty.call(providers[pk].models || {}, mn))) {
       const fb = firstAvailableModel(cfg);
       if (fb && fb !== cfg.model) {
@@ -445,7 +446,7 @@ function fixDefaultModels(cfg, changes, fixes, skipped) {
   if (typeof sm === "string" && sm.includes("/")) {
     const slash = sm.indexOf("/");
     const pk = sm.slice(0, slash);
-    const mn = sm.slice(slash + 1);
+    const mn = sm.slice(slash + 1).split("#")[0];
     if (!isPlainObject(providers[pk]) || !(mn && Object.prototype.hasOwnProperty.call(providers[pk].models || {}, mn))) {
       changes.push({ op: "delete", path: ["small_model"] });
       fixes.push({ id: "bad-small-model", message: `Убран висячий small_model ${sm}` });
@@ -477,6 +478,8 @@ export function discoveredToEntry(src) {
     costOutput: src?.costOutput,
     costCacheRead: src?.costCacheRead,
     costCacheWrite: src?.costCacheWrite,
+    reasoningEfforts: src?.reasoningEfforts || [],
+    variants: src?.variants || [],
   });
   return built ? built.entry : null;
 }
