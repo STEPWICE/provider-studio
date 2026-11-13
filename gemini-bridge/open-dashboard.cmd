@@ -1,15 +1,13 @@
 @echo off
-chcp 65001 >nul
 cd /d "%~dp0"
+rem ASCII-only on purpose: chcp 65001 plus UTF-8 text desynchronises the cmd parser.
 
-:: Проверяем, запущен ли сервер моста на порту 8010
-curl.exe -s --connect-timeout 1 http://127.0.0.1:8010/health >nul 2>&1
+curl.exe -s --noproxy "*" --connect-timeout 1 http://127.0.0.1:8010/health >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo [INFO] Запуск Gemini Web Bridge в фоновом режиме...
+    echo [INFO] Starting Gemini Web Bridge in the background...
     wscript.exe "%~dp0start-hidden.vbs"
     timeout /t 2 /nobreak >nul
 )
 
-:: Открываем дашборд лимитов в браузере по умолчанию
 start "" "http://127.0.0.1:8010/dashboard"
 exit /b 0

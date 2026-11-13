@@ -223,11 +223,9 @@ def is_auth_or_session_error(err: Exception) -> bool:
     return any(p in msg for p in patterns)
 
 async def cookie_persistence_loop():
-    """Keeps .env in sync with Google-rotated tokens and with the bridge browser session."""
-    ticks = 0
+    """Keeps .env in sync with the Google-rotated tokens of the live client."""
     while True:
         await asyncio.sleep(30)
-        ticks += 1
         try:
             if client_instance and client_instance._running:
                 live = {c.name: c.value for c in client_instance.cookies.jar
@@ -241,16 +239,12 @@ async def cookie_persistence_loop():
                 if changed:
                     print("[INFO] Google обновил сессионные куки. Сохраняем в .env...")
                     update_env_file(psid=psid, psidts=psidts)
-            if ticks % 10 == 0:
-                if await refresh_cookies_from_browser():
-                    await get_gemini_client(force_refresh=True)
         except Exception as e:
             print(f"[WARN] Цикл обновления сессии: {e}")
 
 async def warmup():
     try:
         cleanup_old_upload_cache(0)
-        await refresh_cookies_from_browser()
         await get_gemini_client()
     except Exception as e:
         print(f"[WARN] Авто-прогрев при старте: {e}")
@@ -488,7 +482,13 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
             "\nTo call a tool, output:",
             "```tool_call",
             '{"name": "<tool_name>", "arguments": { ... }}',
-            "```\n"
+            "```\n",
+            "The tools listed above ARE available right now. They are executed by the client on your behalf: "
+            "you emit a tool_call block, the client runs it and returns the next turn as 'Tool Result (<name>): ...'. "
+            "Never claim you lack tools or filesystem access, and never ask the user to run a tool for you.",
+            "Read the Tool Result and continue the task. Do not ask the user for information a tool already returned, "
+            "and do not re-call a tool with identical arguments just to see its output again.",
+            "When the task is finished, reply in plain text with no tool_call block.\n",
         ]
 
         examples = ["Examples:"]
@@ -668,7 +668,7 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
             dialogue_parts.append(f"Assistant: {' '.join(parts)}")
         elif m.role in ("tool", "function"):
             tool_name = m.name or m.tool_call_id or "tool"
-            dialogue_parts.append(f"Tool Output ({tool_name}): {text}")
+            dialogue_parts.append(f"Tool Result ({tool_name}): {text}")
         else:
             dialogue_parts.append(f"{m.role.capitalize()}: {text}")
 
