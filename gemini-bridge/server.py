@@ -295,6 +295,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
     tools: Optional[List[Any]] = None
+    tool_choice: Optional[Any] = None
     reasoning_effort: Optional[str] = None
 
 def orchestrator_route(messages: List[ChatMessage], tools: Optional[List[Any]], effort: str, prompt_text: str = "") -> tuple[str, bool]:
@@ -532,7 +533,12 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
                     'Assistant: ```tool_call\n{"name": "write", "arguments": {"path": "project.godot", "content": "..."}}\n```\n'
                 )
 
-        tools_instruction = "\n".join(instruction_lines) + "\n" + "\n".join(examples)
+        # Only emit the header when examples follow it. A dangling "Examples:"
+        # right before the dialogue made the model read the real task as one of
+        # the examples and reply that no task had been given.
+        tools_instruction = "\n".join(instruction_lines)
+        if len(examples) > 1:
+            tools_instruction += "\n" + "\n".join(examples)
         system_prompts.append(tools_instruction)
 
     processed_messages = messages
@@ -699,16 +705,43 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
 
     return full_prompt.strip(), files_to_upload
 
-def extract_tool_calls(text: str) -> Optional[List[Dict[str, Any]]]:
-    """Detects and parses all single or multiple tool calls emitted by Gemini across any code fence or bare JSON."""
-    if not text:
+def collect_tool_names(tools: Optional[List[Any]]) -> set:
+    names = set()
+    for t in tools or []:
+        if isinstance(t, dict):
+            fn = t.get("function")
+            if isinstance(fn, dict) and fn.get("name"):
+                names.add(fn["name"])
+            elif t.get("name"):
+                names.add(t["name"])
+    return names
+
+ARG_KEYS = ("arguments", "parameters", "args", "params", "input")
+
+def estimate_tokens(text: str) -> int:
+    """The web session reports no token counts, so this is an estimate.
+
+    Counting words, as this used to, undercounts code badly: a minified line is
+    one word and hundreds of tokens, and the client sizes its context budget
+    from these numbers.
+    """
+    return len(text or "") // 4
+
+def extract_tool_calls(text: str, tool_names: Optional[set] = None) -> Optional[List[Dict[str, Any]]]:
+    """Parses tool calls the model emitted.
+
+    Only names offered in this request count. A generic JSON fence is otherwise
+    indistinguishable from a config sample: a package.json answer carries
+    {"name": "my-app"} and used to be executed as a tool called my-app.
+    """
+    if not text or not tool_names:
         return None
 
     results: List[Dict[str, Any]] = []
     seen_calls = set()
 
     def add_call(name: str, args: Any):
-        if not name:
+        if not name or name not in tool_names:
             return
         args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
         dedup_key = (str(name), args_str)
@@ -724,7 +757,8 @@ def extract_tool_calls(text: str) -> Optional[List[Dict[str, Any]]]:
             }
         })
 
-    # 1. Parse code blocks with ANY tag: ```tool_call, ```json, ```javascript, ```js, ``` or any other language
+    # 1. Code blocks. An explicit tool_call tag is a call on its own; any other
+    #    tag (```json, ```js, bare ```) also needs an arguments-shaped key.
     cb_pattern = r"```(?:[a-zA-Z0-9_\-]+)?\s*([\{\[][\s\S]*?[\}\]])\s*```"
     for m in re.finditer(cb_pattern, text):
         raw = m.group(1).strip()
@@ -735,7 +769,7 @@ def extract_tool_calls(text: str) -> Optional[List[Dict[str, Any]]]:
                 if isinstance(item, dict):
                     name = item.get("name") or item.get("function") or item.get("tool")
                     args = item.get("arguments") or item.get("parameters") or item.get("args") or item.get("params") or item.get("input") or {}
-                    if name:
+                    if name and any(k in item for k in ARG_KEYS):
                         add_call(name, args)
         except Exception:
             # Handle multiple JSON objects concatenated inside a single code block
@@ -788,13 +822,19 @@ def extract_tool_calls(text: str) -> Optional[List[Dict[str, Any]]]:
 
     return results if results else None
 
-def strip_tool_call_blocks(text: str) -> str:
-    """Removes tool call codeblocks and xml tags from user-facing conversational text."""
-    if not text:
-        return ""
-    cleaned = re.sub(r"```(?:[a-zA-Z0-9_\-]+)?\s*[\{\[][\s\S]*?[\}\]]\s*```", "", text)
+def strip_tool_call_blocks(text: str, tool_names: Optional[set] = None) -> str:
+    """Removes only the blocks that really are tool calls.
+
+    This used to delete every fenced block starting with a brace or bracket, so
+    a coding answer lost its package.json / tsconfig sample and kept only prose.
+    """
+    if not text or not tool_names:
+        return (text or "").strip()
+
+    def fence_repl(m):
+        return "" if extract_tool_calls(m.group(0), tool_names) else m.group(0)
+    cleaned = re.sub(r"```(?:[a-zA-Z0-9_\-]+)?\s*[\{\[][\s\S]*?[\}\]]\s*```", fence_repl, text)
     cleaned = re.sub(r"<tool_call>[\s\S]*?</tool_call>", "", cleaned)
-    cleaned = re.sub(r"`\{\s*\"name\":[\s\S]*?\}`", "", cleaned)
     return cleaned.strip()
 
 @app.get("/")
@@ -1352,9 +1392,17 @@ def generate_local_title(prompt: str) -> str:
     return title.capitalize() if title else "Сессия"
 
 def is_google_glitch_text(text: str) -> bool:
+    """True only when the whole reply is a Google error page.
+
+    A substring search anywhere in the answer also matched ordinary prose about
+    error handling ("if an error occurred, please try again"), which then got
+    replaced by a canned sentence.
+    """
     if not text:
         return False
     t = text.strip().lower()
+    if len(t) > 200 or "```" in t:
+        return False
     patterns = (
         "something went wrong",
         "encountered an error",
@@ -1372,6 +1420,9 @@ def is_google_glitch_text(text: str) -> bool:
 @app.post("/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     cleanup_old_upload_cache()
+    if req.tool_choice == "none":
+        req.tools = None
+    tool_names = collect_tool_names(req.tools)
     client = await get_gemini_client()
     prompt, files_to_upload = parse_openai_messages(req.messages, req.tools)
 
@@ -1381,13 +1432,12 @@ async def chat_completions(req: ChatCompletionRequest):
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created_time = int(time.time())
 
-    # Fast-path: OpenCode / client background title generation (0ms local, zero race collision)
-    is_title_request = any(p in (prompt or "").lower() for p in (
-        "reply with only the title",
-        "generate a title",
-        "title for this",
-        "give a short title"
-    ))
+    # Fast-path for the client's background title generation. Matched against the
+    # last user turn only: searching the whole prompt hijacked real coding tasks
+    # like "write a function to generate a title for each blog post".
+    last_user = next((m for m in reversed(req.messages) if m.role == "user"), None)
+    last_user_text = str(last_user.content or "").lower() if last_user else ""
+    is_title_request = not req.tools and "reply with only the title" in last_user_text
 
     if is_title_request:
         title = generate_local_title(prompt)
@@ -1577,11 +1627,14 @@ async def chat_completions(req: ChatCompletionRequest):
                             await asyncio.sleep(0.3)
                             continue
                         else:
-                            print(f"[RECOVERY] Сбой Google Web на повторе. Заменяем текст сбоя...")
-                            collected_full_text = "Я готов помочь с анализом и исправлением кода. Укажите, какой файл или действие требуется выполнить."
+                            err = {"error": {"message": "Gemini Web вернул страницу ошибки вместо ответа. Повторите запрос.",
+                                             "type": "gemini_upstream_error"}}
+                            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
 
                     # 3. Handle Tool Calls & Text at stream completion
-                    tool_calls = extract_tool_calls(collected_full_text)
+                    tool_calls = extract_tool_calls(collected_full_text, tool_names)
 
                     if tool_calls:
                         # Emit delta.tool_calls chunk required by @ai-sdk/openai-compatible (ZERO refusal text emitted!)
@@ -1615,7 +1668,7 @@ async def chat_completions(req: ChatCompletionRequest):
                         finish_reason = "tool_calls"
                     else:
                         # Pure text assistant response (or clean final answer)
-                        clean_text = strip_tool_call_blocks(collected_full_text)
+                        clean_text = strip_tool_call_blocks(collected_full_text, tool_names)
 
                         if req.tools:
                             # In tool mode, emit the clean finalized content chunk
@@ -1644,6 +1697,11 @@ async def chat_completions(req: ChatCompletionRequest):
                                 "finish_reason": finish_reason,
                             }
                         ],
+                        "usage": {
+                            "prompt_tokens": estimate_tokens(prompt),
+                            "completion_tokens": estimate_tokens(collected_full_text),
+                            "total_tokens": estimate_tokens(prompt) + estimate_tokens(collected_full_text),
+                        },
                     }
                     yield f"data: {json.dumps(final_event)}\n\n"
                     yield "data: [DONE]\n\n"
@@ -1703,12 +1761,12 @@ async def chat_completions(req: ChatCompletionRequest):
                     await asyncio.sleep(0.3)
                     continue
                 else:
-                    reply_content = "Я готов помочь с анализом и исправлением кода. Укажите, какой файл или действие требуется выполнить."
+                    raise RuntimeError("Gemini Web вернул страницу ошибки вместо ответа. Повторите запрос.")
 
-            tool_calls = extract_tool_calls(reply_content)
+            tool_calls = extract_tool_calls(reply_content, tool_names)
 
             finish_reason = "tool_calls" if tool_calls else "stop"
-            clean_content = strip_tool_call_blocks(reply_content) if tool_calls else reply_content
+            clean_content = strip_tool_call_blocks(reply_content, tool_names) if tool_calls else reply_content
 
             msg_body: Dict[str, Any] = {
                 "role": "assistant",
@@ -1732,9 +1790,9 @@ async def chat_completions(req: ChatCompletionRequest):
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": len((prompt or "").split()),
-                    "completion_tokens": len(reply_content.split()),
-                    "total_tokens": len((prompt or "").split()) + len(reply_content.split()),
+                    "prompt_tokens": estimate_tokens(prompt),
+                    "completion_tokens": estimate_tokens(reply_content),
+                    "total_tokens": estimate_tokens(prompt) + estimate_tokens(reply_content),
                 },
             }
         except Exception as e:
@@ -1747,7 +1805,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     pass
             err_msg = str(e)
             if "auth" in err_msg.lower() or "token" in err_msg.lower() or "401" in err_msg or "cookie" in err_msg.lower():
-                err_msg = "Сессионные куки Google AI Pro устарели. Пожалуйста, обновите значение __Secure-1PSID в файле .env."
+                err_msg = "Сессия Google недействительна. Запустите login.cmd и войдите в аккаунт в окне Chrome моста."
             raise HTTPException(status_code=500, detail=f"Ошибка генерации ответа Gemini: {err_msg}")
 
 if __name__ == "__main__":

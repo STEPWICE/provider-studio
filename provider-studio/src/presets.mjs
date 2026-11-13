@@ -110,11 +110,11 @@ export const PRESETS = [
     needsKey: false,
     discover: true,
     models: [
-      { id: "gemini-orchestrator", name: "Gemini Orchestrator (Auto)", contextWindow: 1000000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
-      { id: "gemini-carbon", name: "Gemini Carbon", contextWindow: 1000000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
-      { id: "gemini-pro", name: "Gemini Pro", contextWindow: 1000000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
-      { id: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen", contextWindow: 1000000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: false, toolUse: true },
-      { id: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (Высокий)", contextWindow: 1000000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
+      { id: "gemini-orchestrator", name: "Gemini Orchestrator (Auto)", contextWindow: 175000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
+      { id: "gemini-carbon", name: "Gemini Carbon", contextWindow: 175000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
+      { id: "gemini-pro", name: "Gemini Pro", contextWindow: 175000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
+      { id: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen", contextWindow: 175000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: false, toolUse: true },
+      { id: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (Высокий)", contextWindow: 175000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
     ],
   },
   {
