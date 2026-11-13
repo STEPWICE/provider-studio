@@ -3,9 +3,9 @@
 //
 // Зачем отдельный модуль, а не поле в formats.mjs:
 //   - opencode принимает ровно один `options.apiKey` на провайдера, поэтому
-//     «пул» не пишется в конфиг как массив — он разворачивается либо в N
-//     блоков-шардов (по одному ключу в каждом), либо в один блок + плагин,
-//     который переставляет ключи уже в рантайме opencode;
+//     «пул» не пишется в конфиг как массив — это один блок, чей `env`
+//     перечисляет все переменные ключей, плюс плагин, который переставляет
+//     ключи уже в рантайме opencode;
 //   - секреты не должны пересекать HTTP-границу туда-обратно: сюда приходят
 //     сырые ключи из формы, а наружу уходят только маски и вердикты.
 //     Хранятся ключи только в переменных окружения ОС (см. src/env.mjs),
@@ -241,31 +241,6 @@ export async function fetchKeyBalance({ baseURL, apiKey, timeoutMs = 10000 } = {
 
 // ------------------------------------------------------- развёртка в конфиг
 
-/**
- * Строит N форм провайдеров-шардов из одной логической формы + пула.
- * Первый шард сохраняет исходный ключ/имя (обратная совместимость:
- * уже настроенный `model: slug/...` продолжает работать), остальные
- * получают суффиксы `-2..N` и `envBase_2..N`.
- */
-export function buildPoolShards(provider, envBase, keys) {
-  const list = Array.isArray(keys) ? keys : [];
-  const base = String(envBase || "").trim() || poolEnvBaseFor(provider?.name);
-  const p = provider && typeof provider === "object" ? provider : {};
-  const baseName = String(p.displayName || p.name || "provider").trim() || "provider";
-  const baseKey = String(p.key || p.name || baseName).trim() || baseName;
-  return list.map((k, i) => ({
-    ...p,
-    key: i === 0 ? baseKey : `${baseKey}-${i + 1}`,
-    name: baseName,
-    displayName: i === 0 ? baseName : `${baseName} ${i + 1}`,
-    useEnvVar: true,
-    envVarName: i === 0 ? base : `${base}_${i + 1}`,
-    // Сырой ключ живёт только до записи в env; в store/конфиг он не попадает
-    // (server.mjs срезает его через stripSecrets, в opencode пишется ссылка).
-    apiKey: String(k || ""),
-  }));
-}
-
 /** Имя каталога плагина: keypool-<slug> */
 export function poolPluginDirName(providerKey) {
   return `keypool-${slugify(providerKey || "provider")}`;
@@ -461,8 +436,13 @@ export function buildKeypoolPlugin({ providerKey, displayName, baseURL, apiForma
     `    try { urlHost = new URL(url).hostname.toLowerCase(); } catch { urlHost = ""; }`,
     `    let poolHost = "";`,
     `    try { poolHost = new URL(POOL_BASE).hostname.toLowerCase(); } catch { poolHost = ""; }`,
-    `    const inScope = url === POOL_BASE || url.startsWith(POOL_BASE + "/") || url.startsWith(POOL_BASE + "?") || (hasAuth && !!poolHost && urlHost === poolHost);`,
-    `    if (!POOL_BASE || !inScope || !hasAuth) return origFetch(input, init);`,
+    `    const inScopeExact = url === POOL_BASE || url.startsWith(POOL_BASE + "/") || url.startsWith(POOL_BASE + "?");`,
+    `    // Exact-prefix scope is intercepted even without an auth header: a single`,
+    `    // pool block whose head env is empty still gets a live key injected and`,
+    `    // rotated. The same-host fallback stays auth-gated so a neighbour on the`,
+    `    // same host is never rewritten with this pool's keys.`,
+    `    const inScope = inScopeExact || (hasAuth && !!poolHost && urlHost === poolHost);`,
+    `    if (!POOL_BASE || !inScope) return origFetch(input, init);`,
     ``,
     `    let bodyText = null;`,
     `    let bodyBytes = null;`,

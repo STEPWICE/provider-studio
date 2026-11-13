@@ -1748,15 +1748,17 @@ async function poolPreview(provider) {
   if (seq !== previewSeq) return;
   if (!r.ok) return toast(r.error || "Не удалось построить diff пула", "err");
   state.configHash = r.hash || "";
+  const keyCount = (r.envNames || r.shardKeys || []).length;
   openDiff({
-    title: `Пул ключей: ${(r.shardKeys || []).length} ${plural((r.shardKeys || []).length, "шард", "шарда", "шардов")} + плагин`,
+    title: `Пул ключей: 1 провайдер · ${keyCount} ${plural(keyCount, "ключ", "ключа", "ключей")} + плагин ротации`,
     meta: `<div class="diff-path">${esc(r.path || "")}</div>
       <div class="diff-stat"><span class="plus">+${r.diff ? r.diff.added : 0}</span>
       <span class="minus">-${r.diff ? r.diff.removed : 0}</span>
-      <span class="tag">шарды: ${esc((r.shardKeys || []).join(", "))}</span>
+      <span class="tag">провайдер: ${esc((r.shardKeys || []).join(", "))}</span>
+      <span class="tag">ключей: ${keyCount}</span>
       ${r.plugin ? `<span class="tag">плагин: ${esc(r.plugin.fileName)}</span>` : ""}</div>`,
     diff: r.diff,
-    hint: r.defaultModel ? `Модель по умолчанию: ${r.defaultModel}. Ключи в конфиг не попадут — только ссылки {env:...} и плагин ротации.` : "",
+    hint: r.defaultModel ? `Модель по умолчанию: ${r.defaultModel}. Один провайдер на весь пул: ключи в конфиг не попадут — только ссылки {env:...} и плагин авторотации до исчерпания балансов.` : "",
     onConfirm: async () => { await poolApplyNow(provider); },
   });
 }
@@ -1788,10 +1790,14 @@ async function poolApplyNow(provider) {
 
   const resultsEl = $("#results");
   resultsEl.hidden = false;
-  const shardLines = (res.shards || []).map((s) => `<div class="ok-line" style="color:var(--muted)">${esc(s.key)} → {env:${esc(s.envVar)}}</div>`).join("");
+  const envNames = res.envNames || [];
+  const keyCount = envNames.length || (res.shardKeys || []).length;
+  const envRefs = envNames.map((n) => `{env:${esc(n)}}`).join(", ");
   resultsEl.innerHTML = `<div class="result-card"><h3>opencode · пул ключей</h3>`
-    + `<div class="ok-line">✓ Применено: ${(res.shardKeys || []).length} ${plural((res.shardKeys || []).length, "шард", "шарда", "шардов")}. Модель по умолчанию: ${esc(res.defaultModel || "—")}</div>`
-    + shardLines
+    + `<div class="ok-line">✓ Применено: 1 провайдер · ${keyCount} ${plural(keyCount, "ключ", "ключа", "ключей")}. Модель по умолчанию: ${esc(res.defaultModel || "—")}</div>`
+    + `<div class="ok-line" style="color:var(--muted)">${esc((res.shardKeys || []).join(", "))} → ${envRefs}</div>`
+    + ((res.removedShards && res.removedShards.length)
+      ? `<div class="ok-line" style="color:var(--muted)">Убраны старые копии: ${esc(res.removedShards.join(", "))}</div>` : "")
     + (res.pluginFile ? `<div class="ok-line" style="color:var(--muted)">Плагин ротации: ${esc(res.pluginFile)}</div>`
       : `<div class="err-line">✕ Плагин не записан: ${esc(res.pluginError || "ошибка")}</div>`)
     + (res.pluginWarning ? `<div class="err-line">⚠ ${esc(res.pluginWarning)}</div>` : "")
@@ -2074,7 +2080,7 @@ async function preview() {
   const provider = collectProvider();
   const err = validateForm(provider);
   if (err) return toast(err, "err");
-  // A non-empty pool takes the pool path: N shards + rotation plugin.
+  // A non-empty pool takes the pool path: one provider block + rotation plugin.
   if (poolKeys().length) return poolPreview(provider);
 
   setStatus("Считаю изменения\u2026", "");
@@ -2119,7 +2125,7 @@ async function apply() {
   const provider = collectProvider();
   const err = validateForm(provider);
   if (err) return toast(err, "err");
-  // A non-empty pool takes the pool path: N shards + rotation plugin.
+  // A non-empty pool takes the pool path: one provider block + rotation plugin.
   if (poolKeys().length) return poolApply(provider);
   if (!provider.useEnvVar && provider.apiKey &&
       !confirm("Ключ будет записан в opencode-конфиг открытым текстом. Продолжить?"))
@@ -3665,6 +3671,7 @@ async function diagnose() {
       <span class="diag-name">${esc(p.key)}</span>
       ${p.isDefault ? `<span class="tag">по умолчанию</span>` : ""}
       <span class="diag-meta">${p.nModels} ${plural(p.nModels, "модель", "модели", "моделей")}</span>
+      ${p.quota && p.quota.window_5h ? `<a href="http://127.0.0.1:8010/dashboard" target="_blank" class="tag" style="background:rgba(56,189,248,0.15);color:#38bdf8;border:1px solid rgba(56,189,248,0.3);text-decoration:none;" title="Лимит 5h: ${p.quota.window_5h.remaining_credits}/${p.quota.window_5h.total_credits} кредитов. Нажмите для открытия дашборда">⚡ ${p.quota.window_5h.remaining_credits} кр. (5h) · ${Math.round(p.quota.weekly.remaining_credits/1000)}k (нед) ↗</a>` : ""}
       ${reachBadge(p)}
     </div>
     <div class="diag-sub muted">${esc(p.conn || "")} · ${esc(p.baseURL || "—")}${typeof p.ms === "number" ? ` · ${p.ms} мс` : ""}</div>`;

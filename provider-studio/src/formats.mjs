@@ -453,7 +453,17 @@ export function buildProviderChanges(provider, opts = {}) {
 
   const envVarName = trimmed(provider.envVarName);
   if (provider.useEnvVar && envVarName) {
-    merge.env = [envVarName];
+    // A key pool lives in ONE provider block: apiKey points at the head
+    // variable, while `env` lists every pool variable (BASE, BASE_2, …) so the
+    // rotation plugin can read them and the env audit does not orphan them.
+    const poolEnvs = (Array.isArray(opts.poolEnvNames) ? opts.poolEnvNames : [])
+      .map((n) => trimmed(n)).filter(Boolean);
+    const priorEnv = Array.isArray(prior?.env) ? prior.env.map((n) => trimmed(n)).filter(Boolean) : [];
+    // An ordinary re-save of a pool head only knows the head variable; shrinking
+    // the list to it would orphan the rest of the pool. Keep the stored list
+    // while the head still belongs to it.
+    const keepPool = !poolEnvs.length && priorEnv.length > 1 && priorEnv.includes(envVarName);
+    merge.env = poolEnvs.length ? poolEnvs : (keepPool ? priorEnv : [envVarName]);
     options.apiKey = `{env:${envVarName}}`;
   } else if (trimmed(provider.apiKey)) {
     options.apiKey = trimmed(provider.apiKey);

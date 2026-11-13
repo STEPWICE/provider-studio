@@ -1,4 +1,4 @@
-// Пул API-ключей: парсинг, ротация, развёртка в шарды и плагин.
+// Пул API-ключей: парсинг, ротация, развёртка в конфиг и плагин.
 // Без сети: живость ключей проверяют ручные пробы через UI (/api/pool-check).
 import { readFileSync, existsSync } from "node:fs";
 import * as K from "./src/keypool.mjs";
@@ -106,22 +106,8 @@ eq("bearer headers use Authorization", K.poolAuthHeaders("key123", "bearer"), { 
   check("azure plugin checks hasAuth for api-key", azurePlugin.source.includes('headers.has("api-key")'));
 }
 
-// ------------------------------------------------------- shards + plugin
+// ------------------------------------------------------------- pool plugin
 {
-  const provider = {
-    name: "Test", baseURL: "https://api.example.com/v1", apiFormat: "openai-chat",
-    models: [{ id: "m1", name: "M1" }],
-  };
-  const shards = K.buildPoolShards(provider, "TEST_API_KEY", ["k1", "k2"]);
-  eq("shard count matches keys", shards.length, 2);
-  eq("first shard keeps env base", shards[0].envVarName, "TEST_API_KEY");
-  eq("second shard gets a suffix", shards[1].envVarName, "TEST_API_KEY_2");
-  eq("first shard keeps the key", shards[0].key, "Test");
-  // Slugification happens later in buildProviderChanges; shards keep the label.
-  eq("second shard is suffixed", shards[1].key, "Test-2");
-  check("shards force env mode", shards.every((s) => s.useEnvVar === true));
-  check("raw keys do not leak into names", !JSON.stringify(shards.map((s) => ({ k: s.key, e: s.envVarName }))).includes("k1"));
-
   const plugin = K.buildKeypoolPlugin({
     providerKey: "test", displayName: "Test",
     baseURL: "https://api.example.com/v1", apiFormat: "openai-chat",

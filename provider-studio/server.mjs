@@ -18,7 +18,7 @@ import { planKiloWrite, planWorkBuddyWrite, writeHarnessPlan, removeKiloProvider
 import { FORMATS, slugify, decodeApiKey, detectApiFormat, isCustomProviderBlock, looksLikePackage, modelEntryToForm, buildProviderChanges } from "./src/formats.mjs";
 import {
   parseKeyPool, maskKey, poolEnvNames, poolEnvBaseFor, validateKeyPool, fetchKeyBalance,
-  buildPoolShards, buildKeypoolPlugin, poolPluginFileName, poolPluginDirName, mergePluginEntry,
+  buildKeypoolPlugin, poolPluginFileName, poolPluginDirName, mergePluginEntry,
   MAX_POOL_KEYS,
 } from "./src/keypool.mjs";
 import { PRESETS } from "./src/presets.mjs";
@@ -269,6 +269,17 @@ function collectReferencedEnv(config) {
       }
       if (Array.isArray(p.envNames)) {
         for (const n of p.envNames) {
+          const clean = String(n || "").trim();
+          if (ENV_NAME_RE.test(clean) && !names.has(clean.toLowerCase())) {
+            names.set(clean.toLowerCase(), clean);
+          }
+        }
+      }
+      // A single-block pool keeps its full key list here even when the config
+      // block was hand-edited down to the head variable — the plugin still
+      // reads every name, so none of them is an orphan.
+      if (Array.isArray(p?.pool?.envNames)) {
+        for (const n of p.pool.envNames) {
           const clean = String(n || "").trim();
           if (ENV_NAME_RE.test(clean) && !names.has(clean.toLowerCase())) {
             names.set(clean.toLowerCase(), clean);
@@ -543,10 +554,13 @@ function readPoolInput(body) {
 
 /**
  * Computes the patched text for a whole key pool without writing anything.
- * The first shard keeps the provider's own key (so an existing
- * `model: slug/...` keeps working); shards 2..N become `slug-2..N`.
- * With withPlugin a fetch-patching opencode plugin is staged next to the
- * config and registered in top-level `plugin`.
+ * The pool is ONE provider block: `options.apiKey` points at the head variable
+ * and `env` lists every pool variable (BASE, BASE_2, …). A fetch-patching
+ * opencode plugin rotates through all of them at runtime — round-robin,
+ * skipping dead (401/402) and cooled (429/quota) keys until every balance is
+ * spent — so no `Провайдер 2/3` copies are needed. Legacy `slug-2..N` shard
+ * blocks on the same endpoint are removed, collapsing an old multi-copy pool
+ * into the single block on re-apply.
  */
 function planPoolChange({ provider, envBase, keys, configPath, setAsDefault = true, defaultModelId = "", previousKey = "", withPlugin = true }) {
   const cfg = readConfig(configPath);
@@ -560,73 +574,101 @@ function planPoolChange({ provider, envBase, keys, configPath, setAsDefault = tr
   }
   const baseText = cfg.missing ? `{\n  "$schema": "${SCHEMA_URL}"\n}\n` : cfg.raw;
   const existingConfig = cfg.config || { $schema: SCHEMA_URL };
-  const shards = buildPoolShards(provider, envBase, keys);
-  if (!shards.length) return { ok: false, error: "Пустой пул — нечего применять", configPath: cfg.path };
+  if (!Array.isArray(keys) || !keys.length) return { ok: false, error: "Пустой пул — нечего применять", configPath: cfg.path };
 
+  const envNames = poolEnvNames(envBase, keys.length);
   const changes = [];
   if (!Object.prototype.hasOwnProperty.call(existingConfig, "$schema")) {
     changes.push({ op: "set", path: ["$schema"], value: SCHEMA_URL });
   }
-  const shardKeys = [];
-  // Shards 2..N are named by suffixing the head key. When the head key is exact
-  // (`my_pool`), the suffix must be exact too: slugifying it would write
-  // `my-pool-2` next to `my_pool` and leave the old shard behind on the next
-  // save. `buildProviderChanges` collapses each shard back onto this exact key.
-  const prevRaw = String(previousKey || "").trim();
-  const providerSlug = slugify(provider?.key || provider?.name || "");
-  const exactBase = prevRaw && providerSlug && slugify(prevRaw) === providerSlug ? prevRaw : "";
-  for (let i = 0; i < shards.length; i++) {
-    const built = buildProviderChanges(shards[i], {
-      existingConfig,
-      previousKey: i === 0 ? previousKey : (exactBase ? `${exactBase}-${i + 1}` : ""),
-      setAsDefault: false,
-      defaultModelId: "",
-    });
-    if (!built.ok) return { ok: false, error: built.error, configPath: cfg.path };
-    shardKeys.push(built.providerKey);
-    changes.push(...built.changes);
+
+  // One head block carries the whole pool. It keeps the provider's own key/name
+  // so an existing `model: slug/...` keeps working; the other keys live only in
+  // env vars the rotation plugin reads.
+  const headForm = {
+    ...provider,
+    useEnvVar: true,
+    envVarName: envBase,
+    apiKey: String(keys[0] || ""),
+  };
+  const built = buildProviderChanges(headForm, {
+    existingConfig,
+    previousKey,
+    setAsDefault: false,
+    defaultModelId: "",
+    poolEnvNames: envNames,
+  });
+  if (!built.ok) return { ok: false, error: built.error, configPath: cfg.path };
+  const headKey = built.providerKey;
+  const shardKeys = [headKey];
+  changes.push(...built.changes);
+
+  // Collapse legacy shard blocks (slug-2..N sharing the head's endpoint) into
+  // the head. The endpoint guard keeps an unrelated `slug-2` provider alive.
+  const normBase = (b) => String(b || "").trim().replace(/\/+$/, "").toLowerCase();
+  const headBase = normBase(headForm.baseURL);
+  const staleShardKeys = [];
+  for (let n = 2; n <= MAX_POOL_KEYS + 1; n++) {
+    const k = `${headKey}-${n}`;
+    const blk = existingConfig.provider?.[k];
+    if (!blk || typeof blk !== "object") continue;
+    if (headBase && normBase(blk.options?.baseURL || blk.baseURL) !== headBase) continue;
+    staleShardKeys.push(k);
   }
-  // One default pointer for the whole pool: the explicitly chosen model when
-  // it belongs to the first shard, otherwise the first shard's first model.
+  for (const k of staleShardKeys) changes.push({ op: "delete", path: ["provider", k] });
+  for (const listField of ["disabled_providers", "enabled_providers"]) {
+    const arr = existingConfig[listField];
+    if (!Array.isArray(arr) || !arr.some((x) => staleShardKeys.includes(x))) continue;
+    const next = arr.filter((x) => !staleShardKeys.includes(x));
+    changes.push(next.length ? { op: "set", path: [listField], value: next } : { op: "delete", path: [listField] });
+  }
+  // A default pointer aimed at a removed shard must follow the head.
+  if (staleShardKeys.length) {
+    for (const field of ["model", "small_model"]) {
+      const cur = String(existingConfig[field] || "");
+      const hit = staleShardKeys.find((k) => cur.startsWith(k + "/"));
+      if (hit) changes.push({ op: "set", path: [field], value: headKey + "/" + cur.slice(hit.length + 1) });
+    }
+  }
+
+  // One default pointer for the whole pool: the explicitly chosen model when it
+  // belongs to the pool, otherwise the first model.
   const firstModels = (Array.isArray(provider.models) ? provider.models : [])
     .map((m) => (typeof m === "string" ? m : m?.id)).map((s) => String(s || "").trim()).filter(Boolean);
   const wanted = String(defaultModelId || "").trim();
   const fallback = firstModels[0] || "";
   const chosenModel = (wanted && firstModels.includes(wanted)) ? wanted : fallback;
   let defaultModel = "";
-  if (setAsDefault && shardKeys[0] && chosenModel) {
-    defaultModel = `${shardKeys[0]}/${chosenModel}`;
+  if (setAsDefault && headKey && chosenModel) {
+    defaultModel = `${headKey}/${chosenModel}`;
     changes.push({ op: "set", path: ["model"], value: defaultModel });
   }
 
   let plugin = null;
   if (withPlugin) {
-    const envNames = poolEnvNames(envBase, keys.length);
-    const built = buildKeypoolPlugin({
-      providerKey: shardKeys[0],
-      displayName: shards[0].displayName,
-      baseURL: shards[0].baseURL,
+    const builtPlugin = buildKeypoolPlugin({
+      providerKey: headKey,
+      displayName: String(provider.displayName || provider.name || headKey),
+      baseURL: headForm.baseURL,
       apiFormat: provider.apiFormat || "openai-chat",
       envNames,
     });
     const dir = path.dirname(cfg.path);
-    const pluginDir = path.resolve(dir, "plugins", built.dirName || poolPluginDirName(shardKeys[0]));
+    const pluginDir = path.resolve(dir, "plugins", builtPlugin.dirName || poolPluginDirName(headKey));
     const merged = mergePluginEntry(cfg.config?.plugin, pluginDir);
     changes.push({ op: "set", path: ["plugin"], value: merged });
     plugin = {
-      dirName: built.dirName || poolPluginDirName(shardKeys[0]),
+      dirName: builtPlugin.dirName || poolPluginDirName(headKey),
       pluginDir,
       path: pluginDir,
       entry: pluginDir,
-      fileName: built.fileName,
-      packageJsonText: built.packageJsonText,
-      indexSource: built.indexSource || built.source,
-      source: built.source,
+      fileName: builtPlugin.fileName,
+      packageJsonText: builtPlugin.packageJsonText,
+      indexSource: builtPlugin.indexSource || builtPlugin.source,
+      source: builtPlugin.source,
       envNames,
     };
   }
-
-  const pluginWarning = "";
 
   const applied = applySchemaChanges(baseText, existingConfig, changes);
   if (!applied.ok) return { ok: false, error: applied.error, configPath: cfg.path };
@@ -637,11 +679,12 @@ function planPoolChange({ provider, envBase, keys, configPath, setAsDefault = tr
     after: applied.text,
     changes: applied.changes,
     shardKeys,
-    shards: shards.map((s, i) => ({ key: shardKeys[i], envVar: i === 0 ? envBase : `${envBase}_${i + 1}` })),
-    envNames: poolEnvNames(envBase, keys.length),
+    shards: [{ key: headKey, envVar: envBase }],
+    removedShards: staleShardKeys,
+    envNames,
     defaultModel,
     plugin,
-    pluginWarning,
+    pluginWarning: "",
     created: !!cfg.missing,
     hash: cfg.missing ? "" : cfg.hash || "",
   };
@@ -1466,7 +1509,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, results, passed, failed: results.length - passed, total: results.length });
     }
 
-    // Preview of a pool write: N provider shards + optional runtime plugin,
+    // Preview of a pool write: one provider block + optional runtime plugin,
     // without touching the disk.
     if (url.pathname === "/api/pool-preview" && req.method === "POST") {
       const body = await readBody(req);
@@ -1487,6 +1530,7 @@ const server = http.createServer(async (req, res) => {
         path: plan.configPath,
         shardKeys: plan.shardKeys,
         shards: plan.shards,
+        removedShards: plan.removedShards,
         envNames: plan.envNames,
         defaultModel: plan.defaultModel,
         created: plan.created,
@@ -1499,8 +1543,8 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // Commits a pool planned above: shards + plugin registration in one write
-    // (single backup, single undo entry), then the plugin file next to it.
+    // Commits a pool planned above: one provider block + plugin registration in
+    // one write (single backup, single undo entry), then the plugin file next to it.
     if (url.pathname === "/api/pool-apply" && req.method === "POST") {
       const body = await readBody(req);
       const { provider, envBase, keys } = readPoolInput(body);
@@ -1555,7 +1599,7 @@ const server = http.createServer(async (req, res) => {
           apiKey: "",
           poolKeys: undefined,
           poolRaw: undefined,
-          pool: { envBase, size: keys.length, shards: plan.shardKeys, pluginFile },
+          pool: { envBase, size: keys.length, shards: plan.shardKeys, envNames: plan.envNames, pluginFile },
         };
         delete record.poolKeys;
         delete record.poolRaw;
@@ -1573,6 +1617,7 @@ const server = http.createServer(async (req, res) => {
         path: committed.configPath,
         shardKeys: plan.shardKeys,
         shards: plan.shards,
+        removedShards: plan.removedShards,
         envNames: plan.envNames,
         missingEnv,
         defaultModel: plan.defaultModel,
@@ -1727,6 +1772,14 @@ const server = http.createServer(async (req, res) => {
               ok: true, reach: "unknown",
               message: "Проба невозможна: у провайдера нет своего Base URL — адрес берётся из npm-пакета",
             };
+        let quota = null;
+        if (base && (base.includes("8010") || key.includes("gemini"))) {
+          try {
+            const quotaUrl = base.replace(/\/v1\/?$/, "") + "/v1/quota";
+            const qResp = await fetch(quotaUrl, { signal: AbortSignal.timeout(1500) });
+            if (qResp.ok) quota = await qResp.json();
+          } catch (_) {}
+        }
         return {
           key,
           baseURL: base,
@@ -1734,6 +1787,7 @@ const server = http.createServer(async (req, res) => {
           isDefault: String(cfg.config?.model || "").startsWith(key + "/"),
           ok: conn.ok,
           conn: conn.message,
+          quota,
           // reach/fault let the UI separate "their server is down" from "your
           // key is wrong" instead of showing one undifferentiated red line.
           reach: conn.reach || null,
@@ -2237,17 +2291,30 @@ function decodeOpenProvider(key, p) {
 function openCodeProviderList(config) {
   const entries = Object.entries(config.provider || {})
     .filter(([, p]) => isCustomProviderBlock(p));
-  // Pool families: head "openrouter" owns shards "openrouter-2", "openrouter-3"…
-  // on the same endpoint (buildPoolShards). Only the head carries `pool`, so
-  // the form can show "сохранено в пуле N" instead of an empty textarea.
+  // A pool is ONE provider block whose `env` lists every key variable
+  // (BASE, BASE_2, …) and whose rotation plugin cycles through them. Legacy
+  // pools unfolded into `slug-2..N` shard blocks on the same endpoint; both
+  // shapes are recognised so the form shows "сохранено в пуле N" either way.
   const keySet = new Map(entries.map(([k, p]) => [k, p]));
   const baseOf = (p) => {
     const b = String(p?.options?.baseURL || p?.baseURL || "").trim().replace(/\/+$/, "").toLowerCase();
     return b || null;
   };
+  const envInfo = (key, envVarName) => {
+    const info = envVarName ? lookupEnv(envVarName) : null;
+    return { key, envVarName, set: !!(info && info.set), length: info ? info.length : 0 };
+  };
   const poolOf = (headKey, headP) => {
     const base = baseOf(headP);
     if (!base) return null;
+    const d = decodeApiKey(headP.options?.apiKey ?? headP.apiKey);
+    const headEnv = d.useEnvVar && d.envVarName ? d.envVarName : "";
+    // Single-block pool: the head's env array carries the whole key list.
+    const envList = Array.isArray(headP.env) ? headP.env.map((x) => String(x || "").trim()).filter(Boolean) : [];
+    if (headEnv && envList.length > 1 && envList.includes(headEnv)) {
+      return { count: envList.length, names: envList.map((envVarName) => envInfo(headKey, envVarName)) };
+    }
+    // Legacy multi-block pool: head + suffix shards sharing the endpoint.
     const members = [{ key: headKey, p: headP }];
     let n = 2;
     for (;;) {
@@ -2260,10 +2327,8 @@ function openCodeProviderList(config) {
     }
     if (members.length < 2) return null;
     const names = members.map(({ key, p }) => {
-      const d = decodeApiKey(p.options?.apiKey ?? p.apiKey);
-      const envVarName = d.useEnvVar && d.envVarName ? d.envVarName : "";
-      const info = envVarName ? lookupEnv(envVarName) : null;
-      return { key, envVarName, set: !!(info && info.set), length: info ? info.length : 0 };
+      const dd = decodeApiKey(p.options?.apiKey ?? p.apiKey);
+      return envInfo(key, dd.useEnvVar && dd.envVarName ? dd.envVarName : "");
     });
     return { count: names.length, names };
   };

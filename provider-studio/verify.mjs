@@ -304,8 +304,22 @@ try {
     keys: ["sk-pool-key-one-12345", "sk-pool-key-two-67890"],
     envBase: "PS_POOL_VICTIM_KEY",
   })).json();
-  check("pool apply succeeds", poolApply.ok === true && (poolApply.shardKeys || []).length === 2,
+  check("pool apply succeeds as a single provider", poolApply.ok === true && (poolApply.shardKeys || []).length === 1,
     JSON.stringify(poolApply).slice(0, 300));
+  check("pool apply lists every key variable", (poolApply.envNames || []).length === 2,
+    JSON.stringify(poolApply.envNames || []));
+  const cfgPoolApplied = readConfigFile();
+  check("the pool is one block, not copies",
+    !!cfgPoolApplied.provider?.["pool-victim"] && cfgPoolApplied.provider?.["pool-victim-2"] === undefined,
+    Object.keys(cfgPoolApplied.provider || {}));
+  check("the single block carries the whole env list",
+    JSON.stringify(cfgPoolApplied.provider?.["pool-victim"]?.env) === JSON.stringify(["PS_POOL_VICTIM_KEY", "PS_POOL_VICTIM_KEY_2"]),
+    JSON.stringify(cfgPoolApplied.provider?.["pool-victim"]?.env));
+  const poolState = await (await get("/api/state")).json();
+  const poolRow = (poolState.opencode?.providers || []).find((p) => p.key === "pool-victim");
+  check("the single-block pool is reported with its key count",
+    !!poolRow && !!poolRow.pool && poolRow.pool.count === 2,
+    JSON.stringify(poolRow && poolRow.pool));
   const poolPlugin = poolApply.pluginFile || "";
   check("pool apply stages the rotation plugin next to the config",
     !!poolPlugin && existsSync(poolPlugin), poolPlugin);
@@ -314,13 +328,13 @@ try {
     !(poolVal.issues || []).some((i) => i.id === "duplicate-baseurl"),
     JSON.stringify((poolVal.issues || []).map((i) => i.id)));
   const poolPrev = await (await post("/api/preview-remove", { key: "pool-victim" })).json();
-  check("pool removal preview names both shards",
-    poolPrev.ok === true && (poolPrev.removedKeys || []).length === 2,
+  check("pool removal preview names the single provider",
+    poolPrev.ok === true && (poolPrev.removedKeys || []).length === 1,
     JSON.stringify(poolPrev.removedKeys || poolPrev));
   check("pool removal preview drops the plugin entry",
     poolPrev.ok === true && !!poolPrev.pluginEntry, JSON.stringify(poolPrev.pluginEntry));
   const poolRm = await (await post("/api/remove-provider", { key: "pool-victim" })).json();
-  check("pool removal succeeds", poolRm.ok === true && (poolRm.removedKeys || []).length === 2,
+  check("pool removal succeeds", poolRm.ok === true && (poolRm.removedKeys || []).length === 1,
     JSON.stringify(poolRm).slice(0, 300));
   check("pool removal deletes the plugin file",
     poolRm.pluginRemoved === true && !existsSync(poolPlugin), `${poolRm.pluginRemoved} ${poolPlugin}`);
@@ -348,21 +362,24 @@ try {
     envBase: "PS_EXACT_POOL_KEY",
     previousKey: "my_pool",
   })).json();
-  check("an exact pool key keeps every shard exact",
+  check("an exact pool key stays one exact block",
     exactPool.ok === true
-      && JSON.stringify(exactPool.shardKeys) === JSON.stringify(["my_pool", "my_pool-2"]),
+      && JSON.stringify(exactPool.shardKeys) === JSON.stringify(["my_pool"]),
     JSON.stringify(exactPool).slice(0, 300));
   const cfgExactPool = readConfigFile();
-  check("both exact shard blocks are in the config",
-    !!cfgExactPool.provider?.my_pool && !!cfgExactPool.provider?.["my_pool-2"],
+  check("the exact pool is a single block",
+    !!cfgExactPool.provider?.my_pool && cfgExactPool.provider?.["my_pool-2"] === undefined,
     JSON.stringify(Object.keys(cfgExactPool.provider || {})));
+  check("the exact block keeps the exact env list",
+    JSON.stringify(cfgExactPool.provider?.my_pool?.env) === JSON.stringify(["PS_EXACT_POOL_KEY", "PS_EXACT_POOL_KEY_2"]),
+    JSON.stringify(cfgExactPool.provider?.my_pool?.env));
   check("no slug twin was created",
     cfgExactPool.provider?.["my-pool-2"] === undefined,
     JSON.stringify(Object.keys(cfgExactPool.provider || {})));
   const exactPoolRm = await (await post("/api/preview-remove", { key: "my_pool" })).json();
-  check("an exact pool key expands to every shard",
+  check("an exact pool key removes the single block",
     exactPoolRm.ok === true
-      && JSON.stringify([...exactPoolRm.removedKeys].sort()) === JSON.stringify(["my_pool", "my_pool-2"]),
+      && JSON.stringify([...exactPoolRm.removedKeys].sort()) === JSON.stringify(["my_pool"]),
     JSON.stringify(exactPoolRm).slice(0, 300));
   const exactPoolGone = await (await post("/api/remove-provider", { key: "my_pool" })).json();
   check("an exact pool key removes every shard",
@@ -370,6 +387,42 @@ try {
       && !readConfigFile().provider?.my_pool
       && !readConfigFile().provider?.["my_pool-2"],
     JSON.stringify(exactPoolGone).slice(0, 300));
+
+  // ---- re-applying a legacy multi-copy pool collapses it into one block ----
+  // Old pools unfolded into slug-2..N copies; a re-apply must remove the copies
+  // and keep a single provider, without touching an unrelated same-stem block.
+  // The blocks are created through /api/apply because the server only honours
+  // known config paths (a foreign temp file would be ignored).
+  const mkLegacy = (key, name, env, base) => post("/api/apply", {
+    provider: {
+      key, name, baseURL: base, apiFormat: "openai-chat",
+      useEnvVar: true, envVarName: env, setAsDefault: false, models: [{ id: "m1" }],
+    },
+    targets: ["opencode"],
+  });
+  await (await mkLegacy("migrate-pool", "Migrate Pool", "PS_MIGRATE_KEY", "https://migrate.example/v1")).json();
+  await (await mkLegacy("migrate-pool-2", "Migrate Pool 2", "PS_MIGRATE_KEY_2", "https://migrate.example/v1")).json();
+  await (await mkLegacy("migrate-pool-3", "Unrelated", "PS_OTHER_KEY", "https://other.example/v1")).json();
+  const migrate = await (await post("/api/pool-preview", {
+    provider: {
+      key: "migrate-pool", name: "Migrate Pool", baseURL: "https://migrate.example/v1",
+      apiFormat: "openai-chat", setAsDefault: false, models: [{ id: "m1" }],
+    },
+    keys: ["sk-migrate-key-one-12345", "sk-migrate-key-two-67890"],
+    envBase: "PS_MIGRATE_KEY", previousKey: "migrate-pool",
+  })).json();
+  check("a legacy pool re-applies as one provider",
+    migrate.ok === true && JSON.stringify(migrate.shardKeys) === JSON.stringify(["migrate-pool"]),
+    JSON.stringify(migrate).slice(0, 300));
+  check("the legacy copy is collapsed",
+    JSON.stringify(migrate.removedShards || []) === JSON.stringify(["migrate-pool-2"]),
+    JSON.stringify(migrate.removedShards || []));
+  check("an unrelated same-stem block is kept",
+    !(migrate.removedShards || []).includes("migrate-pool-3"),
+    JSON.stringify(migrate.removedShards || []));
+  for (const k of ["migrate-pool", "migrate-pool-2", "migrate-pool-3"]) {
+    await (await post("/api/remove-provider", { key: k })).json();
+  }
 
   // ---- non-ASCII bodies must survive the request decode ----
   const uni = await (await post("/api/preview", {
