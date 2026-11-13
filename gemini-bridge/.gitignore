@@ -1,0 +1,13 @@
+# Live Google session cookies — never commit
+.env
+
+# Bridge-owned Chrome profile (contains a signed-in Google session)
+.chrome-profile/
+
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime artifacts
+uploads/
+*.log
