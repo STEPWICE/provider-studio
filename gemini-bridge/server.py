@@ -34,6 +34,7 @@ from contextlib import asynccontextmanager
 
 from antigravity_sync import fetch_antigravity_live_quota
 from browser_session import harvest_cookies, browser_debug_alive
+from gemini_webapi.utils import rotate_1psidts
 
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
@@ -129,6 +130,7 @@ load_env_file()
 PORT = int(os.getenv("PORT", "8010"))
 HOST = os.getenv("HOST", "127.0.0.1")
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "700000"))
+AGENT_THINKING = os.getenv("AGENT_THINKING", "1") == "1"
 
 client_instance: Optional[GeminiClient] = None
 client_lock = asyncio.Lock()
@@ -268,6 +270,23 @@ async def cookie_persistence_loop():
                         after = {m.model_name for m in (client_instance.list_models() or [])}
                         if after != before:
                             print(f"[MODELS] Список моделей аккаунта обновился: {sorted(after)}")
+                if ticks % 20 == 0:
+                    # gemini_webapi only starts its own rotation when the status
+                    # RPC says AVAILABLE. That RPC reports UNAUTHENTICATED on a
+                    # session that still generates, so rotation never starts,
+                    # 1PSIDTS ages out within the hour and the account silently
+                    # drops to guest level: flash-lite only, no tier, no quota.
+                    # Rotate here regardless of what the status endpoint thinks.
+                    try:
+                        fresh = await rotate_1psidts(client_instance._live_client, client_instance.verbose)
+                        if fresh:
+                            os.environ["GEMINI_SECURE_1PSIDTS"] = fresh
+                            update_env_file(psidts=fresh)
+                            print("[ROTATE] 1PSIDTS обновлён и сохранён.")
+                        else:
+                            print("[ROTATE] Google не вернул новый 1PSIDTS — повторим через интервал.")
+                    except Exception as rot_err:
+                        print(f"[ROTATE] Не удалось обновить 1PSIDTS: {rot_err}")
         except Exception as e:
             print(f"[WARN] Цикл обновления сессии: {e}")
 
@@ -346,11 +365,13 @@ def orchestrator_route(messages: List[ChatMessage], tools: Optional[List[Any]], 
     if effort in ("low", "none"):
         return "gemini-4-hydrogen", False
 
-    # Agentic turns stay on the fast model: deliberation here stalls the tool loop.
+    # Agentic turns: thinking makes the model's reasoning visible in the client,
+    # at the cost of latency on every tool round. AGENT_THINKING=0 trades the
+    # visible reasoning for speed.
     if tools or (last_msg and last_msg.role in ("tool", "function")):
-        return "gemini-4-hydrogen", False
+        return "gemini-4-hydrogen", AGENT_THINKING
 
-    return "gemini-4-hydrogen", False
+    return "gemini-4-hydrogen", AGENT_THINKING
 
 def resolve_available_model(client, wanted: str) -> str:
     """Falls back to a model the account actually lists right now.
@@ -819,6 +840,118 @@ def output_limits(text: str, stops: List[str], max_tokens: Optional[int]) -> tup
 
     return limit, reason
 
+def repair_json(raw: str) -> Any:
+    """Parses the JSON models actually emit, not just well-formed JSON.
+
+    A web model writing a tool call by hand produces trailing commas, Python
+    literals, single-quoted keys and occasionally a truncated tail. Rejecting
+    those turns a usable call into a plain-text answer and stalls the agent.
+    Raises ValueError when nothing usable can be recovered.
+    """
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("empty")
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    candidate = re.sub(r",\s*([}\]])", r"\1", text)
+    candidate = re.sub(r"\b(True|False|None)\b",
+                       lambda m: {"True": "true", "False": "false", "None": "null"}[m.group(1)],
+                       candidate)
+    try:
+        return json.loads(candidate)
+    except Exception:
+        pass
+
+    # Single-quoted keys and values, but only when double quotes are absent:
+    # a blanket replace would corrupt apostrophes inside real content.
+    if "'" in candidate and '"' not in candidate:
+        quoted = re.sub(r"'([^'\\]*)'", lambda m: json.dumps(m.group(1)), candidate)
+        try:
+            return json.loads(quoted)
+        except Exception:
+            pass
+
+    # Truncated tail: close what is still open, dropping a dangling fragment.
+    trimmed = candidate.rstrip()
+    trimmed = re.sub(r",\s*$", "", trimmed)
+    # A key whose value never arrived would close into `"path":}`.
+    trimmed = re.sub(r',?\s*"[^"]*"\s*:\s*$', "", trimmed)
+    stack = []
+    in_str = False
+    esc = False
+    for ch in trimmed:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]" and stack:
+            stack.pop()
+    if in_str:
+        trimmed += '"'
+    for opener in reversed(stack):
+        trimmed += "}" if opener == "{" else "]"
+    trimmed = re.sub(r",\s*([}\]])", r"\1", trimmed)
+    try:
+        return json.loads(trimmed)
+    except Exception as e:
+        raise ValueError(str(e))
+
+
+def match_tool_name(name: str, tool_names: set) -> Optional[str]:
+    """Maps a near-miss name onto a tool that was actually offered."""
+    if not name or not tool_names:
+        return None
+    if name in tool_names:
+        return name
+    lowered = {n.lower(): n for n in tool_names}
+    if name.lower() in lowered:
+        return lowered[name.lower()]
+    normalized = name.lower().replace("-", "_").replace(" ", "_")
+    for key, original in lowered.items():
+        if key.replace("-", "_") == normalized:
+            return original
+    import difflib
+    close = difflib.get_close_matches(name.lower(), list(lowered), n=1, cutoff=0.8)
+    return lowered[close[0]] if close else None
+
+
+def tool_call_problems(tool_calls: Optional[list], tools: Optional[list]) -> List[str]:
+    """Required arguments the model left out. A repaired truncation can do this."""
+    specs = {}
+    for t in tools or []:
+        fn = (t.get("function") or t) if isinstance(t, dict) else {}
+        if fn.get("name"):
+            specs[fn["name"]] = fn.get("parameters") or {}
+    problems = []
+    for tc in tool_calls or []:
+        fn = tc.get("function") or {}
+        name = fn.get("name", "")
+        required = (specs.get(name) or {}).get("required") or []
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            args = None
+        if not isinstance(args, dict):
+            problems.append(f"{name}: arguments must be a JSON object")
+            continue
+        missing = [k for k in required if k not in args]
+        if missing:
+            problems.append(f"{name}: missing required argument(s): {', '.join(missing)}")
+    return problems
+
+
 def extract_tool_calls(text: str, tool_names: Optional[set] = None) -> Optional[List[Dict[str, Any]]]:
     """Parses tool calls the model emitted.
 
@@ -833,8 +966,10 @@ def extract_tool_calls(text: str, tool_names: Optional[set] = None) -> Optional[
     seen_calls = set()
 
     def add_call(name: str, args: Any):
-        if not name or name not in tool_names:
+        resolved = match_tool_name(name, tool_names)
+        if not resolved:
             return
+        name = resolved
         args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
         dedup_key = (str(name), args_str)
         if dedup_key in seen_calls:
@@ -851,11 +986,11 @@ def extract_tool_calls(text: str, tool_names: Optional[set] = None) -> Optional[
 
     # 1. Code blocks. An explicit tool_call tag is a call on its own; any other
     #    tag (```json, ```js, bare ```) also needs an arguments-shaped key.
-    cb_pattern = r"```(?:[a-zA-Z0-9_\-]+)?\s*([\{\[][\s\S]*?[\}\]])\s*```"
+    cb_pattern = r"```(?:[a-zA-Z0-9_\-]+)?\s*([\{\[][\s\S]*?)\s*```"
     for m in re.finditer(cb_pattern, text):
         raw = m.group(1).strip()
         try:
-            parsed = json.loads(raw)
+            parsed = repair_json(raw)
             items = parsed if isinstance(parsed, list) else [parsed]
             for item in items:
                 if isinstance(item, dict):
@@ -867,7 +1002,7 @@ def extract_tool_calls(text: str, tool_names: Optional[set] = None) -> Optional[
             # Handle multiple JSON objects concatenated inside a single code block
             for obj_m in re.finditer(r"(\{\s*\"(?:name|function|tool)\"\s*:[\s\S]*?\})(?=\s*\{|\s*$)", raw):
                 try:
-                    obj = json.loads(obj_m.group(1))
+                    obj = repair_json(obj_m.group(1))
                     name = obj.get("name") or obj.get("function") or obj.get("tool")
                     args = obj.get("arguments") or obj.get("parameters") or obj.get("args") or {}
                     if name:
@@ -881,7 +1016,7 @@ def extract_tool_calls(text: str, tool_names: Optional[set] = None) -> Optional[
         inner = m.group(1).strip()
         if inner.startswith("{"):
             try:
-                data = json.loads(inner)
+                data = repair_json(inner)
                 name = data.get("name") or data.get("function") or data.get("tool")
                 args = data.get("arguments") or data.get("parameters") or data.get("args") or {}
                 if name:
@@ -904,7 +1039,7 @@ def extract_tool_calls(text: str, tool_names: Optional[set] = None) -> Optional[
     if not results:
         for bare_m in re.finditer(r"\{\s*\"(?:name|function|tool)\"\s*:\s*\"([^\"]+)\"[\s\S]*?\}", text):
             try:
-                data = json.loads(bare_m.group(0))
+                data = repair_json(bare_m.group(0))
                 name = data.get("name") or data.get("function") or data.get("tool")
                 args = data.get("arguments") or data.get("parameters") or data.get("args") or {}
                 if name:
@@ -1731,7 +1866,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # STREAMING (SSE)
     if req.stream:
         async def event_generator():
-            nonlocal client
+            nonlocal client, prompt
 
             for attempt in range(2):
                 try:
@@ -1839,6 +1974,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
                     # 3. Handle Tool Calls & Text at stream completion
                     tool_calls = extract_tool_calls(collected_full_text, tool_names)
+
+                    problems = tool_call_problems(tool_calls, req.tools) if tool_calls else []
+                    if problems and attempt == 0 and not last_sent_text:
+                        # Only retry while nothing has been shown, otherwise the
+                        # client would receive the prose twice.
+                        print(f"[TOOL_FIX] Битый вызов в стриме, повтор: {problems}")
+                        prompt, _ = parse_openai_messages(
+                            req.messages, req.tools,
+                            tool_directive + " Your last tool call was invalid: " + "; ".join(problems)
+                            + ". Emit the corrected tool_call block with every required argument.")
+                        continue
 
                     if tool_calls:
                         # Emit delta.tool_calls chunk required by @ai-sdk/openai-compatible (ZERO refusal text emitted!)
@@ -1990,6 +2136,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
             # A cut answer may end mid-call, so do not parse calls out of it.
             tool_calls = None if cap_reason else extract_tool_calls(reply_content, tool_names)
+
+            problems = tool_call_problems(tool_calls, req.tools) if tool_calls else []
+            if problems and attempt == 0:
+                print(f"[TOOL_FIX] Битый вызов, просим исправить: {problems}")
+                prompt, _ = parse_openai_messages(
+                    req.messages, req.tools,
+                    tool_directive + " Your last tool call was invalid: " + "; ".join(problems)
+                    + ". Emit the corrected tool_call block with every required argument.")
+                continue
 
             if not tool_calls and not cap_reason and (forced_tool or req.tool_choice == "required"):
                 if attempt == 0:
