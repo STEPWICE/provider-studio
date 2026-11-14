@@ -191,10 +191,15 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
                 print(f"[INFO] Авторизация GeminiClient в сессии Google (попытка {attempt+1}/3)...")
                 new_client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts)
                 await new_client.init(timeout=300, watchdog_timeout=120, auto_refresh=True, refresh_interval=600)
-                if hasattr(new_client, "account_status"):
+                if getattr(new_client, "account_status", None) is not None:
                     from gemini_webapi.constants import AccountStatus
                     if new_client.account_status != AccountStatus.AVAILABLE:
-                        raise AuthError("сессия Google недействительна. Запустите login.cmd и войдите в аккаунт в окне Chrome моста.")
+                        # The status RPC (GPRiHf) answers UNAUTHENTICATED on cookies
+                        # that still generate perfectly well. Treating it as fatal
+                        # made the bridge refuse a working session, so it is a
+                        # warning only: a genuinely dead session fails on generate.
+                        print(f"[WARN] Статус аккаунта: {new_client.account_status.name}. "
+                              "Это не приговор — проверяем генерацией.")
                 print("[SUCCESS] GeminiClient успешно авторизован в gemini.google.com!")
                 client_instance = new_client
                 return client_instance
@@ -294,6 +299,7 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
+    stop: Optional[Union[str, List[str]]] = None
     tools: Optional[List[Any]] = None
     tool_choice: Optional[Any] = None
     reasoning_effort: Optional[str] = None
@@ -321,6 +327,26 @@ def orchestrator_route(messages: List[ChatMessage], tools: Optional[List[Any]], 
         return "gemini-4-hydrogen", False
 
     return "gemini-4-hydrogen", False
+
+def resolve_available_model(client, wanted: str) -> str:
+    """Falls back to a model the account actually lists right now.
+
+    Google sometimes returns a partial registry (only flash-lite) while the
+    session still generates. Hard-failing on "Unknown model name" turned that
+    into an outage, so pick the closest available model instead and say so.
+    """
+    try:
+        available = [m.model_name for m in (client.list_models() or [])]
+    except Exception:
+        return wanted
+    if not available or wanted in available:
+        return wanted
+    for cand in ("gemini-4-hydrogen", "gemini-pro", "gemini-carbon", "gemini-flash-lite"):
+        if cand in available:
+            print(f"[FALLBACK] Модели {wanted} нет в списке аккаунта {available}. Берём {cand}.")
+            return cand
+    print(f"[FALLBACK] Модели {wanted} нет в списке аккаунта {available}. Берём {available[0]}.")
+    return available[0]
 
 def detect_file_extension(raw_bytes: bytes, mime_type: str = "", filename: str = "") -> str:
     """Inspects filename, magic bytes, and MIME type to ensure exact file extensions for Google Vision/Files/Video/Audio."""
@@ -446,7 +472,8 @@ def save_upload_bytes_to_disk(raw_bytes: bytes, mime_type: str = "", original_fi
     file_path.write_bytes(raw_bytes)
     return file_path
 
-def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]] = None):
+def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]] = None,
+                          tool_directive: str = ""):
     """
     Parses OpenAI chat history, tool specs, assistant invocations, and extracts
     base64/local image, video, audio and document files into concrete Path objects.
@@ -540,6 +567,8 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
         if len(examples) > 1:
             tools_instruction += "\n" + "\n".join(examples)
         system_prompts.append(tools_instruction)
+    if tool_directive:
+        system_prompts.append(tool_directive)
 
     processed_messages = messages
 
@@ -727,6 +756,45 @@ def estimate_tokens(text: str) -> int:
     """
     return len(text or "") // 4
 
+def normalize_stops(stop: Optional[Union[str, List[str]]]) -> List[str]:
+    if not stop:
+        return []
+    items = [stop] if isinstance(stop, str) else list(stop)
+    return [s for s in items if isinstance(s, str) and s][:4]
+
+def output_limits(text: str, stops: List[str], max_tokens: Optional[int]) -> tuple[int, Optional[str]]:
+    """Enforces stop and max_tokens here, because Gemini Web accepts neither.
+
+    Returns how much of the cumulative text may be emitted and whether generation
+    should end. While no stop has matched, a tail of len(stop)-1 is held back so a
+    sequence split across chunks is still caught — that also keeps the emitted
+    prefix from ever having to shrink.
+    """
+    limit = len(text)
+    reason = None
+
+    if max_tokens is not None and max_tokens > 0:
+        budget = max_tokens * 4
+        if limit > budget:
+            limit = budget
+            reason = "length"
+
+    if stops:
+        earliest = None
+        for s in stops:
+            i = text.find(s)
+            if i != -1 and (earliest is None or i < earliest):
+                earliest = i
+        if earliest is not None:
+            limit = min(limit, earliest)
+            reason = reason or "stop"
+        else:
+            guard = max(len(s) for s in stops) - 1
+            if guard > 0:
+                limit = min(limit, max(0, len(text) - guard))
+
+    return limit, reason
+
 def extract_tool_calls(text: str, tool_names: Optional[set] = None) -> Optional[List[Dict[str, Any]]]:
     """Parses tool calls the model emitted.
 
@@ -837,6 +905,57 @@ def strip_tool_call_blocks(text: str, tool_names: Optional[set] = None) -> str:
     cleaned = re.sub(r"<tool_call>[\s\S]*?</tool_call>", "", cleaned)
     return cleaned.strip()
 
+TOOL_FENCE_TAGS = ("tool_call", "tool_calls", "tools")
+XML_OPEN = "<tool_call>"
+FENCE_BLOCK_RE = re.compile(r"```(?:[a-zA-Z0-9_\-]+)?\s*[\{\[][\s\S]*?[\}\]]\s*```")
+
+
+def safe_stream_prefix(text: str, tool_names: Optional[set]) -> int:
+    """Length of the prefix that is safe to show before a tool call resolves.
+
+    Agent turns used to buffer everything so a half-written call could not leak
+    into the UI, which cost all streaming. Only the call itself needs holding:
+    prose and ordinary code blocks go out immediately.
+    """
+    if not tool_names:
+        return len(text)
+
+    limit = len(text)
+
+    x = text.find(XML_OPEN)
+    if x != -1:
+        limit = min(limit, x)
+
+    for m in FENCE_BLOCK_RE.finditer(text):
+        if extract_tool_calls(m.group(0), tool_names):
+            limit = min(limit, m.start())
+
+    # An odd number of fence markers means the last block is still open. Hold it
+    # until its tag line and first body character are known: while "```t" is
+    # still arriving it may yet become "```tool_call", and a prefix that shrinks
+    # would mean un-sending text the client already has.
+    parts = text.split("```")
+    if len(parts) % 2 == 0:
+        inside = parts[-1]
+        tag_m = re.match(r"[a-zA-Z0-9_\-]*", inside)
+        tag = tag_m.group(0).lower()
+        rest = inside[tag_m.end():]
+        body = rest.lstrip()
+        if ("\n" not in rest or tag in TOOL_FENCE_TAGS
+                or not body or body.startswith(("{", "["))):
+            limit = min(limit, text.rfind("```"))
+
+    # Never emit the first characters of a marker that is still arriving.
+    m = re.search(r"`{1,2}$", text)
+    if m:
+        limit = min(limit, m.start())
+    for k in range(len(XML_OPEN) - 1, 0, -1):
+        if text.endswith(XML_OPEN[:k]):
+            limit = min(limit, len(text) - k)
+            break
+
+    return max(0, limit)
+
 @app.get("/")
 @app.get("/health")
 async def health_check():
@@ -899,14 +1018,24 @@ async def auth_refresh():
         return {"ok": False, "browser_alive": browser_alive, "session_updated": updated,
                 "detail": str(e.detail)}
     from gemini_webapi.constants import AccountStatus
-    if getattr(client, "account_status", None) != AccountStatus.AVAILABLE:
-        return {
-            "ok": False,
-            "browser_alive": browser_alive,
-            "session_updated": updated,
-            "detail": "Сессия Google недействительна. Запустите login.cmd и войдите в аккаунт в окне Chrome моста.",
-        }
-    return {"ok": True, "browser_alive": browser_alive, "session_updated": updated}
+    account_status = getattr(client, "account_status", None)
+    status_name = getattr(account_status, "name", "UNKNOWN")
+    if account_status != AccountStatus.AVAILABLE:
+        # Status alone cannot decide this: it reports UNAUTHENTICATED on cookies
+        # that still generate. Probe once, and only in this ambiguous case, so
+        # login.cmd polling does not spend quota on every tick.
+        try:
+            await client.generate_content("ping", model="gemini-flash-lite")
+        except Exception:
+            return {
+                "ok": False,
+                "browser_alive": browser_alive,
+                "session_updated": updated,
+                "account_status": status_name,
+                "detail": "Сессия Google недействительна. Запустите login.cmd и войдите в аккаунт в окне Chrome моста.",
+            }
+    return {"ok": True, "browser_alive": browser_alive, "session_updated": updated,
+            "account_status": status_name}
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -1416,15 +1545,29 @@ def is_google_glitch_text(text: str) -> bool:
     return any(p in t for p in patterns)
 
 @app.post("/v1/chat/completions")
-@app.post("/v1/responses")
 @app.post("/chat/completions")
-async def chat_completions(req: ChatCompletionRequest):
+async def chat_completions(req: ChatCompletionRequest, request: Request):
     cleanup_old_upload_cache()
     if req.tool_choice == "none":
         req.tools = None
+    forced_tool = None
+    tool_directive = ""
+    if isinstance(req.tool_choice, dict):
+        forced_tool = (req.tool_choice.get("function") or {}).get("name")
+        if forced_tool:
+            # Showing only the chosen tool is the strongest lever available:
+            # the model cannot name a tool it was never offered.
+            req.tools = [t for t in (req.tools or [])
+                         if isinstance(t, dict) and (t.get("function") or {}).get("name") == forced_tool]
+            tool_directive = (f"You must call the tool `{forced_tool}` in this turn. "
+                              "Reply with a tool_call block and nothing else.")
+    elif req.tool_choice == "required":
+        tool_directive = ("You must call one of the available tools in this turn. "
+                          "Reply with a tool_call block and nothing else.")
     tool_names = collect_tool_names(req.tools)
+    stops = normalize_stops(req.stop)
     client = await get_gemini_client()
-    prompt, files_to_upload = parse_openai_messages(req.messages, req.tools)
+    prompt, files_to_upload = parse_openai_messages(req.messages, req.tools, tool_directive)
 
     if not prompt and not files_to_upload:
         raise HTTPException(status_code=400, detail="Messages and files cannot be empty")
@@ -1498,6 +1641,7 @@ async def chat_completions(req: ChatCompletionRequest):
         extended_thinking = False if explicit_think_override is None else explicit_think_override
 
     print(f"[ROUTE] {req.model} -> {gemini_model_param}, thinking={extended_thinking}")
+    gemini_model_param = resolve_available_model(client, gemini_model_param)
 
     # Upload files / images / videos / audios with retry
     file_data = None
@@ -1539,10 +1683,6 @@ async def chat_completions(req: ChatCompletionRequest):
     if req.stream:
         async def event_generator():
             nonlocal client
-            tool_markers = [
-                "```tool_call", "```tool_calls", "```tools", "<tool_call>",
-                "```json\n{", "```json\r\n{", "```\n{", "```\r\n{"
-            ]
 
             for attempt in range(2):
                 try:
@@ -1551,8 +1691,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     last_sent_text = ""
                     last_sent_thought = ""
                     collected_full_text = ""
-                    tool_detected = False
-                    refusal_matched = False
+                    finish_override = None
 
                     chunk_count = 0
                     async for chunk in client._generate(
@@ -1564,6 +1703,9 @@ async def chat_completions(req: ChatCompletionRequest):
                         session_state=session_state,
                     ):
                         chunk_count += 1
+                        if await request.is_disconnected():
+                            print("[STREAM] Клиент отключился — прерываем генерацию Google.")
+                            return
                         if chunk_count % 5 == 1:
                             print(f"[STREAM] Chunk #{chunk_count} принят от Google (len={len(getattr(chunk, 'text', '') or '')})")
                         # 1. Reasoning (thoughts) delta
@@ -1595,30 +1737,43 @@ async def chat_completions(req: ChatCompletionRequest):
                             current_text = chunk.text
                             collected_full_text = current_text
 
-                            if not req.tools:
-                                # Conversational turn: Stream immediately in real time
-                                if len(current_text) > len(last_sent_text):
-                                    delta_text = current_text[len(last_sent_text):]
-                                    last_sent_text = current_text
-                                    event_data = {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created_time,
-                                        "model": req.model,
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "delta": {
-                                                    "content": delta_text,
-                                                },
-                                                "finish_reason": None,
-                                            }
-                                        ],
-                                    }
-                                    yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
-                            else:
-                                # Agent turn with tools: Buffer text during generation to ensure no partial refusal leaks into UI
-                                pass
+                            safe = safe_stream_prefix(current_text, tool_names)
+                            cap, cap_reason = output_limits(current_text, stops, req.max_tokens)
+                            safe = min(safe, cap)
+                            if safe > len(last_sent_text):
+                                delta_text = current_text[len(last_sent_text):safe]
+                                last_sent_text = current_text[:safe]
+                                event_data = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_time,
+                                    "model": req.model,
+                                    "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+                            if cap_reason:
+                                # stop / max_tokens reached: end upstream generation too,
+                                # so the rest of the answer is not paid for.
+                                finish_override = cap_reason
+                                collected_full_text = current_text[:safe]
+                                break
+
+                    if finish_override:
+                        final_event = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": req.model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_override}],
+                            "usage": {
+                                "prompt_tokens": estimate_tokens(prompt),
+                                "completion_tokens": estimate_tokens(collected_full_text),
+                                "total_tokens": estimate_tokens(prompt) + estimate_tokens(collected_full_text),
+                            },
+                        }
+                        yield f"data: {json.dumps(final_event)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
 
                     # Automatic recovery if Google returned a transient web glitch text
                     if is_google_glitch_text(collected_full_text):
@@ -1667,19 +1822,22 @@ async def chat_completions(req: ChatCompletionRequest):
                         yield f"data: {json.dumps(tool_delta_event, ensure_ascii=False)}\n\n"
                         finish_reason = "tool_calls"
                     else:
+                        if forced_tool or req.tool_choice == "required":
+                            err = {"error": {"message": "Модель не сделала обязательный вызов инструмента (tool_choice). "
+                                                        "Веб-сессия Gemini не умеет принуждать к вызову — повторите запрос.",
+                                             "type": "gemini_tool_choice_error"}}
+                            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
                         # Pure text assistant response (or clean final answer)
                         clean_text = strip_tool_call_blocks(collected_full_text, tool_names)
 
-                        if req.tools:
-                            # In tool mode, emit the clean finalized content chunk
-                            if clean_text:
-                                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': clean_text}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-                        else:
-                            # In chat mode, emit any remaining text
-                            if len(last_sent_text) < len(clean_text):
-                                rem_text = clean_text[len(last_sent_text):]
-                                if rem_text:
-                                    yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': rem_text}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                        # Both modes stream incrementally now, so only the tail is
+                        # left. The prefix check keeps a stripped block from making
+                        # us resend text the client already has.
+                        if clean_text.startswith(last_sent_text) and len(clean_text) > len(last_sent_text):
+                            rem_text = clean_text[len(last_sent_text):]
+                            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': rem_text}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
                         finish_reason = "stop"
 
                     print(f"[STREAM] Завершено. Чанков: {chunk_count}, tool_calls: {len(tool_calls) if tool_calls else 0}, finish_reason: {finish_reason}")
@@ -1740,20 +1898,38 @@ async def chat_completions(req: ChatCompletionRequest):
     for attempt in range(2):
         try:
             session_state = {"last_texts": {}, "last_thoughts": {}}
-            last_chunk = None
 
-            async for chunk in client._generate(
-                prompt=prompt or "Please analyze the attached inputs.",
-                req_file_data=file_data,
-                model=gemini_model_param,
-                temporary=True,
-                extended_thinking=extended_thinking,
-                session_state=session_state,
-            ):
-                last_chunk = chunk
+            async def collect_reply():
+                last = None
+                async for ch in client._generate(
+                    prompt=prompt or "Please analyze the attached inputs.",
+                    req_file_data=file_data,
+                    model=gemini_model_param,
+                    temporary=True,
+                    extended_thinking=extended_thinking,
+                    session_state=session_state,
+                ):
+                    last = ch
+                    text_so_far = getattr(ch, "text", "") or ""
+                    _, why = output_limits(text_so_far, stops, req.max_tokens)
+                    if why:
+                        break
+                return last
+
+            gen_task = asyncio.create_task(collect_reply())
+            while not gen_task.done():
+                if await request.is_disconnected():
+                    gen_task.cancel()
+                    print("[REQUEST] Клиент отключился — генерация Google отменена.")
+                    return
+                await asyncio.sleep(0.4)
+            last_chunk = gen_task.result()
 
             reply_content = getattr(last_chunk, "text", "") or ""
             reply_thoughts = getattr(last_chunk, "thoughts", None)
+
+            cap, cap_reason = output_limits(reply_content, stops, req.max_tokens)
+            reply_content = reply_content[:cap]
 
             if is_google_glitch_text(reply_content):
                 if attempt == 0:
@@ -1763,9 +1939,24 @@ async def chat_completions(req: ChatCompletionRequest):
                 else:
                     raise RuntimeError("Gemini Web вернул страницу ошибки вместо ответа. Повторите запрос.")
 
-            tool_calls = extract_tool_calls(reply_content, tool_names)
+            # A cut answer may end mid-call, so do not parse calls out of it.
+            tool_calls = None if cap_reason else extract_tool_calls(reply_content, tool_names)
 
-            finish_reason = "tool_calls" if tool_calls else "stop"
+            if not tool_calls and not cap_reason and (forced_tool or req.tool_choice == "required"):
+                if attempt == 0:
+                    print("[TOOL_CHOICE] Обязательный вызов не состоялся — повтор с усиленной директивой.")
+                    prompt, _ = parse_openai_messages(
+                        req.messages, req.tools,
+                        tool_directive + " Your previous reply was plain text, which is not allowed here. "
+                                         "Output only a tool_call block now.")
+                    continue
+                raise HTTPException(
+                    status_code=502,
+                    detail="Модель не сделала обязательный вызов инструмента (tool_choice). "
+                           "Веб-сессия Gemini не умеет принуждать к вызову — повторите запрос.",
+                )
+
+            finish_reason = cap_reason or ("tool_calls" if tool_calls else "stop")
             clean_content = strip_tool_call_blocks(reply_content, tool_names) if tool_calls else reply_content
 
             msg_body: Dict[str, Any] = {
@@ -1795,6 +1986,8 @@ async def chat_completions(req: ChatCompletionRequest):
                     "total_tokens": estimate_tokens(prompt) + estimate_tokens(reply_content),
                 },
             }
+        except HTTPException:
+            raise
         except Exception as e:
             if attempt == 0 and is_auth_or_session_error(e):
                 print(f"[WARN] Сбой сессии ({e}). Выполняем авто-восстановление сессии...")
@@ -1807,6 +2000,177 @@ async def chat_completions(req: ChatCompletionRequest):
             if "auth" in err_msg.lower() or "token" in err_msg.lower() or "401" in err_msg or "cookie" in err_msg.lower():
                 err_msg = "Сессия Google недействительна. Запустите login.cmd и войдите в аккаунт в окне Chrome моста."
             raise HTTPException(status_code=500, detail=f"Ошибка генерации ответа Gemini: {err_msg}")
+
+class ResponsesRequest(BaseModel):
+    model: str
+    input: Union[str, List[Any]] = []
+    instructions: Optional[str] = None
+    tools: Optional[List[Any]] = None
+    tool_choice: Optional[Any] = None
+    stream: Optional[bool] = False
+    max_output_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    stop: Optional[Union[str, List[str]]] = None
+
+
+def responses_to_chat(req: "ResponsesRequest") -> ChatCompletionRequest:
+    """Translates the Responses API shape into the internal chat shape."""
+    messages: List[ChatMessage] = []
+    if req.instructions:
+        messages.append(ChatMessage(role="system", content=req.instructions))
+
+    items = [{"role": "user", "content": req.input}] if isinstance(req.input, str) else list(req.input)
+    for item in items:
+        if not isinstance(item, dict):
+            messages.append(ChatMessage(role="user", content=str(item)))
+            continue
+        kind = item.get("type")
+        if kind == "function_call":
+            messages.append(ChatMessage(role="assistant", content=None, tool_calls=[{
+                "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {"name": item.get("name", ""), "arguments": item.get("arguments", "{}")},
+            }]))
+        elif kind == "function_call_output":
+            messages.append(ChatMessage(role="tool", tool_call_id=item.get("call_id", ""),
+                                        content=str(item.get("output", ""))))
+        else:
+            role = item.get("role", "user")
+            if role == "developer":
+                role = "system"
+            content = item.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for c in content:
+                    if isinstance(c, dict):
+                        parts.append(c.get("text") or c.get("content") or "")
+                    else:
+                        parts.append(str(c))
+                content = "\n".join(p for p in parts if p)
+            messages.append(ChatMessage(role=role, content=content))
+
+    tools = None
+    if req.tools:
+        tools = []
+        for t in req.tools:
+            if not isinstance(t, dict):
+                continue
+            if t.get("type") == "function" and "function" not in t:
+                tools.append({"type": "function", "function": {
+                    "name": t.get("name", ""), "description": t.get("description", ""),
+                    "parameters": t.get("parameters", {"type": "object", "properties": {}})}})
+            else:
+                tools.append(t)
+
+    return ChatCompletionRequest(
+        model=req.model, messages=messages, stream=bool(req.stream), tools=tools,
+        tool_choice=req.tool_choice, max_tokens=req.max_output_tokens,
+        temperature=req.temperature, stop=req.stop,
+    )
+
+
+def chat_result_to_response(result: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Builds a Responses API object from a chat completion."""
+    choice = (result.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    output: List[Dict[str, Any]] = []
+    if msg.get("content"):
+        output.append({
+            "type": "message", "id": f"msg_{uuid.uuid4().hex[:12]}", "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": msg["content"], "annotations": []}],
+        })
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        output.append({
+            "type": "function_call", "id": f"fc_{uuid.uuid4().hex[:12]}",
+            "call_id": tc.get("id", ""), "name": fn.get("name", ""),
+            "arguments": fn.get("arguments", "{}"), "status": "completed",
+        })
+    usage = result.get("usage") or {}
+    return {
+        "id": f"resp_{uuid.uuid4().hex[:16]}", "object": "response",
+        "created_at": result.get("created", int(time.time())), "status": "completed",
+        "model": model, "output": output, "error": None,
+        "usage": {"input_tokens": usage.get("prompt_tokens", 0),
+                  "output_tokens": usage.get("completion_tokens", 0),
+                  "total_tokens": usage.get("total_tokens", 0)},
+    }
+
+
+@app.post("/v1/responses")
+async def responses_endpoint(req: ResponsesRequest, request: Request):
+    chat_req = responses_to_chat(req)
+    result = await chat_completions(chat_req, request)
+
+    if not req.stream:
+        return chat_result_to_response(result, req.model)
+
+    async def as_responses_events():
+        resp_id = f"resp_{uuid.uuid4().hex[:16]}"
+        created = int(time.time())
+        text_parts: List[str] = []
+        calls: List[Dict[str, Any]] = []
+        usage: Dict[str, Any] = {}
+        seq = 0
+
+        def emit(kind: str, payload: Dict[str, Any]) -> str:
+            nonlocal seq
+            seq += 1
+            body = {"type": kind, "sequence_number": seq, **payload}
+            return f"event: {kind}\ndata: {json.dumps(body, ensure_ascii=False)}\n\n"
+
+        base = {"id": resp_id, "object": "response", "created_at": created,
+                "status": "in_progress", "model": req.model, "output": [], "error": None}
+        yield emit("response.created", {"response": base})
+
+        async for raw in result.body_iterator:
+            line = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            line = line.strip()
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload == "[DONE]":
+                break
+            try:
+                d = json.loads(payload)
+            except Exception:
+                continue
+            if d.get("error"):
+                yield emit("response.failed", {"response": {**base, "status": "failed", "error": d["error"]}})
+                return
+            if d.get("usage"):
+                usage = d["usage"]
+            for ch in d.get("choices", []):
+                delta = ch.get("delta") or {}
+                if delta.get("content"):
+                    text_parts.append(delta["content"])
+                    yield emit("response.output_text.delta",
+                               {"item_id": "msg_0", "output_index": 0, "content_index": 0,
+                                "delta": delta["content"]})
+                for tc in delta.get("tool_calls") or []:
+                    calls.append(tc)
+
+        output: List[Dict[str, Any]] = []
+        full_text = "".join(text_parts)
+        if full_text:
+            yield emit("response.output_text.done",
+                       {"item_id": "msg_0", "output_index": 0, "content_index": 0, "text": full_text})
+            output.append({"type": "message", "id": "msg_0", "role": "assistant", "status": "completed",
+                           "content": [{"type": "output_text", "text": full_text, "annotations": []}]})
+        for tc in calls:
+            fn = tc.get("function") or {}
+            output.append({"type": "function_call", "id": f"fc_{uuid.uuid4().hex[:12]}",
+                           "call_id": tc.get("id", ""), "name": fn.get("name", ""),
+                           "arguments": fn.get("arguments", "{}"), "status": "completed"})
+        final = {**base, "status": "completed", "output": output,
+                 "usage": {"input_tokens": usage.get("prompt_tokens", 0),
+                           "output_tokens": usage.get("completion_tokens", 0),
+                           "total_tokens": usage.get("total_tokens", 0)}}
+        yield emit("response.completed", {"response": final})
+
+    return StreamingResponse(as_responses_events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 if __name__ == "__main__":
     import uvicorn
