@@ -3,6 +3,8 @@
 
 # Cached Code Assist OAuth access token
 .codeassist-token.json
+.codeassist-oauth.json
+.codeassist-client.json
 
 # Bridge-owned Chrome profile (contains a signed-in Google session)
 .chrome-profile/

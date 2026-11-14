@@ -215,3 +215,26 @@ HOST=127.0.0.1
 
 Вывод: без выданного проекта Code Assist нативного function calling не получить. Это ограничение
 энтайтлмента аккаунта, а не моста.
+
+### Нативный путь проверен до конца и закрыт лицензией
+
+Продолжение проверки с реальным GCP-проектом `gemini-code-assist-514702`, созданным в консоли:
+
+| Клиент | Проект | Результат |
+|---|---|---|
+| Antigravity (`1071006060591-…`) | нет | `loadCodeAssist` без проекта, генерация 404 |
+| Antigravity | имя без проекта | 403 `cloudaicompanion.licenses.selfAssign denied` |
+| Antigravity | существующий | `onboardUser` 403 «no valid license», генерация 404 |
+| Gemini CLI (`681255809395-…`) | существующий | 403 «no valid license» на обоих хостах |
+
+`free-tier` («Gemini Code Assist for individuals») помечен `UNSUPPORTED_CLIENT` **у обоих клиентов**:
+«This client is no longer supported for Gemini Code Assist for individuals… migrate to the Antigravity
+suite». Разрешён только `standard-tier`, а он требует платной лицензии.
+
+Google закрыл Code Assist для частных пользователей: дело не в клиенте, не в проекте и не в коде.
+`codeassist.py` и `codeassist_login.py` оставлены рабочими и пройдут весь путь, если лицензия появится.
+Проверка — `python codeassist_check.py <project-id>`.
+
+**Нативные инструменты без лицензии** даёт ключ Gemini API из AI Studio
+(`https://aistudio.google.com/apikey`, пресет `google-ai-studio`): настоящий function calling и свой
+бесплатный лимит. Это отдельная квота, не кредиты Google AI Pro.
