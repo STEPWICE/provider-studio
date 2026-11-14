@@ -19,6 +19,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "    Write-Host ('Port 8010 is owned by another process ' + $proc.Name + ' (PID ' + $p + ') - leaving it alone.')" ^
   "  }" ^
   "};" ^
-  "if ($killed -eq 0) { Write-Host 'Bridge is not running.' }"
+  "if ($killed -eq 0) { Write-Host 'Bridge is not running.' }" ^
+  "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object { $_.CommandLine -like '*gemini-bridge*start.cmd*' } | ForEach-Object { Write-Host ('Removing stale launcher PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
 
 endlocal

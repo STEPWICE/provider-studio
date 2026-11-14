@@ -28,9 +28,56 @@ import tempfile
 import asyncio
 import ctypes
 import ctypes.wintypes
+import threading
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
 from contextlib import asynccontextmanager
+
+# --------------------------------------------------------------- logging
+# start-hidden.vbs runs the bridge without a console, so every print() used to
+# vanish: a failing 1PSIDTS rotation, a silent fallback to flash-lite or a
+# traceback from a broken stream left no trace at all. Everything the process
+# prints is mirrored into logs/bridge.log (rotated at 2 MB), which is the only
+# way to diagnose a failure that already happened.
+LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH = LOG_DIR / "bridge.log"
+LOG_MAX_BYTES = 2 * 1024 * 1024
+
+_real_print = print
+_log_lock = threading.Lock()
+
+
+def _rotate_log():
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_MAX_BYTES:
+            backup = LOG_DIR / "bridge.log.1"
+            if backup.exists():
+                backup.unlink()
+            LOG_PATH.rename(backup)
+    except Exception:
+        pass
+
+
+def log(*args, **kwargs):
+    text = " ".join(str(a) for a in args)
+    try:
+        with _log_lock:
+            _rotate_log()
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+    except Exception:
+        pass
+    if kwargs.get("file") is None:
+        try:
+            _real_print(*args, **kwargs)
+        except Exception:
+            pass
+
+
+# Rebind in this module only. Library prints are not routed here on purpose,
+# but uvicorn's own logger is attached to the same file in __main__ below.
+print = log
 
 from antigravity_sync import fetch_antigravity_live_quota
 from browser_session import harvest_cookies, browser_debug_alive
@@ -140,6 +187,27 @@ GEMINI_PROXY = (os.getenv("GEMINI_PROXY") or os.getenv("HTTPS_PROXY")
 client_instance: Optional[GeminiClient] = None
 client_lock = asyncio.Lock()
 
+# Everything that silently went wrong before is recorded here and exposed by
+# /health, so "it degraded to flash-lite" has a timestamp instead of a guess.
+bridge_state: Dict[str, Any] = {
+    "started_at": time.time(),
+    "last_rotation_at": None,
+    "last_rotation_ok": None,
+    "last_rotation_error": None,
+    "last_models_refresh_at": None,
+    "last_auth_refresh_at": None,
+    "last_auth_error": None,
+    "last_quota_at": None,
+    "last_quota_source": None,
+}
+
+# Requests currently generating on the shared client. A forced re-auth closes
+# the client, which kills every stream using it, so it must wait for them.
+bridge_state["inflight"] = 0
+
+# Last "does this session really generate?" probe, shared by login.cmd polling.
+_auth_probe: Dict[str, Any] = {"at": 0.0, "ok": None, "error": None}
+
 async def refresh_cookies_from_browser() -> bool:
     """Pulls the Google session cookies from the bridge-owned Chrome and stores them.
 
@@ -157,6 +225,19 @@ async def refresh_cookies_from_browser() -> bool:
     print("[CDP] Получена свежая сессия Google из браузера моста.")
     await asyncio.to_thread(update_env_file, psid, psidts)
     return True
+
+async def _retire_client(old_client) -> None:
+    """Closes a replaced client only after in-flight generations finished."""
+    for _ in range(60):
+        if bridge_state["inflight"] <= 0:
+            break
+        await asyncio.sleep(5)
+    try:
+        await old_client.close()
+        print("[INFO] Старый GeminiClient закрыт после завершения активных запросов.")
+    except Exception:
+        pass
+
 
 async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
     global client_instance
@@ -186,11 +267,17 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
             )
 
         if client_instance is not None:
-            try:
-                await client_instance.close()
-            except Exception:
-                pass
+            old_client = client_instance
             client_instance = None
+            if bridge_state["inflight"] > 0:
+                # Other streams are still reading from this client. Closing it
+                # now kills them mid-answer, so retire it once they finish.
+                asyncio.create_task(_retire_client(old_client))
+            else:
+                try:
+                    await old_client.close()
+                except Exception:
+                    pass
 
         # Attempt initialization with retry
         for attempt in range(3):
@@ -207,10 +294,18 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
                         # warning only: a genuinely dead session fails on generate.
                         print(f"[WARN] Статус аккаунта: {new_client.account_status.name}. "
                               "Это не приговор — проверяем генерацией.")
-                print("[SUCCESS] GeminiClient успешно авторизован в gemini.google.com!")
+                models = [m.model_name for m in (new_client.list_models() or [])]
+                bridge_state["last_auth_refresh_at"] = time.time()
+                bridge_state["last_auth_error"] = None
+                print(f"[SUCCESS] GeminiClient успешно авторизован в gemini.google.com! "
+                      f"Модели аккаунта: {models or ['<пусто>']}")
+                if len(models) < 3:
+                    print("[WARN] Список моделей урезан (гостевой уровень). Аккаунт не отдаёт Pro-модели: "
+                          "проверьте 1PSIDTS и IP — Google отвечает так на 429 и на протухшую куку.")
                 client_instance = new_client
                 return client_instance
             except Exception as e:
+                bridge_state["last_auth_error"] = str(e)
                 if is_rate_limited(e):
                     # Retrying a 429 immediately is what keeps the session limited.
                     raise HTTPException(
@@ -235,13 +330,29 @@ def is_rate_limited(err: Exception) -> bool:
     return "429" in m or "too many requests" in m
 
 def is_auth_or_session_error(err: Exception) -> bool:
-    """Checks whether an exception is related to session expiration, network drop, or auth token rotation."""
+    """Session/auth failures only.
+
+    This used to match "timeout", "closed", "bad gateway" and "not available"
+    too, so an ordinary network hiccup triggered a full Google re-auth — a new
+    bootstrap token on every slow reply, which is exactly what gets an IP
+    throttled. Network trouble is now a separate, cheaper retry.
+    """
     msg = str(err).lower()
     patterns = [
-        "auth", "session", "cookie", "token", "unauthorized",
+        "auth", "session expired", "cookie", "1psid", "unauthorized",
         "401", "302", "redirect", "login", "forbidden", "403",
-        "bad gateway", "not available", "connection reset", "broken pipe",
-        "timeout", "eof occurred", "remotedisconnected", "closed"
+        "invalid session", "not signed in",
+    ]
+    return any(p in msg for p in patterns)
+
+
+def is_transient_network_error(err: Exception) -> bool:
+    """Timeouts and dropped sockets: retry the same client, do not re-auth."""
+    msg = str(err).lower()
+    patterns = [
+        "timeout", "timed out", "connection reset", "broken pipe", "closed",
+        "eof occurred", "remotedisconnected", "bad gateway", "502", "503", "504",
+        "temporarily unavailable", "try again",
     ]
     return any(p in msg for p in patterns)
 
@@ -271,8 +382,12 @@ async def cookie_persistence_loop():
                     # This refetch reuses the session and needs no new token.
                     before = {m.model_name for m in (client_instance.list_models() or [])}
                     if len(before) < 3:
-                        await client_instance._fetch_user_status()
+                        try:
+                            await client_instance._fetch_user_status()
+                        except Exception as refetch_err:
+                            print(f"[MODELS] Переспрос реестра не удался: {refetch_err}")
                         after = {m.model_name for m in (client_instance.list_models() or [])}
+                        bridge_state["last_models_refresh_at"] = time.time()
                         if after != before:
                             print(f"[MODELS] Список моделей аккаунта обновился: {sorted(after)}")
                 if ticks % 20 == 0:
@@ -287,11 +402,30 @@ async def cookie_persistence_loop():
                         if fresh:
                             os.environ["GEMINI_SECURE_1PSIDTS"] = fresh
                             update_env_file(psidts=fresh)
+                            bridge_state["last_rotation_at"] = time.time()
+                            bridge_state["last_rotation_ok"] = True
+                            bridge_state["last_rotation_error"] = None
                             print("[ROTATE] 1PSIDTS обновлён и сохранён.")
                         else:
+                            bridge_state["last_rotation_at"] = time.time()
+                            bridge_state["last_rotation_ok"] = False
+                            bridge_state["last_rotation_error"] = "Google вернул пустой 1PSIDTS"
                             print("[ROTATE] Google не вернул новый 1PSIDTS — повторим через интервал.")
                     except Exception as rot_err:
+                        bridge_state["last_rotation_at"] = time.time()
+                        bridge_state["last_rotation_ok"] = False
+                        bridge_state["last_rotation_error"] = str(rot_err)
                         print(f"[ROTATE] Не удалось обновить 1PSIDTS: {rot_err}")
+
+                if ticks % 20 == 0:
+                    # One line every ten minutes: the state that used to be
+                    # invisible when the bridge ran without a console.
+                    status_name = getattr(getattr(client_instance, "account_status", None), "name", "?")
+                    models = [m.model_name for m in (client_instance.list_models() or [])]
+                    last_rot = bridge_state.get("last_rotation_at")
+                    rot_age = f"{int((time.time() - last_rot) // 60)} мин назад" if last_rot else "никогда"
+                    print(f"[STATE] account={status_name} models={models} rotation={rot_age} "
+                          f"inflight={bridge_state['inflight']}")
         except Exception as e:
             print(f"[WARN] Цикл обновления сессии: {e}")
 
@@ -306,11 +440,13 @@ async def warmup():
 async def lifespan(app: FastAPI):
     # Startup
     load_env_file()
-    try:
-        await warmup()
-    except Exception as e:
-        print(f"[WARN] Ошибка прогрева при старте: {e}")
+    # Warmup used to be awaited here, so the port did not accept connections
+    # until Google finished the bootstrap (init timeout is 5 minutes). A slow
+    # bootstrap then looked like "the bridge is not running". The first request
+    # still waits on the same lock, so nothing is duplicated.
+    asyncio.create_task(warmup())
     asyncio.create_task(cookie_persistence_loop())
+    print(f"[BOOT] Мост запущен на http://{HOST}:{PORT} · proxy={GEMINI_PROXY or 'нет'} · лог={LOG_PATH}")
     yield
     # Shutdown
     global client_instance
@@ -322,7 +458,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Gemini Web Bridge (Google AI Pro - Antigravity Orchestrator Edition)",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -552,11 +688,6 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
                 elif t.get("name"):
                     tool_names.append(t["name"])
 
-        has_execute = "execute" in tool_names
-        has_edit = "edit" in tool_names
-        has_write = "write" in tool_names
-        has_direct_godot = any("editor_state" in n or "screenshot" in n or "godot" in n for n in tool_names)
-
         instruction_lines = [
             "Available tools:",
             json.dumps(tools, separators=(',', ':'), ensure_ascii=False),
@@ -575,53 +706,49 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
             "When the task is finished, reply in plain text with no tool_call block.\n",
         ]
 
-        examples = ["Examples:"]
-        if has_execute:
-            examples.append(
-                'User: опиши как выглядит сцена через редактор godot\n'
-                'Assistant: ```tool_call\n'
-                '{"name": "execute", "arguments": {"code": "const state = await tools[\'godot-ai\'].editor_state({}); const shot = await tools[\'godot-ai\'].editor_screenshot({ source: \'editor\' }); return { state, shot };"}}\n'
-                '```\n'
-            )
-            if has_edit:
-                examples.append(
-                    'User: Исправь ошибки в project.godot\n'
-                    'Assistant: ```tool_call\n'
-                    '{"name": "edit", "arguments": {"path": "project.godot", "edits": [{"oldText": "anti_aliasing/quality/use_taa=false", "newText": "anti_aliasing/quality/use_taa=true"}]}}\n'
-                    '```\n'
-                )
-            elif has_write:
-                examples.append(
-                    'User: Исправь ошибки в project.godot\n'
-                    'Assistant: ```tool_call\n'
-                    '{"name": "write", "arguments": {"path": "project.godot", "content": "[application]\\n..."}}\n'
-                    '```\n'
-                )
-        elif has_direct_godot:
-            ex_editor = next((n for n in tool_names if "editor_state" in n or "state" in n), "editor_state")
-            ex_shot = next((n for n in tool_names if "editor_screenshot" in n or "screenshot" in n), "editor_screenshot")
-            examples.append(
-                f'User: опиши как выглядит сцена через редактор godot\n'
-                f'Assistant: ```tool_call\n{{"name": "{ex_editor}", "arguments": {{}}}}\n```\n'
-                f'```tool_call\n{{"name": "{ex_shot}", "arguments": {{"source": "editor"}}}}\n```\n'
-            )
-            if has_edit:
-                examples.append(
-                    'User: Исправь ошибки в project.godot\n'
-                    'Assistant: ```tool_call\n{"name": "edit", "arguments": {"path": "project.godot", "edits": [...]}}\n```\n'
-                )
-            elif has_write:
-                examples.append(
-                    'User: Исправь ошибки в project.godot\n'
-                    'Assistant: ```tool_call\n{"name": "write", "arguments": {"path": "project.godot", "content": "..."}}\n```\n'
-                )
+        # One example, generated from the schema of a tool that is really in this
+        # request. The old block hardcoded `edit` as {path, edits:[{oldText,
+        # newText}]} and `write` as {path, content} plus a Godot-only `execute`
+        # call, so the model was taught arguments the client does not accept and
+        # every edit came back malformed.
+        def _example_value(spec: Dict[str, Any]) -> Any:
+            kind = (spec or {}).get("type")
+            enum = (spec or {}).get("enum")
+            if enum:
+                return enum[0]
+            return {
+                "string": "...",
+                "number": 0,
+                "integer": 0,
+                "boolean": False,
+                "array": [],
+                "object": {},
+            }.get(kind, "...")
 
-        # Only emit the header when examples follow it. A dangling "Examples:"
-        # right before the dialogue made the model read the real task as one of
-        # the examples and reply that no task had been given.
+        def _example_arguments(name: str) -> Dict[str, Any]:
+            fn = next((t.get("function") for t in tools
+                       if isinstance(t, dict) and (t.get("function") or {}).get("name") == name), {}) or {}
+            params = fn.get("parameters") or {}
+            props = params.get("properties") or {}
+            required = params.get("required") or []
+            if not required:
+                required = list(props)[:2]
+            return {k: _example_value(props.get(k) or {}) for k in required}
+
+        example_tool = next((n for n in ("read", "read_file", "bash", "execute", "write", "edit")
+                             if n in tool_names), tool_names[0])
+        tool_example = {
+            "name": example_tool,
+            "arguments": _example_arguments(example_tool),
+        }
+        instruction_lines += [
+            "\nExample for a tool from this request:",
+            "Assistant: ```tool_call",
+            json.dumps(tool_example, ensure_ascii=False),
+            "```\n",
+        ]
+
         tools_instruction = "\n".join(instruction_lines)
-        if len(examples) > 1:
-            tools_instruction += "\n" + "\n".join(examples)
         system_prompts.append(tools_instruction)
     if tool_directive:
         system_prompts.append(tool_directive)
@@ -865,6 +992,36 @@ CONTINUE_NUDGE = (
     "You stopped while the task was still in progress. If any change is still unapplied or unverified, "
     "emit the next tool_call block now. If the task really is complete, reply with the final answer only."
 )
+
+# How many continuation attempts a stalled turn may cost. Each one is a whole
+# extra generation, so this is deliberately small and only fires on turns that
+# actually look stalled.
+CONTINUE_NUDGES = int(os.getenv("CONTINUE_NUDGES", "2"))
+
+_STALL_MARKERS = (
+    "i can't", "i cannot", "i don't have access", "i do not have access",
+    "i don't have the ability", "i am unable to", "i'm unable to",
+    "не могу", "не имею доступа", "нет доступа", "не в состоянии",
+    "here's the plan", "here is the plan", "вот план", "план действий",
+    "would you like me to", "хотите, чтобы я", "should i proceed",
+    "let me know if you want me to", "please provide", "предоставьте",
+)
+
+
+def looks_like_stall(text: str) -> bool:
+    """Prose that replaces work with a plan, an excuse or a question.
+
+    Nudging every answer that came without a tool call tripled the cost of an
+    ordinary reply: the client offers tools on every request, so a plain final
+    answer looked identical to a model that refused to act. This is the signal
+    that separates the two.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    if "```tool_call" in t or "<tool_call>" in t:
+        return False
+    return any(p in t for p in _STALL_MARKERS)
 
 def repair_json(raw: str) -> Any:
     """Parses the JSON models actually emit, not just well-formed JSON.
@@ -1141,7 +1298,6 @@ def safe_stream_prefix(text: str, tool_names: Optional[set]) -> int:
 
     return max(0, limit)
 
-@app.get("/")
 @app.get("/health")
 async def health_check():
     load_env_file()
@@ -1149,18 +1305,42 @@ async def health_check():
     is_active = client_instance is not None and client_instance._running
     models = []
     quotas = {}
+    account_status = None
     if is_active and client_instance:
         raw_models = client_instance.list_models() or []
         models = [m.model_name for m in raw_models]
         quotas = client_instance._quotas or {}
+        account_status = getattr(getattr(client_instance, "account_status", None), "name", None)
+
+    last_rot = bridge_state.get("last_rotation_at")
     return {
         "status": "ok",
         "service": "Gemini Web to OpenAI Bridge (Google AI Pro - Antigravity Orchestrator Edition)",
+        "version": "1.9.0",
         "cookies_configured": has_cookies,
         "client_active": is_active,
+        "account_status": account_status,
         "active_models": models,
+        "degraded": bool(is_active and models and len(models) < 3),
         "quotas": quotas,
         "endpoint": f"http://{HOST}:{PORT}/v1",
+        # The bridge used to be diagnosable only from its console, which is
+        # hidden when it autostarts. These are the facts needed to tell a dead
+        # session from a slow Google.
+        "bridge": {
+            "uptime_seconds": int(time.time() - bridge_state["started_at"]),
+            "proxy": GEMINI_PROXY or None,
+            "last_rotation_at": last_rot,
+            "last_rotation_age_seconds": int(time.time() - last_rot) if last_rot else None,
+            "last_rotation_ok": bridge_state.get("last_rotation_ok"),
+            "last_rotation_error": bridge_state.get("last_rotation_error"),
+            "last_auth_refresh_at": bridge_state.get("last_auth_refresh_at"),
+            "last_auth_error": bridge_state.get("last_auth_error"),
+            "last_quota_at": bridge_state.get("last_quota_at"),
+            "last_quota_source": bridge_state.get("last_quota_source"),
+            "inflight_requests": bridge_state["inflight"],
+            "log": str(LOG_PATH),
+        },
     }
 
 @app.get("/v1/models")
@@ -1197,6 +1377,10 @@ async def list_models():
     return {
         "object": "list",
         "account_models": sorted(live),
+        # False means "the account list is not known yet", not "the model works".
+        # Reporting every model as available while the client was down made a
+        # dead bridge look healthy.
+        "known": bool(live),
         "data": [
             {
                 "id": m["id"],
@@ -1209,7 +1393,7 @@ async def list_models():
                 # When Google returns a partial registry the bridge falls back to
                 # a weaker model. Say so here instead of letting the caller think
                 # it is talking to Carbon.
-                "available": (not live) or served_by(m["id"]) in live,
+                "available": bool(live) and served_by(m["id"]) in live,
             }
             for m in models_list
         ],
@@ -1230,20 +1414,42 @@ async def auth_refresh():
     status_name = getattr(account_status, "name", "UNKNOWN")
     if account_status != AccountStatus.AVAILABLE:
         # Status alone cannot decide this: it reports UNAUTHENTICATED on cookies
-        # that still generate. Probe once, and only in this ambiguous case, so
-        # login.cmd polling does not spend quota on every tick.
-        try:
-            await client.generate_content("ping", model="gemini-flash-lite")
-        except Exception:
+        # that still generate. Probe once, and rate-limit it, because login.cmd
+        # polls this endpoint every five seconds and every probe is a real
+        # generation on a session Google may already be throttling.
+        now = time.time()
+        if updated or _auth_probe["ok"] is None or now - _auth_probe["at"] > 30:
+            try:
+                await client.generate_content("ping", model="gemini-flash-lite")
+                _auth_probe.update(at=now, ok=True)
+            except Exception as probe_err:
+                _auth_probe.update(at=now, ok=False, error=str(probe_err))
+                return {
+                    "ok": False,
+                    "browser_alive": browser_alive,
+                    "session_updated": updated,
+                    "account_status": status_name,
+                    "detail": "Сессия Google недействительна. Запустите login.cmd и войдите в аккаунт в окне Chrome моста.",
+                }
+        elif not _auth_probe["ok"]:
             return {
                 "ok": False,
                 "browser_alive": browser_alive,
                 "session_updated": updated,
                 "account_status": status_name,
-                "detail": "Сессия Google недействительна. Запустите login.cmd и войдите в аккаунт в окне Chrome моста.",
+                "detail": "Сессия Google недействительна (проверено менее 30 с назад). "
+                          "Запустите login.cmd и войдите в аккаунт в окне Chrome моста.",
             }
+    models = [m.model_name for m in (client.list_models() or [])]
+    bridge_state["last_auth_refresh_at"] = time.time()
+    # The cached quota was computed against the previous session; a fresh one
+    # must not be answered from it.
+    _quota_cache["at"] = 0.0
+    degraded = len(models) < 3
     return {"ok": True, "browser_alive": browser_alive, "session_updated": updated,
-            "account_status": status_name}
+            "account_status": status_name, "account_models": models,
+            "degraded": degraded,
+            "reason": "guest_session" if degraded else None}
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -1496,35 +1702,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function render(d) {
       const h5 = d.window_5h || {};
       const w = d.weekly || {};
-      
-      const h5Rem = h5.remaining_credits ?? 2400;
-      const h5Tot = h5.total_credits || 2400;
-      const h5Pct = (h5.remaining_percentage !== undefined) ? h5.remaining_percentage : Math.round((h5Rem / h5Tot) * 100);
-      
-      document.getElementById('h5Rem').textContent = h5Rem.toLocaleString();
-      document.getElementById('h5Badge').textContent = h5Pct + '% доступно';
-      document.getElementById('h5Bar').style.width = Math.min(100, Math.max(0, h5Pct)) + '%';
-      
-      const wRem = w.remaining_credits ?? 48384;
-      const wTot = w.total_credits || 48384;
-      const wPct = (w.remaining_percentage !== undefined) ? w.remaining_percentage : Math.round((wRem / wTot) * 100);
-      
-      document.getElementById('wRem').textContent = wRem.toLocaleString();
-      document.getElementById('wBadge').textContent = wPct + '% доступно';
-      document.getElementById('wBar').style.width = Math.min(100, Math.max(0, wPct)) + '%';
-      document.getElementById('wUsed').textContent = (w.used_credits || 0).toLocaleString() + ' кр. (' + (w.usage_percentage || 0) + '%)';
+      const known5 = h5.remaining_credits !== null && h5.remaining_credits !== undefined;
+      const knownW = w.remaining_credits !== null && w.remaining_credits !== undefined;
+
+      document.getElementById('h5Rem').textContent = known5 ? h5.remaining_credits.toLocaleString() : '—';
+      document.getElementById('h5Badge').textContent = known5 ? h5.remaining_percentage + '% доступно' : 'нет данных';
+      document.getElementById('h5Bar').style.width = known5 ? Math.min(100, Math.max(0, h5.remaining_percentage)) + '%' : '0%';
+
+      document.getElementById('wRem').textContent = knownW ? w.remaining_credits.toLocaleString() : '—';
+      document.getElementById('wBadge').textContent = knownW ? w.remaining_percentage + '% доступно' : 'нет данных';
+      document.getElementById('wBar').style.width = knownW ? Math.min(100, Math.max(0, w.remaining_percentage)) + '%' : '0%';
+      document.getElementById('wUsed').textContent = knownW
+        ? (w.used_credits || 0).toLocaleString() + ' кр. (' + (w.usage_percentage || 0) + '%)'
+        : 'Google не отдаёт счётчики для этой сессии';
 
       const pill = document.querySelector('.status-pill');
       if (pill) {
         if (d.source === 'antigravity_daemon') {
-          pill.innerHTML = '<span class=\"status-dot\"></span> 🟢 ANTIGRAVITY AUTO-SYNC';
+          pill.innerHTML = '<span class="status-dot"></span> 🟢 ANTIGRAVITY AUTO-SYNC';
         } else if (d.ok) {
-          pill.innerHTML = '<span class=\"status-dot\"></span> PRO ACTIVE';
+          pill.innerHTML = '<span class="status-dot"></span> PRO ACTIVE';
+        } else if (d.authenticated === false && d.account_status && d.account_status !== 'UNKNOWN') {
+          pill.innerHTML = '<span class="status-dot" style="background:#ef4444;"></span> ⚠️ КВОТА НЕИЗВЕСТНА (' + d.account_status + ')';
         } else {
-          pill.innerHTML = '<span class=\"status-dot\" style=\"background:#ef4444;\"></span> ⚠️ AUTH REQUIRED';
+          pill.innerHTML = '<span class="status-dot" style="background:#eab308;"></span> ⚠️ НЕТ ДАННЫХ О КВОТЕ';
         }
       }
-      
+
       if (h5.reset_at) {
         const rDate = new Date(h5.reset_at);
         document.getElementById('h5ExactTime').textContent = rDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -1557,7 +1761,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       try {
         const res = await fetch('/auth/refresh', { method: 'POST' });
         const data = await res.json();
-        if (data.ok) {
+        if (data.ok && data.degraded) {
+          msg.textContent = '⚠️ Сессия гостевого уровня: Google отдаёт только flash-lite. '
+            + 'Войдите в аккаунт в окне Chrome моста (login.cmd).';
+          msg.style.color = '#fbbf24';
+          loadQuota(true);
+        } else if (data.ok) {
           msg.textContent = data.session_updated
             ? '✅ Сессия обновлена из браузера, мост переподключён.'
             : '✅ Сессия уже актуальна.';
@@ -1583,13 +1792,47 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </html>
 """
 
-@app.get("/v1/quota")
-@app.get("/api/quota")
-async def get_quota_info():
-    """Returns real-time Google AI Pro quota and remaining credit metrics, prioritizing direct local Antigravity daemon sync."""
+QUOTA_TTL_SECONDS = 30.0
+_quota_cache: Dict[str, Any] = {"at": 0.0, "body": None}
+_quota_lock = asyncio.Lock()
+
+
+def _empty_window(total_hint: int) -> Dict[str, Any]:
+    """Unknown, not zero.
+
+    The old fallback filled in 2400/2400 used and 0 left whenever the status
+    RPC was unhappy, so a working session was reported as an exhausted plan and
+    the dashboard showed "0 кредитов". Nothing here is a measurement, so the
+    values are null and the caller has to say "unknown".
+    """
+    return {
+        "total_credits": None,
+        "remaining_credits": None,
+        "used_credits": None,
+        "usage_percentage": None,
+        "remaining_percentage": None,
+        "reset_at": "",
+        "total_credits_hint": total_hint,
+    }
+
+
+def _quota_models() -> List[Dict[str, Any]]:
+    return [
+        {"id": "gemini-orchestrator", "name": "Gemini Orchestrator (Auto: Carbon + Hydrogen)", "default": True},
+        {"id": "gemini-carbon", "name": "Gemini Carbon (Глубокие рассуждения)", "tier": "Flagship"},
+        {"id": "gemini-pro", "name": "Gemini Pro (Сложные задачи)", "tier": "Flagship"},
+        {"id": "gemini-4-hydrogen-high", "name": "Gemini 4 Hydrogen (Высокий Thinking)", "tier": "Fast Thinking"},
+        {"id": "gemini-4-hydrogen", "name": "Gemini 4 Hydrogen (Повседневный кодинг)", "tier": "Fast"},
+        {"id": "gemini-flash-lite", "name": "Gemini Flash Lite (Быстрые ответы)", "tier": "Fast"},
+    ]
+
+
+async def _collect_quota() -> Dict[str, Any]:
     agy_data = None
     try:
-        agy_data = fetch_antigravity_live_quota()
+        # Blocking urllib with 3+3 s timeouts: it must not run on the event loop,
+        # where it stalled every in-flight chat stream for two seconds.
+        agy_data = await asyncio.to_thread(fetch_antigravity_live_quota)
     except Exception as e:
         print(f"[ANTIGRAVITY-SYNC] Quota query exception: {e}")
 
@@ -1606,7 +1849,6 @@ async def get_quota_info():
         c5h_rem = int(round(c5h_total * c5h_frac))
         c5h_used = max(0, c5h_total - c5h_rem)
         c5h_pct = round(100.0 - c5h_rem_pct, 1)
-        c5h_reset = h5.get("reset_time", "")
 
         w_total = 48384
         w_rem_pct = w.get("remaining_pct", 100.0)
@@ -1614,95 +1856,148 @@ async def get_quota_info():
         w_rem = int(round(w_total * w_frac))
         w_used = max(0, w_total - w_rem)
         w_pct = round(100.0 - w_rem_pct, 1)
-        w_reset = w.get("reset_time", "")
 
         tier_name = user_info.get("tier", "Pro")
         user_email = user_info.get("email", "")
-        tier = f"PRO ({tier_name})" if not user_email else f"PRO ({user_email})"
-        is_authenticated = True
-        status_label = f"AVAILABLE (Antigravity Daemon : {agy_data.get('port', 'live')})"
-    else:
-        # Fallback when Antigravity daemon is inactive
-        is_authenticated = False
-        status_label = "UNAUTHENTICATED"
-        tier = "AUTH REQUIRED"
-        c5h_rem = 0
+        tier = f"PRO ({user_email})" if user_email else f"PRO ({tier_name})"
+        bridge_state["last_quota_source"] = "antigravity_daemon"
+        bridge_state["last_quota_at"] = time.time()
+        return {
+            "ok": True,
+            "authenticated": True,
+            "tier": tier,
+            "account_status": f"AVAILABLE (Antigravity Daemon : {agy_data.get('port', 'live')})",
+            "source": "antigravity_daemon",
+            "reason": None,
+            "checked_at": int(time.time()),
+            "window_5h": {
+                "total_credits": c5h_total,
+                "remaining_credits": c5h_rem,
+                "used_credits": c5h_used,
+                "usage_percentage": c5h_pct,
+                "remaining_percentage": round(100.0 - c5h_pct, 1),
+                "reset_at": h5.get("reset_time", ""),
+                "estimated_requests": {
+                    "hydrogen_fast": int(c5h_rem / 2),
+                    "orchestrator_balanced": int(c5h_rem / 8),
+                    "carbon_deep_thinking": int(c5h_rem / 22),
+                },
+            },
+            "weekly": {
+                "total_credits": w_total,
+                "remaining_credits": w_rem,
+                "used_credits": w_used,
+                "usage_percentage": w_pct,
+                "remaining_percentage": round(100.0 - w_pct, 1),
+                "reset_at": w.get("reset_time", ""),
+            },
+            "models": _quota_models(),
+        }
+
+    # Fallback: ask the web session. The status RPC is not trusted here either —
+    # it says UNAUTHENTICATED on cookies that generate — but usage_info only
+    # carries numbers when Google actually returned them.
+    status_name = "UNKNOWN"
+    usage: Dict[str, Any] = {}
+    reason = "web_session_unavailable"
+    try:
+        client = await get_gemini_client()
+        status_name = getattr(getattr(client, "account_status", None), "name", "UNKNOWN")
+        if hasattr(client, "_fetch_usage_info"):
+            await client._fetch_usage_info()
+        usage = getattr(client, "usage_info", {}) or {}
+        reason = "web_session_reports_no_usage"
+    except HTTPException as e:
+        reason = str(e.detail)
+    except Exception as e:
+        reason = f"web_session_error: {e}"
+        print(f"[QUOTA] Web client fallback error: {e}")
+
+    c5h = usage.get("current_5h", {}) or {}
+    weekly = usage.get("weekly", {}) or {}
+    tier_info = usage.get("tier", {})
+    has_numbers = c5h.get("remaining_credits") is not None
+
+    bridge_state["last_quota_source"] = "web_client"
+    bridge_state["last_quota_at"] = time.time()
+
+    if has_numbers:
         c5h_total = 2400
-        c5h_used = 2400
-        c5h_pct = 100.0
-        c5h_rem_pct = 0.0
-        c5h_reset = ""
-        w_rem = 0
+        c5h_rem = int(c5h.get("remaining_credits", 0))
+        c5h_used = max(0, c5h_total - c5h_rem)
+        c5h_pct = c5h.get("usage_percentage", round((c5h_used / c5h_total) * 100, 1))
         w_total = 48384
-        w_used = 48384
-        w_pct = 100.0
-        w_rem_pct = 0.0
-        w_reset = ""
-
-        try:
-            client = await get_gemini_client()
-            if hasattr(client, "_fetch_usage_info"):
-                await client._fetch_usage_info()
-            usage = getattr(client, "usage_info", {}) or {}
-            c5h = usage.get("current_5h", {})
-            weekly = usage.get("weekly", {})
-            tier_info = usage.get("tier", {})
-            tier = tier_info.get("label", "PRO") if isinstance(tier_info, dict) else "PRO"
-            is_authenticated = (getattr(client.account_status, "name", "") == "AVAILABLE") and bool(usage)
-            if is_authenticated:
-                c5h_rem = c5h.get("remaining_credits", 2400)
-                c5h_used = max(0, c5h_total - c5h_rem)
-                c5h_pct = c5h.get("usage_percentage", round((c5h_used / c5h_total) * 100, 1))
-                c5h_rem_pct = round(100.0 - c5h_pct, 1)
-                c5h_reset = c5h.get("reset_at", "")
-
-                w_rem = weekly.get("remaining_credits", 48384)
-                w_used = max(0, w_total - w_rem)
-                w_pct = weekly.get("usage_percentage", round((w_used / w_total) * 100, 1))
-                w_rem_pct = round(100.0 - w_pct, 1)
-                w_reset = weekly.get("reset_at", "")
-                status_label = "AVAILABLE (Web Session)"
-        except Exception as e:
-            print(f"[QUOTA] Web client fallback error: {e}")
-
-    est_hydrogen = int(c5h_rem / 2) if c5h_rem else 0
-    est_orchestrator = int(c5h_rem / 8) if c5h_rem else 0
-    est_carbon = int(c5h_rem / 22) if c5h_rem else 0
+        w_rem = int(weekly.get("remaining_credits", 0))
+        w_used = max(0, w_total - w_rem)
+        w_pct = weekly.get("usage_percentage", round((w_used / w_total) * 100, 1))
+        tier_label = tier_info.get("label") if isinstance(tier_info, dict) else None
+        return {
+            "ok": True,
+            "authenticated": True,
+            "tier": tier_label or "PRO",
+            "account_status": f"{status_name} (Web Session)",
+            "source": "web_client",
+            "reason": None,
+            "checked_at": int(time.time()),
+            "window_5h": {
+                "total_credits": c5h_total,
+                "remaining_credits": c5h_rem,
+                "used_credits": c5h_used,
+                "usage_percentage": c5h_pct,
+                "remaining_percentage": round(100.0 - c5h_pct, 1),
+                "reset_at": c5h.get("reset_at", ""),
+                "estimated_requests": {
+                    "hydrogen_fast": int(c5h_rem / 2),
+                    "orchestrator_balanced": int(c5h_rem / 8),
+                    "carbon_deep_thinking": int(c5h_rem / 22),
+                },
+            },
+            "weekly": {
+                "total_credits": w_total,
+                "remaining_credits": w_rem,
+                "used_credits": w_used,
+                "usage_percentage": w_pct,
+                "remaining_percentage": round(100.0 - w_pct, 1),
+                "reset_at": weekly.get("reset_at", ""),
+            },
+            "models": _quota_models(),
+        }
 
     return {
-        "ok": is_authenticated,
-        "tier": tier,
-        "account_status": status_label,
-        "source": "antigravity_daemon" if (agy_data and agy_data.get("quotas")) else "web_client",
-        "window_5h": {
-            "total_credits": c5h_total,
-            "remaining_credits": c5h_rem,
-            "used_credits": c5h_used,
-            "usage_percentage": c5h_pct,
-            "remaining_percentage": c5h_rem_pct,
-            "reset_at": c5h_reset,
-            "estimated_requests": {
-                "hydrogen_fast": est_hydrogen,
-                "orchestrator_balanced": est_orchestrator,
-                "carbon_deep_thinking": est_carbon
-            }
-        },
-        "weekly": {
-            "total_credits": w_total,
-            "remaining_credits": w_rem,
-            "used_credits": w_used,
-            "usage_percentage": w_pct,
-            "remaining_percentage": w_rem_pct,
-            "reset_at": w_reset
-        },
-        "models": [
-            {"id": "gemini-orchestrator", "name": "Gemini Orchestrator (Auto: Carbon + Hydrogen)", "default": True},
-            {"id": "gemini-carbon", "name": "Gemini Carbon (Глубокие рассуждения)", "tier": "Flagship"},
-            {"id": "gemini-pro", "name": "Gemini Pro (Сложные задачи)", "tier": "Flagship"},
-            {"id": "gemini-4-hydrogen-high", "name": "Gemini 4 Hydrogen (Высокий Thinking)", "tier": "Fast Thinking"},
-            {"id": "gemini-4-hydrogen", "name": "Gemini 4 Hydrogen (Повседневный кодинг)", "tier": "Fast"}
-        ]
+        "ok": False,
+        "authenticated": False,
+        "tier": None,
+        "account_status": status_name,
+        "source": "web_client",
+        "reason": reason,
+        "checked_at": int(time.time()),
+        "window_5h": _empty_window(2400),
+        "weekly": _empty_window(48384),
+        "models": _quota_models(),
     }
+
+
+@app.get("/v1/quota")
+@app.get("/api/quota")
+async def get_quota_info():
+    """Live quota. Cached for 30 s, and honest when it has no numbers.
+
+    The dashboard polls this every 30 s, ProviderStudio polls it on every
+    diagnosis, and both used to pay a two-second Google round trip that ran on
+    the event loop.
+    """
+    now = time.time()
+    if _quota_cache["body"] is not None and now - _quota_cache["at"] < QUOTA_TTL_SECONDS:
+        return _quota_cache["body"]
+
+    async with _quota_lock:
+        now = time.time()
+        if _quota_cache["body"] is not None and now - _quota_cache["at"] < QUOTA_TTL_SECONDS:
+            return _quota_cache["body"]
+        body = await _collect_quota()
+        _quota_cache["body"] = body
+        _quota_cache["at"] = time.time()
+        return body
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -1773,8 +2068,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         tool_directive = ("You must call one of the available tools in this turn. "
                           "Reply with a tool_call block and nothing else.")
     tool_names = collect_tool_names(req.tools)
+    # A turn whose last message is a tool result is mid-task: prose there means
+    # the agent stalled. On a plain user turn prose is the normal final answer.
+    last_role = req.messages[-1].role if req.messages else ""
+    agent_turn = last_role in ("tool", "function")
     stops = normalize_stops(req.stop)
-    client = await get_gemini_client()
+    # Parsed before any Google call: title generation is answered locally, and
+    # it must keep working while the session is degraded or rate-limited.
     prompt, files_to_upload = parse_openai_messages(req.messages, req.tools, tool_directive)
 
     if not prompt and not files_to_upload:
@@ -1782,6 +2082,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created_time = int(time.time())
+    # Defined before the title fast-path: that branch returned a completion with
+    # `resp_model` and crashed with UnboundLocalError (HTTP 500) whenever the
+    # client asked for a title without streaming.
+    resp_model = req.model
 
     # Fast-path for the client's background title generation. Matched against the
     # last user turn only: searching the whole prompt hijacked real coding tasks
@@ -1814,6 +2118,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             }
 
     resp_model = req.model
+    # The client is fetched only after the local fast-paths: a background title
+    # request used to fail with the whole session's error for no reason.
+    client = await get_gemini_client()
+
     model_id = req.model.lower().strip()
     effort = (req.reasoning_effort or "").lower().strip()
     extended_thinking = True
@@ -2022,9 +2330,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         continue
 
                     if (not tool_calls and not finish_override and tool_names
-                            and nudges < 2):
+                            and nudges < CONTINUE_NUDGES
+                            and (agent_turn or looks_like_stall(collected_full_text))):
                         nudges += 1
-                        print("[CONTINUE] Модель остановилась посреди задачи — одна попытка продолжить (стрим).")
+                        print("[CONTINUE] Модель остановилась посреди задачи — попытка продолжить "
+                              f"({nudges}/{CONTINUE_NUDGES}, стрим).")
                         prompt, _ = parse_openai_messages(req.messages, req.tools,
                                                           tool_directive + " " + CONTINUE_NUDGE)
                         continue
@@ -2073,9 +2383,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         # Both modes stream incrementally now, so only the tail is
                         # left. The prefix check keeps a stripped block from making
                         # us resend text the client already has.
-                        if clean_text.startswith(last_sent_text) and len(clean_text) > len(last_sent_text):
+                        # A nudged attempt may only add a tool call: its prose is
+                        # a second answer, and the client already has the first.
+                        if (not nudges and clean_text.startswith(last_sent_text)
+                                and len(clean_text) > len(last_sent_text)):
                             rem_text = clean_text[len(last_sent_text):]
-                            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': rem_text}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': resp_model, 'choices': [{'index': 0, 'delta': {'content': rem_text}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
                         finish_reason = "stop"
 
                     print(f"[STREAM] Завершено. Чанков: {chunk_count}, tool_calls: {len(tool_calls) if tool_calls else 0}, finish_reason: {finish_reason}")
@@ -2104,6 +2417,21 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     return
 
                 except Exception as stream_err:
+                    if is_rate_limited(stream_err):
+                        # Log the real Google message: the generic 429 detail in
+                        # the client response is not enough to tell a short
+                        # per-session limit from an IP-level block.
+                        bridge_state["last_error"] = f"429: {stream_err}"
+                        print(f"[429] Google ограничил стрим: {stream_err}")
+                        err_payload = {
+                            "error": {
+                                "message": "Google ограничил сессию (429). Подождите несколько минут.",
+                                "type": "gemini_rate_limited",
+                            }
+                        }
+                        yield f"data: {json.dumps(err_payload)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
                     if attempt == 0 and is_auth_or_session_error(stream_err):
                         print(f"[WARN] Сбой сессии во время стрима ({stream_err}). Автоматическое восстановление сессии Google...")
                         try:
@@ -2111,6 +2439,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             continue
                         except Exception as refresh_err:
                             print(f"[ERROR] Не удалось восстановить сессию: {refresh_err}")
+                    elif attempt == 0 and is_transient_network_error(stream_err):
+                        # A dropped socket is not a dead session. Re-authing here
+                        # spent a new Google bootstrap token on every hiccup.
+                        print(f"[WARN] Сетевой сбой во время стрима ({stream_err}). Повтор без переавторизации.")
+                        await asyncio.sleep(1)
+                        continue
+
+                    bridge_state["last_error"] = str(stream_err)
 
                     err_payload = {
                         "error": {
@@ -2122,8 +2458,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     yield "data: [DONE]\n\n"
                     return
 
+        async def _counted_stream(inner):
+            bridge_state["inflight"] += 1
+            try:
+                async for piece in inner:
+                    yield piece
+            finally:
+                bridge_state["inflight"] = max(0, bridge_state["inflight"] - 1)
+
         return StreamingResponse(
-            event_generator(),
+            _counted_stream(event_generator()),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -2134,6 +2478,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     # NON-STREAMING (with automatic retry on session dropout)
     nudges = 0
+    first_reply = None
+    first_thoughts = None
     for attempt in range(4):
         try:
             session_state = {"last_texts": {}, "last_thoughts": {}}
@@ -2155,14 +2501,18 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         break
                 return last
 
-            gen_task = asyncio.create_task(collect_reply())
-            while not gen_task.done():
-                if await request.is_disconnected():
-                    gen_task.cancel()
-                    print("[REQUEST] Клиент отключился — генерация Google отменена.")
-                    return
-                await asyncio.sleep(0.4)
-            last_chunk = gen_task.result()
+            bridge_state["inflight"] += 1
+            try:
+                gen_task = asyncio.create_task(collect_reply())
+                while not gen_task.done():
+                    if await request.is_disconnected():
+                        gen_task.cancel()
+                        print("[REQUEST] Клиент отключился — генерация Google отменена.")
+                        return
+                    await asyncio.sleep(0.4)
+                last_chunk = gen_task.result()
+            finally:
+                bridge_state["inflight"] = max(0, bridge_state["inflight"] - 1)
 
             reply_content = getattr(last_chunk, "text", "") or ""
             reply_thoughts = getattr(last_chunk, "thoughts", None)
@@ -2181,15 +2531,30 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # A cut answer may end mid-call, so do not parse calls out of it.
             tool_calls = None if cap_reason else extract_tool_calls(reply_content, tool_names)
 
+            if not tool_calls and not cap_reason and reply_content and nudges == 0:
+                # Remembered so a failed continuation cannot replace a perfectly
+                # good answer: the retry exists to rescue a stalled agent, not to
+                # throw away the first reply.
+                first_reply = reply_content
+                first_thoughts = reply_thoughts
+
             if (not tool_calls and not cap_reason and tool_names
-                    and nudges < 2):
+                    and nudges < CONTINUE_NUDGES
+                    and (agent_turn or looks_like_stall(reply_content))):
                 # The recurring failure of a text protocol: the model diagnoses the
-                # bug and hands back a plan instead of editing. One bounded retry
-                # recovers it; if the model still declines, its original answer stands.
+                # bug and hands back a plan instead of editing.
                 nudges += 1
-                print("[CONTINUE] Модель остановилась посреди задачи — одна попытка продолжить.")
+                print(f"[CONTINUE] Модель остановилась посреди задачи — попытка продолжить "
+                      f"({nudges}/{CONTINUE_NUDGES}, non-stream).")
                 prompt, _ = parse_openai_messages(req.messages, req.tools, tool_directive + " " + CONTINUE_NUDGE)
                 continue
+
+            if not tool_calls and not cap_reason and nudges and first_reply:
+                # The continuation produced no call either: return what the model
+                # actually answered first instead of the follow-up refusal.
+                print("[CONTINUE] Повтор не дал вызова инструмента — возвращаем исходный ответ.")
+                reply_content = first_reply
+                reply_thoughts = first_thoughts
 
             problems = tool_call_problems(tool_calls, req.tools) if tool_calls else []
             if problems and attempt == 0:
@@ -2254,6 +2619,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             raise
         except Exception as e:
             if is_rate_limited(e):
+                bridge_state["last_error"] = f"429: {e}"
+                print(f"[429] Google ограничил генерацию: {e}")
                 raise HTTPException(status_code=429,
                                     detail="Google ограничил сессию (429). Подождите несколько минут.")
             if attempt == 0 and is_auth_or_session_error(e):
@@ -2263,6 +2630,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     continue
                 except Exception:
                     pass
+            elif attempt == 0 and is_transient_network_error(e):
+                print(f"[WARN] Сетевой сбой ({e}). Повтор без переавторизации.")
+                await asyncio.sleep(1)
+                continue
+            bridge_state["last_error"] = str(e)
             err_msg = str(e)
             if "auth" in err_msg.lower() or "token" in err_msg.lower() or "401" in err_msg or "cookie" in err_msg.lower():
                 err_msg = "Сессия Google недействительна. Запустите login.cmd и войдите в аккаунт в окне Chrome моста."
@@ -2380,6 +2752,9 @@ async def responses_endpoint(req: ResponsesRequest, request: Request):
         calls: List[Dict[str, Any]] = []
         usage: Dict[str, Any] = {}
         seq = 0
+        actual_model = req.model
+        base = {"id": resp_id, "object": "response", "created_at": created,
+                "status": "in_progress", "model": req.model, "output": [], "error": None}
 
         def emit(kind: str, payload: Dict[str, Any]) -> str:
             nonlocal seq
@@ -2387,8 +2762,6 @@ async def responses_endpoint(req: ResponsesRequest, request: Request):
             body = {"type": kind, "sequence_number": seq, **payload}
             return f"event: {kind}\ndata: {json.dumps(body, ensure_ascii=False)}\n\n"
 
-        base = {"id": resp_id, "object": "response", "created_at": created,
-                "status": "in_progress", "model": resp_model, "output": [], "error": None}
         yield emit("response.created", {"response": base})
 
         async for raw in result.body_iterator:
@@ -2404,8 +2777,13 @@ async def responses_endpoint(req: ResponsesRequest, request: Request):
             except Exception:
                 continue
             if d.get("error"):
-                yield emit("response.failed", {"response": {**base, "status": "failed", "error": d["error"]}})
+                yield emit("response.failed", {"response": {**base, "model": actual_model,
+                                                              "status": "failed", "error": d["error"]}})
                 return
+            if d.get("model"):
+                # The chat stream carries the model that actually answered, which
+                # may differ from the requested one after a fallback.
+                actual_model = d["model"]
             if d.get("usage"):
                 usage = d["usage"]
             for ch in d.get("choices", []):
@@ -2430,7 +2808,7 @@ async def responses_endpoint(req: ResponsesRequest, request: Request):
             output.append({"type": "function_call", "id": f"fc_{uuid.uuid4().hex[:12]}",
                            "call_id": tc.get("id", ""), "name": fn.get("name", ""),
                            "arguments": fn.get("arguments", "{}"), "status": "completed"})
-        final = {**base, "status": "completed", "output": output,
+        final = {**base, "model": actual_model, "status": "completed", "output": output,
                  "usage": {"input_tokens": usage.get("prompt_tokens", 0),
                            "output_tokens": usage.get("completion_tokens", 0),
                            "total_tokens": usage.get("total_tokens", 0)}}
@@ -2440,6 +2818,15 @@ async def responses_endpoint(req: ResponsesRequest, request: Request):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 if __name__ == "__main__":
+    import logging
     import uvicorn
+
+    # uvicorn reports tracebacks through logging, which went to a console nobody
+    # sees under start-hidden.vbs. Same file as the prints, same rotation.
+    _file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    _file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(_file_handler)
+    logging.getLogger().setLevel(logging.INFO)
+
     print(f"Запуск Gemini Web Bridge на http://{HOST}:{PORT} ...")
     uvicorn.run("server:app", host=HOST, port=PORT, reload=False)

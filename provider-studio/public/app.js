@@ -3570,6 +3570,29 @@ function finishWizard() {
 }
 
 /**
+ * Quota badge for a provider that exposes /v1/quota.
+ *
+ * The numbers are only shown when the bridge actually has them. It used to
+ * fabricate "0 из 2400 израсходовано" whenever Google's status RPC was unhappy,
+ * so a working session looked like an exhausted plan and the badge read
+ * "0 кр." — worse than saying nothing.
+ */
+function quotaBadge(p) {
+  const q = p.quota;
+  if (!q) return "";
+  const h5 = q.window_5h || {};
+  const w = q.weekly || {};
+  const link = `href="http://127.0.0.1:8010/dashboard" target="_blank"`;
+  const style = `background:rgba(56,189,248,0.15);color:#38bdf8;border:1px solid rgba(56,189,248,0.3);text-decoration:none;`;
+  const known = typeof h5.remaining_credits === "number";
+  if (!known) {
+    return `<a ${link} class="tag" style="${style}" title="Мост не получил от Google счётчики квоты: ${esc(q.reason || "нет данных")}. Нажмите для открытия дашборда">⚡ квота: нет данных ↗</a>`;
+  }
+  const weekly = typeof w.remaining_credits === "number" ? ` · ${Math.round(w.remaining_credits / 1000)}k (нед)` : "";
+  return `<a ${link} class="tag" style="${style}" title="Лимит 5h: ${h5.remaining_credits}/${h5.total_credits} кредитов. Нажмите для открытия дашборда">⚡ ${h5.remaining_credits} кр. (5h)${weekly} ↗</a>`;
+}
+
+/**
  * Three states, not two. A 401 means the endpoint answered, so the old boolean
  * `ok` rendered a rejected key as "✓ доступен" — technically true about the
  * server, useless to the user, and it hid the actual fault.
@@ -3671,7 +3694,7 @@ async function diagnose() {
       <span class="diag-name">${esc(p.key)}</span>
       ${p.isDefault ? `<span class="tag">по умолчанию</span>` : ""}
       <span class="diag-meta">${p.nModels} ${plural(p.nModels, "модель", "модели", "моделей")}</span>
-      ${p.quota && p.quota.window_5h ? `<a href="http://127.0.0.1:8010/dashboard" target="_blank" class="tag" style="background:rgba(56,189,248,0.15);color:#38bdf8;border:1px solid rgba(56,189,248,0.3);text-decoration:none;" title="Лимит 5h: ${p.quota.window_5h.remaining_credits}/${p.quota.window_5h.total_credits} кредитов. Нажмите для открытия дашборда">⚡ ${p.quota.window_5h.remaining_credits} кр. (5h) · ${Math.round(p.quota.weekly.remaining_credits/1000)}k (нед) ↗</a>` : ""}
+      ${quotaBadge(p)}
       ${reachBadge(p)}
     </div>
     <div class="diag-sub muted">${esc(p.conn || "")} · ${esc(p.baseURL || "—")}${typeof p.ms === "number" ? ` · ${p.ms} мс` : ""}</div>`;

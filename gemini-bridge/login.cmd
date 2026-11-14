@@ -36,7 +36,10 @@ echo Waiting for sign-in...
 :wait_login
 timeout /t 5 /nobreak >nul
 curl.exe -s -m 10 --noproxy "*" -X POST http://127.0.0.1:8010/auth/refresh > "%TEMP%\bridge_auth.json" 2>nul
-findstr /c:"\"ok\":true" "%TEMP%\bridge_auth.json" >nul 2>&1
+rem Success means a full session, not just \"the CDP browser answers\":
+rem /auth/refresh returns ok:true even for a guest session that can only use
+rem flash-lite, and this loop used to stop right there without a real sign-in.
+findstr /c:"\"degraded\":false" "%TEMP%\bridge_auth.json" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo   not signed in yet - waiting...
     goto wait_login

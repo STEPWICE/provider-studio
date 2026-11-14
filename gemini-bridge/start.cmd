@@ -25,4 +25,12 @@ echo.
 rem Absolute path on purpose: stop.cmd identifies our process by looking for
 rem "gemini-bridge" in its command line, and a bare "server.py" hides that.
 .venv\Scripts\python.exe "%~dp0server.py"
-pause
+set EXITCODE=%ERRORLEVEL%
+
+rem No "pause" here on purpose. A failed start used to leave a cmd.exe sitting
+rem on pause forever, and fifteen of them had accumulated by the end of a day.
+echo.
+echo [bridge] process exited with code %EXITCODE%
+echo [bridge] last log lines:
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -Path '%~dp0logs\bridge.log' -Tail 25 -ErrorAction SilentlyContinue"
+exit /b %EXITCODE%

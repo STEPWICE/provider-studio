@@ -3,6 +3,34 @@ import json
 from pathlib import Path
 import urllib.request
 
+
+def _pid_alive(pid) -> bool:
+    """True when the daemon PID from the hub file is still running.
+
+    The hub files stay on disk after a crash, and the newest one was three days
+    old while Antigravity was not running. Trusting it turned every quota call
+    into a connection attempt to a dead port.
+    """
+    if not pid:
+        return False
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return False
+        try:
+            code = ctypes.wintypes.DWORD()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return bool(ok) and code.value == STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
 def get_antigravity_daemon_info():
     daemon_dir = Path.home() / ".gemini" / "antigravity" / "daemon"
     if not daemon_dir.exists():
@@ -14,6 +42,8 @@ def get_antigravity_daemon_info():
     newest = max(hub_files, key=lambda f: f.stat().st_mtime)
     try:
         data = json.loads(newest.read_text(encoding="utf-8"))
+        if not _pid_alive(data.get("pid")):
+            return None
         return {
             "httpPort": data.get("httpPort"),
             "httpsPort": data.get("httpsPort"),

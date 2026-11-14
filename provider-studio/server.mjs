@@ -1776,7 +1776,10 @@ const server = http.createServer(async (req, res) => {
         if (base && (base.includes("8010") || key.includes("gemini"))) {
           try {
             const quotaUrl = base.replace(/\/v1\/?$/, "") + "/v1/quota";
-            const qResp = await fetch(quotaUrl, { signal: AbortSignal.timeout(1500) });
+            // The bridge answers from a 30 s cache, but a cold miss still costs
+            // one Google round trip. 1.5 s was shorter than that, so the badge
+            // never appeared.
+            const qResp = await fetch(quotaUrl, { signal: AbortSignal.timeout(5000) });
             if (qResp.ok) quota = await qResp.json();
           } catch (_) {}
         }
