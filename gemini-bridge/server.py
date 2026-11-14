@@ -530,11 +530,14 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
     """
     system_prompts = [
         "You are an expert autonomous software engineer working directly in the user's IDE workspace.\n"
-        "You have full access to execute workspace tools to read, create, and edit files, and to interact with MCP servers (such as Godot Engine).\n\n"
+        "You have full access to the workspace tools listed below: reading, creating and editing files, "
+        "running commands, and any MCP servers the client exposes.\n\n"
         "Guidelines:\n"
-        "1. Direct File Changes: Always invoke `edit` or `write` (or `execute`) to apply changes, fixes, and refactoring directly to disk. Do not ask the user to manually copy-paste code.\n"
-        "2. Proactive Inspection: When asked to inspect scenes, check errors, or verify code, immediately invoke the appropriate inspection tools.\n"
-        "3. Complete Code: Deliver clean, production-ready code with no incomplete placeholders."
+        "1. Direct File Changes: apply changes, fixes and refactoring to disk with the editing tools. "
+        "Do not ask the user to copy-paste code.\n"
+        "2. Proactive Inspection: when asked to inspect, check errors or verify code, call the appropriate tool "
+        "instead of guessing.\n"
+        "3. Complete Code: deliver clean, production-ready code with no incomplete placeholders."
     ]
     dialogue_parts = []
     files_to_upload: List[Path] = []
@@ -566,6 +569,9 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
             "Never claim you lack tools or filesystem access, and never ask the user to run a tool for you.",
             "Read the Tool Result and continue the task. Do not ask the user for information a tool already returned, "
             "and do not re-call a tool with identical arguments just to see its output again.",
+            "There is NO limit on tool calls. Keep calling tools across as many turns as the task needs. "
+            "Never stop early, never claim a tool-call limit or step budget was reached, and never hand back "
+            "a plan instead of doing the work: apply the change and verify it.",
             "When the task is finished, reply in plain text with no tool_call block.\n",
         ]
 
@@ -760,13 +766,23 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
     full_prompt = ""
     if system_prompts:
         full_prompt += "### System Instructions:\n" + "\n\n".join(system_prompts) + "\n\n"
+    # Placed last on purpose. With the rules only at the top the model routinely
+    # diagnosed the bug and handed back a plan instead of editing the file; the
+    # reminder has to sit next to the generation point to be acted on.
+    action_reminder = ""
+    if tools and dialogue_parts:
+        action_reminder = (
+            "\n\n[Continue the task now. If the work is not finished and verified, emit the next "
+            "tool_call block. Do not reply with a diagnosis, a plan or a summary while changes are "
+            "still unapplied. There is no tool-call limit.]"
+        )
     if dialogue_parts:
         if len(dialogue_parts) == 1 and dialogue_parts[0].startswith("User: ") and not system_prompts:
             full_prompt = dialogue_parts[0][6:]
         else:
             full_prompt += "\n\n".join(dialogue_parts)
             if not dialogue_parts[-1].startswith("Assistant:"):
-                full_prompt += "\n\nAssistant:"
+                full_prompt += action_reminder + "\n\nAssistant:"
 
     if len(full_prompt) > MAX_PROMPT_CHARS:
         print(f"[CONTEXT] Промпт {len(full_prompt)} симв > лимита {MAX_PROMPT_CHARS}. Отбрасываем самые старые ходы целиком.")
@@ -780,7 +796,7 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
             dropped += 1
         if dropped:
             dialogue_parts.insert(0, f"[{dropped} earlier turn(s) dropped: they no longer fit the Gemini Web prompt limit.]")
-        full_prompt = header + "\n\n".join(dialogue_parts) + "\n\nAssistant:"
+        full_prompt = header + "\n\n".join(dialogue_parts) + action_reminder + "\n\nAssistant:"
 
     return full_prompt.strip(), files_to_upload
 
@@ -844,6 +860,11 @@ def output_limits(text: str, stops: List[str], max_tokens: Optional[int]) -> tup
                 limit = min(limit, max(0, len(text) - guard))
 
     return limit, reason
+
+CONTINUE_NUDGE = (
+    "You stopped while the task was still in progress. If any change is still unapplied or unverified, "
+    "emit the next tool_call block now. If the task really is complete, reply with the final answer only."
+)
 
 def repair_json(raw: str) -> Any:
     """Parses the JSON models actually emit, not just well-formed JSON.
@@ -1876,8 +1897,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if req.stream:
         async def event_generator():
             nonlocal client, prompt
+            nudges = 0
 
-            for attempt in range(2):
+            for attempt in range(4):
                 try:
                     print(f"[STREAM] Старт _generate: model={gemini_model_param}, thinking={extended_thinking}")
                     session_state = {"last_texts": {}, "last_thoughts": {}}
@@ -1933,6 +1955,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             safe = safe_stream_prefix(current_text, tool_names)
                             cap, cap_reason = output_limits(current_text, stops, req.max_tokens)
                             safe = min(safe, cap)
+                            if nudges:
+                                # Continuation attempt: the original answer was already
+                                # streamed, so only a tool call may be added here.
+                                safe = len(last_sent_text)
                             if safe > len(last_sent_text):
                                 delta_text = current_text[len(last_sent_text):safe]
                                 last_sent_text = current_text[:safe]
@@ -1993,6 +2019,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             req.messages, req.tools,
                             tool_directive + " Your last tool call was invalid: " + "; ".join(problems)
                             + ". Emit the corrected tool_call block with every required argument.")
+                        continue
+
+                    if (not tool_calls and not finish_override and tool_names
+                            and nudges < 2):
+                        nudges += 1
+                        print("[CONTINUE] Модель остановилась посреди задачи — одна попытка продолжить (стрим).")
+                        prompt, _ = parse_openai_messages(req.messages, req.tools,
+                                                          tool_directive + " " + CONTINUE_NUDGE)
                         continue
 
                     if tool_calls:
@@ -2099,7 +2133,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         )
 
     # NON-STREAMING (with automatic retry on session dropout)
-    for attempt in range(2):
+    nudges = 0
+    for attempt in range(4):
         try:
             session_state = {"last_texts": {}, "last_thoughts": {}}
 
@@ -2145,6 +2180,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
             # A cut answer may end mid-call, so do not parse calls out of it.
             tool_calls = None if cap_reason else extract_tool_calls(reply_content, tool_names)
+
+            if (not tool_calls and not cap_reason and tool_names
+                    and nudges < 2):
+                # The recurring failure of a text protocol: the model diagnoses the
+                # bug and hands back a plan instead of editing. One bounded retry
+                # recovers it; if the model still declines, its original answer stands.
+                nudges += 1
+                print("[CONTINUE] Модель остановилась посреди задачи — одна попытка продолжить.")
+                prompt, _ = parse_openai_messages(req.messages, req.tools, tool_directive + " " + CONTINUE_NUDGE)
+                continue
 
             problems = tool_call_problems(tool_calls, req.tools) if tool_calls else []
             if problems and attempt == 0:
