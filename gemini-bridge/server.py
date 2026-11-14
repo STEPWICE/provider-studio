@@ -204,6 +204,13 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
                 client_instance = new_client
                 return client_instance
             except Exception as e:
+                if is_rate_limited(e):
+                    # Retrying a 429 immediately is what keeps the session limited.
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Google ограничил сессию (429). Подождите несколько минут и не перезапускайте "
+                               "мост подряд: каждый старт заново запрашивает токен доступа.",
+                    )
                 print(f"[WARN] Сбой авторизации (попытка {attempt+1}/3): {e}")
                 if attempt < 2:
                     if await refresh_cookies_from_browser():
@@ -215,6 +222,10 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
                         status_code=status.HTTP_502_BAD_GATEWAY,
                         detail=f"Не удалось подключиться к Google Gemini Web: {e}",
                     )
+
+def is_rate_limited(err: Exception) -> bool:
+    m = str(err).lower()
+    return "429" in m or "too many requests" in m
 
 def is_auth_or_session_error(err: Exception) -> bool:
     """Checks whether an exception is related to session expiration, network drop, or auth token rotation."""
@@ -229,8 +240,10 @@ def is_auth_or_session_error(err: Exception) -> bool:
 
 async def cookie_persistence_loop():
     """Keeps .env in sync with the Google-rotated tokens of the live client."""
+    ticks = 0
     while True:
         await asyncio.sleep(30)
+        ticks += 1
         try:
             if client_instance and client_instance._running:
                 live = {c.name: c.value for c in client_instance.cookies.jar
@@ -244,6 +257,17 @@ async def cookie_persistence_loop():
                 if changed:
                     print("[INFO] Google обновил сессионные куки. Сохраняем в .env...")
                     update_env_file(psid=psid, psidts=psidts)
+                if ticks % 10 == 0:
+                    # The registry is filled once at init. If Google answered a
+                    # 429 then, it stays partial and every request silently runs
+                    # on flash-lite until a restart — which risks another 429.
+                    # This refetch reuses the session and needs no new token.
+                    before = {m.model_name for m in (client_instance.list_models() or [])}
+                    if len(before) < 3:
+                        await client_instance._fetch_user_status()
+                        after = {m.model_name for m in (client_instance.list_models() or [])}
+                        if after != before:
+                            print(f"[MODELS] Список моделей аккаунта обновился: {sorted(after)}")
         except Exception as e:
             print(f"[WARN] Цикл обновления сессии: {e}")
 
@@ -991,8 +1015,27 @@ async def list_models():
         {"id": "gemini-flash-lite", "name": "Gemini Flash Lite (Быстрые ответы)"},
     ]
 
+    live = set()
+    if client_instance is not None and client_instance._running:
+        try:
+            live = {m.model_name for m in (client_instance.list_models() or [])}
+        except Exception:
+            live = set()
+
+    def served_by(mid: str) -> str:
+        if "orchestrator" in mid:
+            return "gemini-4-hydrogen"
+        if "flash" in mid or "lite" in mid:
+            return "gemini-flash-lite"
+        if "carbon" in mid:
+            return "gemini-carbon"
+        if "pro" in mid:
+            return "gemini-pro"
+        return "gemini-4-hydrogen"
+
     return {
         "object": "list",
+        "account_models": sorted(live),
         "data": [
             {
                 "id": m["id"],
@@ -1002,6 +1045,10 @@ async def list_models():
                 "permission": [],
                 "root": m["id"],
                 "parent": None,
+                # When Google returns a partial registry the bridge falls back to
+                # a weaker model. Say so here instead of letting the caller think
+                # it is talking to Carbon.
+                "available": (not live) or served_by(m["id"]) in live,
             }
             for m in models_list
         ],
@@ -1596,7 +1643,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 "id": completion_id,
                 "object": "chat.completion",
                 "created": created_time,
-                "model": req.model,
+                "model": resp_model,
                 "choices": [{
                     "index": 0,
                     "message": {"role": "assistant", "content": title},
@@ -1605,6 +1652,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
             }
 
+    resp_model = req.model
     model_id = req.model.lower().strip()
     effort = (req.reasoning_effort or "").lower().strip()
     extended_thinking = True
@@ -1642,6 +1690,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     print(f"[ROUTE] {req.model} -> {gemini_model_param}, thinking={extended_thinking}")
     gemini_model_param = resolve_available_model(client, gemini_model_param)
+    resp_model = gemini_model_param
 
     # Upload files / images / videos / audios with retry
     file_data = None
@@ -1718,7 +1767,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                     "id": completion_id,
                                     "object": "chat.completion.chunk",
                                     "created": created_time,
-                                    "model": req.model,
+                                    "model": resp_model,
                                     "choices": [
                                         {
                                             "index": 0,
@@ -1747,7 +1796,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                                     "id": completion_id,
                                     "object": "chat.completion.chunk",
                                     "created": created_time,
-                                    "model": req.model,
+                                    "model": resp_model,
                                     "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
                                 }
                                 yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
@@ -1763,7 +1812,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             "id": completion_id,
                             "object": "chat.completion.chunk",
                             "created": created_time,
-                            "model": req.model,
+                            "model": resp_model,
                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_override}],
                             "usage": {
                                 "prompt_tokens": estimate_tokens(prompt),
@@ -1797,7 +1846,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             "id": completion_id,
                             "object": "chat.completion.chunk",
                             "created": created_time,
-                            "model": req.model,
+                            "model": resp_model,
                             "choices": [
                                 {
                                     "index": 0,
@@ -1847,7 +1896,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created_time,
-                        "model": req.model,
+                        "model": resp_model,
                         "choices": [
                             {
                                 "index": 0,
@@ -1972,7 +2021,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 "id": completion_id,
                 "object": "chat.completion",
                 "created": created_time,
-                "model": req.model,
+                "model": resp_model,
                 "choices": [
                     {
                         "index": 0,
@@ -1985,10 +2034,19 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     "completion_tokens": estimate_tokens(reply_content),
                     "total_tokens": estimate_tokens(prompt) + estimate_tokens(reply_content),
                 },
+                "bridge": {
+                    "requested_model": req.model,
+                    "actual_model": gemini_model_param,
+                    "fallback": resp_model != req.model,
+                    "thinking": extended_thinking,
+                },
             }
         except HTTPException:
             raise
         except Exception as e:
+            if is_rate_limited(e):
+                raise HTTPException(status_code=429,
+                                    detail="Google ограничил сессию (429). Подождите несколько минут.")
             if attempt == 0 and is_auth_or_session_error(e):
                 print(f"[WARN] Сбой сессии ({e}). Выполняем авто-восстановление сессии...")
                 try:
@@ -2121,7 +2179,7 @@ async def responses_endpoint(req: ResponsesRequest, request: Request):
             return f"event: {kind}\ndata: {json.dumps(body, ensure_ascii=False)}\n\n"
 
         base = {"id": resp_id, "object": "response", "created_at": created,
-                "status": "in_progress", "model": req.model, "output": [], "error": None}
+                "status": "in_progress", "model": resp_model, "output": [], "error": None}
         yield emit("response.created", {"response": base})
 
         async for raw in result.body_iterator:
