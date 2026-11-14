@@ -1,6 +1,9 @@
 # Live Google session cookies — never commit
 .env
 
+# Cached Code Assist OAuth access token
+.codeassist-token.json
+
 # Bridge-owned Chrome profile (contains a signed-in Google session)
 .chrome-profile/
 
