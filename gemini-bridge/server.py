@@ -131,6 +131,11 @@ PORT = int(os.getenv("PORT", "8010"))
 HOST = os.getenv("HOST", "127.0.0.1")
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "700000"))
 AGENT_THINKING = os.getenv("AGENT_THINKING", "1") == "1"
+# Google flags the direct IP after enough session bootstraps and answers 429 on
+# every init, which looks exactly like dead cookies. Going through the same
+# proxy the rest of the machine uses avoids the flag entirely.
+GEMINI_PROXY = (os.getenv("GEMINI_PROXY") or os.getenv("HTTPS_PROXY")
+                or os.getenv("https_proxy") or None)
 
 client_instance: Optional[GeminiClient] = None
 client_lock = asyncio.Lock()
@@ -191,7 +196,7 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
         for attempt in range(3):
             try:
                 print(f"[INFO] Авторизация GeminiClient в сессии Google (попытка {attempt+1}/3)...")
-                new_client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts)
+                new_client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts, proxy=GEMINI_PROXY)
                 await new_client.init(timeout=300, watchdog_timeout=120, auto_refresh=True, refresh_interval=600)
                 if getattr(new_client, "account_status", None) is not None:
                     from gemini_webapi.constants import AccountStatus
@@ -1824,7 +1829,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         extended_thinking = False if explicit_think_override is None else explicit_think_override
 
     print(f"[ROUTE] {req.model} -> {gemini_model_param}, thinking={extended_thinking}")
+    routed_model = gemini_model_param
     gemini_model_param = resolve_available_model(client, gemini_model_param)
+    # The orchestrator is a router: landing on hydrogen is its job, not a
+    # downgrade. Only an unavailable concrete model counts as a fallback.
+    model_fallback = gemini_model_param != routed_model
     resp_model = gemini_model_param
 
     # Upload files / images / videos / audios with retry
@@ -2192,7 +2201,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 "bridge": {
                     "requested_model": req.model,
                     "actual_model": gemini_model_param,
-                    "fallback": resp_model != req.model,
+                    "fallback": model_fallback,
                     "thinking": extended_thinking,
                 },
             }
