@@ -53,13 +53,14 @@ class AppPageClassification(unittest.TestCase):
 
 
 class CookieAdoption(unittest.TestCase):
-    def run_refresh(self, identity, harvested):
+    def run_refresh(self, identity, harvested, reloaded=None, probe=None):
         stored = {}
         ns = definitions({"refresh_cookies_from_browser"}, dict(
             asyncio=asyncio, os=os, time=time, Optional=Optional,
             browser_debug_alive=lambda: True,
             harvest_cookies=lambda: harvested,
-            probe_session=lambda *a, **k: identity,
+            refresh_profile_cookies=lambda: (harvested if reloaded is None else reloaded),
+            probe_session=probe or (lambda *a, **k: identity),
             update_env_file=lambda psid=None, psidts=None: stored.update(psid=psid, psidts=psidts),
             reopen_saved_profile=lambda: True,
             bridge_state={}, GEMINI_PROXY=None,
@@ -98,6 +99,38 @@ class CookieAdoption(unittest.TestCase):
             {"__Secure-1PSID": "maybe-psid"})
         self.assertTrue(adopted)
         self.assertEqual(stored["psid"], "maybe-psid")
+
+    def test_stale_equal_pair_is_refreshed_via_page_reload(self):
+        # The closed profile holds the same stale pair as .env; reloading the app
+        # page yields a fresh signed-in pair, which must be adopted.
+        adopted, stored, _ = self.run_refresh(
+            {"authenticated": True, "account": "d@e.com", "reason": "account_marker"},
+            {"__Secure-1PSID": "old-psid", "__Secure-1PSIDTS": "old-psidts"},
+            reloaded={"__Secure-1PSID": "old-psid", "__Secure-1PSIDTS": "fresh-psidts"})
+        self.assertTrue(adopted)
+        self.assertEqual(stored["psidts"], "fresh-psidts")
+
+    def test_equal_pair_with_no_refresh_is_refused(self):
+        adopted, stored, _ = self.run_refresh(
+            {"authenticated": True},
+            {"__Secure-1PSID": "old-psid", "__Secure-1PSIDTS": "old-psidts"})
+        self.assertFalse(adopted)
+        self.assertEqual(stored, {})
+
+    def test_guest_jar_is_reloaded_and_reprobed(self):
+        # The harvested pair differs from .env but probes guest; a page reload
+        # yields a fresh pair that probes signed-in.
+        def probe(psid, psidts="", proxy=None):
+            if psid == "good-psid":
+                return {"authenticated": True, "account": "d@e.com", "reason": "account_marker"}
+            return {"authenticated": False, "reason": "guest_session"}
+        adopted, stored, _ = self.run_refresh(
+            {"authenticated": False, "reason": "guest_session"},
+            {"__Secure-1PSID": "guest-psid", "__Secure-1PSIDTS": "guest-psidts"},
+            reloaded={"__Secure-1PSID": "good-psid", "__Secure-1PSIDTS": "good-psidts"},
+            probe=probe)
+        self.assertTrue(adopted)
+        self.assertEqual(stored["psid"], "good-psid")
 
 
 class SuppressionUnlock(unittest.TestCase):

@@ -8,6 +8,7 @@ we launch ourselves exposes the same cookies over CDP instead.
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -116,6 +117,54 @@ def harvest_cookies() -> Dict[str, str]:
     except Exception as e:
         print(f"[CDP] Не удалось прочитать куки из браузера моста: {e}")
         return {}
+
+
+def navigate_app_page() -> bool:
+    """Point a bridge-Chrome tab at the app so Google re-sets the session cookies."""
+    try:
+        targets = cffi_requests.get(f"{CDP_BASE}/json", timeout=5).json()
+        page = next((t for t in targets if t.get("type") == "page"
+                     and "gemini.google.com" in (t.get("url") or "")), None)
+        if page is None:
+            page = next((t for t in targets if t.get("type") == "page"), None)
+        ws_url = (page or {}).get("webSocketDebuggerUrl")
+        if not ws_url:
+            return False
+        session = cffi_requests.Session()
+        ws = session.ws_connect(ws_url, timeout=15)
+        try:
+            ws.send_json({"id": 1, "method": "Page.navigate", "params": {"url": GEMINI_APP_URL}})
+            time.sleep(1)
+            return True
+        finally:
+            ws.close()
+            session.close()
+    except Exception as e:
+        print(f"[CDP] Не удалось открыть страницу приложения в профиле: {e}")
+        return False
+
+
+def refresh_profile_cookies(timeout_seconds: float = 25.0) -> Dict[str, str]:
+    """Reload the app page and wait for the cookie pair to actually change.
+
+    CDP answers seconds before the page finishes loading, so a harvest right
+    after reopen returns the stale pair the profile held while it was closed.
+    Navigating forces Google to re-set __Secure-1PSIDTS; polling until the pair
+    differs avoids adopting the stale one.
+    """
+    before = harvest_cookies()
+    if not navigate_app_page():
+        return before
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        time.sleep(2)
+        now = harvest_cookies()
+        if now.get("__Secure-1PSID") and (
+            now.get("__Secure-1PSID") != before.get("__Secure-1PSID")
+            or now.get("__Secure-1PSIDTS") != before.get("__Secure-1PSIDTS")
+        ):
+            return now
+    return harvest_cookies()
 
 
 def reopen_saved_profile() -> bool:

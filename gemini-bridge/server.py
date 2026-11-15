@@ -81,9 +81,9 @@ print = log
 
 from antigravity_sync import fetch_antigravity_live_quota
 from browser_session import (harvest_cookies, browser_debug_alive, reopen_saved_profile,
-                             probe_session)
+                             probe_session, refresh_profile_cookies)
 from model_routing import ModelSelectionError, model_catalog, select_model, selectable_models
-from generation_runtime import generate_once
+from generation_runtime import generate_once, GenerationDeadlineExceeded
 from gemini_webapi.utils import rotate_1psidts
 
 from fastapi import FastAPI, Request, HTTPException, status
@@ -291,16 +291,39 @@ async def refresh_cookies_from_browser() -> bool:
     harvested pair is now identified before it is allowed to overwrite anything.
     """
     if not await asyncio.to_thread(browser_debug_alive):
+        print("[CDP] Браузер моста не отвечает на CDP — куки не обновлены.")
         return False
     cookies = await asyncio.to_thread(harvest_cookies)
     psid = cookies.get("__Secure-1PSID")
     if not psid:
+        print("[CDP] В профиле браузера нет __Secure-1PSID — вход не выполнен.")
         return False
     psidts = cookies.get("__Secure-1PSIDTS")
-    if psid == os.getenv("GEMINI_SECURE_1PSID") and psidts == os.getenv("GEMINI_SECURE_1PSIDTS"):
-        return False
+    env_psid = os.getenv("GEMINI_SECURE_1PSID")
+    env_psidts = os.getenv("GEMINI_SECURE_1PSIDTS")
+    reloaded = False
+    if psid == env_psid and psidts == env_psidts:
+        # A profile that stayed closed holds the same stale pair as .env: the
+        # bridge kept rotating while the browser jar was frozen. Reload the app
+        # page so Google re-sets the cookies, and wait for the pair to change.
+        cookies = await asyncio.to_thread(refresh_profile_cookies)
+        reloaded = True
+        psid = cookies.get("__Secure-1PSID") or psid
+        psidts = cookies.get("__Secure-1PSIDTS") or psidts
+        if psid == env_psid and psidts == env_psidts:
+            print("[CDP] Профиль хранит ту же пару, что и .env; перезагрузка страницы не дала новых куки.")
+            return False
 
     identity = await asyncio.to_thread(probe_session, psid, psidts or "", GEMINI_PROXY)
+    if identity.get("authenticated") is False and identity.get("reason") != "captcha" and not reloaded:
+        # The jar may still be stale even when the pair differs from .env. Force
+        # one page load and re-probe before declaring the profile signed out.
+        cookies = await asyncio.to_thread(refresh_profile_cookies)
+        new_psid = cookies.get("__Secure-1PSID")
+        new_psidts = cookies.get("__Secure-1PSIDTS")
+        if new_psid and (new_psid != psid or new_psidts != psidts):
+            psid, psidts = new_psid, new_psidts
+            identity = await asyncio.to_thread(probe_session, psid, psidts or "", GEMINI_PROXY)
     bridge_state["session_identity"] = {**identity, "at": time.time(), "source": "browser"}
     if identity.get("authenticated") is False:
         reason = identity.get("reason")
@@ -407,6 +430,7 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
         # registry returned right after it was never retried on another node.
         switched_for_429 = False
         switched_for_registry = False
+        tried_browser_recovery = False
         max_attempts = 4
 
         # Attempt initialization with retry
@@ -427,6 +451,7 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
                 if attempt == 0 and getattr(getattr(new_client, "account_status", None), "name", None) == "UNAUTHENTICATED":
                     # A saved profile may hold fresher rotated cookies than .env.
                     # Reopen only our profile; never automate a login or purchase.
+                    tried_browser_recovery = True
                     await asyncio.to_thread(reopen_saved_profile)
                     if await refresh_cookies_from_browser():
                         await new_client.close()
@@ -445,6 +470,17 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
                         usable = [m.model_name for m in selectable_models(new_client.list_models() or [])]
                     if len(usable) < 3:
                         if identity.get("authenticated") is False and identity.get("reason") != "captcha":
+                            # The .env pair can go guest while the bridge profile
+                            # stays signed in. Try the profile once (with a page
+                            # reload) before asking the owner to run login.cmd.
+                            if not tried_browser_recovery:
+                                tried_browser_recovery = True
+                                await asyncio.to_thread(reopen_saved_profile)
+                                if await refresh_cookies_from_browser():
+                                    await new_client.close()
+                                    psid = os.getenv("GEMINI_SECURE_1PSID") or psid
+                                    psidts = os.getenv("GEMINI_SECURE_1PSIDTS") or psidts
+                                    continue
                             # A signed-out session is guest level on every exit, so
                             # switching nodes cannot help and only spends probes.
                             print("[SESSION] Сессия Google гостевая (аккаунт не залогинен). "
@@ -2997,6 +3033,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         print(f"[WARN] Сетевой сбой во время стрима ({stream_err}). Повтор без переавторизации.")
                         await asyncio.sleep(1)
                         continue
+                    elif attempt == 0 and isinstance(stream_err, GenerationDeadlineExceeded):
+                        # Google accepted the prompt and went silent (one empty
+                        # chunk, then nothing). Nothing reached the client, so one
+                        # fresh attempt is safe; after visible output the partial
+                        # branch above already refuses to restart.
+                        print("[RETRY] Google замолчал до первого вывода — повтор без переавторизации.")
+                        await asyncio.sleep(1)
+                        continue
 
                     bridge_state["last_error"] = str(stream_err)
 
@@ -3186,6 +3230,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     pass
             elif attempt == 0 and is_transient_network_error(e):
                 print(f"[WARN] Сетевой сбой ({e}). Повтор без переавторизации.")
+                await asyncio.sleep(1)
+                continue
+            elif attempt == 0 and isinstance(e, GenerationDeadlineExceeded):
+                print("[RETRY] Google замолчал до первого вывода (non-stream) — повтор без переавторизации.")
                 await asyncio.sleep(1)
                 continue
             bridge_state["last_error"] = str(e)
