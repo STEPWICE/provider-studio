@@ -9,6 +9,11 @@ import os
 from contextlib import aclosing
 
 IDLE_SECONDS = float(os.getenv("STREAM_IDLE_SECONDS", "90"))
+# The idle guard above is what catches a hung Google stream. The total deadline
+# only bounds a generation that keeps dribbling chunks forever; set too low it
+# cut healthy long Hydrogen High answers mid-stream, and after visible output the
+# bridge refuses to retry, so the user got a truncated reply. Keep it generous.
+DEFAULT_DEADLINE_SECONDS = float(os.getenv("GENERATION_DEADLINE_SECONDS", "300"))
 
 
 class GenerationDeadlineExceeded(RuntimeError):
@@ -19,7 +24,7 @@ class GenerationStalled(GenerationDeadlineExceeded):
     pass
 
 
-async def generate_once(client, *, deadline_seconds=120, idle_seconds=IDLE_SECONDS, **kwargs):
+async def generate_once(client, *, deadline_seconds=DEFAULT_DEADLINE_SECONDS, idle_seconds=IDLE_SECONDS, **kwargs):
     try:
         async with asyncio.timeout(deadline_seconds):
             # Installed gemini-webapi 2.1.1 @running wrapper otherwise retries

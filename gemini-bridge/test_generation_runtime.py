@@ -1,8 +1,10 @@
 import asyncio
 import unittest
+from contextlib import aclosing
 
 from gemini_webapi.exceptions import APIError
 from gemini_webapi.utils.decorators import running
+import generation_runtime
 from generation_runtime import generate_once, GenerationDeadlineExceeded, GenerationStalled
 
 
@@ -96,6 +98,45 @@ class GenerationRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stall_is_a_deadline_so_existing_handlers_still_apply(self):
         self.assertTrue(issubclass(GenerationStalled, GenerationDeadlineExceeded))
+
+    async def test_aclosing_break_closes_upstream_promptly(self):
+        # The server wraps its consumers in aclosing so a client disconnect or a
+        # stop/max_tokens break closes Google's generator at once, instead of
+        # leaving it running (and spending quota) until garbage collection.
+        # A plain upstream isolates generate_once's own cleanup contract; the
+        # library's @running wrapper propagates aclose lazily, which is why the
+        # decorated FakeClient is used only for cancel/exhaustion cases above.
+        closed = {"value": False}
+
+        class PlainClient:
+            _running = True
+
+            async def _generate(self, **kwargs):
+                try:
+                    yield "first"
+                    yield "second"
+                finally:
+                    closed["value"] = True
+
+        async with aclosing(generate_once(PlainClient(), deadline_seconds=30, idle_seconds=0.5)) as gen:
+            async for _ in gen:
+                break
+        self.assertTrue(closed["value"])
+
+    async def test_silence_is_cut_by_idle_under_the_generous_default_deadline(self):
+        # With the default deadline raised, a silent stream must still be cut by
+        # the idle guard rather than hanging for the whole total deadline.
+        client = FakeClient("stall")
+        with self.assertRaises(GenerationStalled):
+            async for _ in generate_once(client, idle_seconds=0.05):
+                pass
+        self.assertTrue(client.generator_closed)
+        self.assertEqual(client.calls, 1)
+
+    def test_default_deadline_is_generous_and_above_the_idle_guard(self):
+        # A 120s total deadline cut healthy long Hydrogen High answers mid-stream.
+        self.assertGreaterEqual(generation_runtime.DEFAULT_DEADLINE_SECONDS, 240)
+        self.assertLess(generation_runtime.IDLE_SECONDS, generation_runtime.DEFAULT_DEADLINE_SECONDS)
 
 
 if __name__ == "__main__":

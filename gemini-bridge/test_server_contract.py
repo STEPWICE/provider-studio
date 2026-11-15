@@ -65,6 +65,25 @@ class EndpointContracts(unittest.TestCase):
             verify = next(kw.value for kw in call.keywords if kw.arg == "verify")
             self.assertTrue(isinstance(verify, ast.Constant) and verify.value is True)
 
+    def test_generation_consumers_close_upstream_deterministically(self):
+        # Both the streaming and non-streaming consumers must wrap generate_once
+        # in aclosing, so a disconnect or a stop/max_tokens break closes Google's
+        # generator immediately instead of leaking it until garbage collection.
+        func = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "chat_completions")
+        gen_calls = [node for node in ast.walk(func) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "generate_once"]
+        self.assertEqual(len(gen_calls), 2)
+        wrapped = set()
+        for node in ast.walk(func):
+            if isinstance(node, ast.AsyncWith):
+                for item in node.items:
+                    ce = item.context_expr
+                    if isinstance(ce, ast.Call) and isinstance(ce.func, ast.Name) and ce.func.id == "aclosing" and ce.args:
+                        wrapped.add(id(ce.args[0]))
+        for call in gen_calls:
+            self.assertIn(id(call), wrapped)
+        imports = [node for node in TREE.body if isinstance(node, ast.ImportFrom) and node.module == "contextlib"]
+        self.assertTrue(any(alias.name == "aclosing" for node in imports for alias in node.names))
+
 
 if __name__ == "__main__":
     unittest.main()

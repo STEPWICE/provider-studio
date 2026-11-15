@@ -31,7 +31,7 @@ import ctypes.wintypes
 import threading
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Union
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, aclosing
 
 # --------------------------------------------------------------- logging
 # start-hidden.vbs runs the bridge without a console, so every print() used to
@@ -2782,6 +2782,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         async def event_generator():
             nonlocal client, prompt
             nudges = 0
+            # A forced-tool turn must be atomic: either a tool call or an error,
+            # never streamed prose. Buffering it keeps last_sent_text empty, so a
+            # mid-stream Google hiccup stays retryable instead of becoming an
+            # unrecoverable partial-stream error after prose already leaked.
+            buffer_forced = bool(forced_tool or req.tool_choice == "required")
 
             for attempt in range(4):
                 try:
@@ -2793,73 +2798,74 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     finish_override = None
 
                     chunk_count = 0
-                    async for chunk in generate_once(client,
+                    async with aclosing(generate_once(client,
                         prompt=prompt or "Please analyze the attached inputs.",
                         req_file_data=file_data,
                         model=gemini_model_param,
                         temporary=True,
                         extended_thinking=extended_thinking,
                         session_state=session_state,
-                    ):
-                        chunk_count += 1
-                        if await request.is_disconnected():
-                            print("[STREAM] Клиент отключился — прерываем генерацию Google.")
-                            return
-                        if chunk_count % 5 == 1:
-                            print(f"[STREAM] Chunk #{chunk_count} принят от Google (len={len(getattr(chunk, 'text', '') or '')})")
-                        # 1. Reasoning (thoughts) delta
-                        if hasattr(chunk, "thoughts") and chunk.thoughts:
-                            current_thought = chunk.thoughts
-                            if len(current_thought) > len(last_sent_thought):
-                                delta_thought = current_thought[len(last_sent_thought):]
-                                last_sent_thought = current_thought
-                                event_data = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": resp_model,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {
-                                                "reasoning_content": delta_thought,
-                                                "reasoning": delta_thought,
-                                            },
-                                            "finish_reason": None,
-                                        }
-                                    ],
-                                }
-                                yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+                    )) as upstream:
+                        async for chunk in upstream:
+                            chunk_count += 1
+                            if await request.is_disconnected():
+                                print("[STREAM] Клиент отключился — прерываем генерацию Google.")
+                                return
+                            if chunk_count % 5 == 1:
+                                print(f"[STREAM] Chunk #{chunk_count} принят от Google (len={len(getattr(chunk, 'text', '') or '')})")
+                            # 1. Reasoning (thoughts) delta
+                            if not buffer_forced and hasattr(chunk, "thoughts") and chunk.thoughts:
+                                current_thought = chunk.thoughts
+                                if len(current_thought) > len(last_sent_thought):
+                                    delta_thought = current_thought[len(last_sent_thought):]
+                                    last_sent_thought = current_thought
+                                    event_data = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created_time,
+                                        "model": resp_model,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {
+                                                    "reasoning_content": delta_thought,
+                                                    "reasoning": delta_thought,
+                                                },
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                    yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
 
-                        # 2. Text content delta (real-time for chat, buffered & intercepted for tool agent turns)
-                        if hasattr(chunk, "text") and chunk.text:
-                            current_text = chunk.text
-                            collected_full_text = current_text
+                            # 2. Text content delta (real-time for chat, buffered & intercepted for tool agent turns)
+                            if hasattr(chunk, "text") and chunk.text:
+                                current_text = chunk.text
+                                collected_full_text = current_text
 
-                            safe = safe_stream_prefix(current_text, tool_names)
-                            cap, cap_reason = output_limits(current_text, stops, req.max_tokens)
-                            safe = min(safe, cap)
-                            if nudges:
-                                # Continuation attempt: the original answer was already
-                                # streamed, so only a tool call may be added here.
-                                safe = len(last_sent_text)
-                            if safe > len(last_sent_text):
-                                delta_text = current_text[len(last_sent_text):safe]
-                                last_sent_text = current_text[:safe]
-                                event_data = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": resp_model,
-                                    "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
-                                }
-                                yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
-                            if cap_reason:
-                                # stop / max_tokens reached: end upstream generation too,
-                                # so the rest of the answer is not paid for.
-                                finish_override = cap_reason
-                                collected_full_text = current_text[:safe]
-                                break
+                                safe = safe_stream_prefix(current_text, tool_names)
+                                cap, cap_reason = output_limits(current_text, stops, req.max_tokens)
+                                safe = min(safe, cap)
+                                if nudges:
+                                    # Continuation attempt: the original answer was already
+                                    # streamed, so only a tool call may be added here.
+                                    safe = len(last_sent_text)
+                                if not buffer_forced and safe > len(last_sent_text):
+                                    delta_text = current_text[len(last_sent_text):safe]
+                                    last_sent_text = current_text[:safe]
+                                    event_data = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created_time,
+                                        "model": resp_model,
+                                        "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
+                                    }
+                                    yield f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+                                if cap_reason:
+                                    # stop / max_tokens reached: end upstream generation too,
+                                    # so the rest of the answer is not paid for.
+                                    finish_override = cap_reason
+                                    collected_full_text = current_text[:safe]
+                                    break
 
                     if finish_override:
                         final_event = {
@@ -3082,19 +3088,20 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
             async def collect_reply():
                 last = None
-                async for ch in generate_once(client,
+                async with aclosing(generate_once(client,
                     prompt=prompt or "Please analyze the attached inputs.",
                     req_file_data=file_data,
                     model=gemini_model_param,
                     temporary=True,
                     extended_thinking=extended_thinking,
                     session_state=session_state,
-                ):
-                    last = ch
-                    text_so_far = getattr(ch, "text", "") or ""
-                    _, why = output_limits(text_so_far, stops, req.max_tokens)
-                    if why:
-                        break
+                )) as upstream:
+                    async for ch in upstream:
+                        last = ch
+                        text_so_far = getattr(ch, "text", "") or ""
+                        _, why = output_limits(text_so_far, stops, req.max_tokens)
+                        if why:
+                            break
                 return last
 
             bridge_state["inflight"] += 1
