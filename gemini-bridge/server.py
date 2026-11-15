@@ -80,7 +80,10 @@ def log(*args, **kwargs):
 print = log
 
 from antigravity_sync import fetch_antigravity_live_quota
-from browser_session import harvest_cookies, browser_debug_alive
+from browser_session import (harvest_cookies, browser_debug_alive, reopen_saved_profile,
+                             probe_session)
+from model_routing import ModelSelectionError, model_catalog, select_model, selectable_models
+from generation_runtime import generate_once
 from gemini_webapi.utils import rotate_1psidts
 
 from fastapi import FastAPI, Request, HTTPException, status
@@ -109,6 +112,7 @@ except ImportError:
 UPLOAD_CACHE_DIR = Path(tempfile.gettempdir()) / "gemini_bridge_uploads"
 UPLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 last_cache_cleanup_time = 0.0
+MAX_REMOTE_MEDIA_BYTES = 32 * 1024 * 1024
 
 def cleanup_old_upload_cache(max_age_seconds: int = 7200):
     """Purge temporary uploads older than 2 hours."""
@@ -128,6 +132,8 @@ def cleanup_old_upload_cache(max_age_seconds: int = 7200):
         pass
 
 # Load .env if present
+SESSION_ENV_KEYS = {"GEMINI_SECURE_1PSID", "GEMINI_SECURE_1PSIDTS"}
+
 def load_env_file():
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
@@ -138,15 +144,26 @@ def load_env_file():
                     k, v = line.split("=", 1)
                     k = k.strip()
                     v = v.strip().strip("'\"")
-                    os.environ.setdefault(k, v)
+                    if k in SESSION_ENV_KEYS:
+                        # setdefault kept the first value forever, so a session
+                        # refreshed on disk by login.cmd never reached the bridge.
+                        os.environ[k] = v
+                    else:
+                        os.environ.setdefault(k, v)
 
 def update_env_file(psid: Optional[str] = None, psidts: Optional[str] = None):
-    """Updates .env on disk with the freshest tokens without touching other variables."""
+    """Updates .env on disk with the freshest tokens without touching other variables.
+
+    Written through a temporary file: a crash mid-write used to truncate the only
+    copy of the session. The previous values are kept in .env.previous so a bad
+    adoption can be undone without signing in again.
+    """
     env_path = Path(__file__).parent / ".env"
     if not env_path.exists():
         return
     try:
-        lines = env_path.read_text(encoding="utf-8").splitlines()
+        original = env_path.read_text(encoding="utf-8")
+        lines = original.splitlines()
         new_lines = []
         has_psid = False
         has_psidts = False
@@ -163,7 +180,16 @@ def update_env_file(psid: Optional[str] = None, psidts: Optional[str] = None):
             new_lines.append(f"GEMINI_SECURE_1PSID={psid}")
         if not has_psidts and psidts:
             new_lines.append(f"GEMINI_SECURE_1PSIDTS={psidts}")
-        env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        updated = "\n".join(new_lines) + "\n"
+        if updated == original:
+            return
+        tmp = env_path.parent / ".env.tmp"
+        tmp.write_text(updated, encoding="utf-8")
+        try:
+            (env_path.parent / ".env.previous").write_text(original, encoding="utf-8")
+        except OSError:
+            pass
+        tmp.replace(env_path)
         if psid:
             os.environ["GEMINI_SECURE_1PSID"] = psid
         if psidts:
@@ -184,6 +210,46 @@ AGENT_THINKING = os.getenv("AGENT_THINKING", "1") == "1"
 GEMINI_PROXY = (os.getenv("GEMINI_PROXY") or os.getenv("HTTPS_PROXY")
                 or os.getenv("https_proxy") or None)
 
+# The pool can replace GEMINI_PROXY at runtime, so the value from .env is kept
+# separately as the fallback used when v2rayN is closed or no exit passes.
+PROXY_FALLBACK = GEMINI_PROXY
+VPN_ENABLED = os.getenv("VPN_AUTOSWITCH", "1") == "1"
+VPN_PROBE_INTERVAL = max(300, int(os.getenv("VPN_PROBE_INTERVAL", "1800")))
+
+try:
+    from vpn_pool import VpnPool
+
+    vpn_pool: Optional[VpnPool] = VpnPool(
+        base_dir=Path(__file__).parent,
+        log=print,
+        v2rayn_home=os.getenv("V2RAYN_HOME") or None,
+        size=int(os.getenv("VPN_POOL_SIZE", "10")),
+        probe_timeout=float(os.getenv("VPN_PROBE_TIMEOUT", "12")),
+        prefer_countries=os.getenv("VPN_PREFER_COUNTRIES",
+                                   "SE,FI,CH,FR,PL,DE,NL,GB,CA,US"),
+    )
+    _saved_vpn = vpn_pool.load_state()
+    vpn_pool.preferred_index = int(os.getenv("VPN_PROFILE_INDEX")
+                                   or _saved_vpn.get("index_id") or 0) or None
+except Exception as _vpn_import_error:  # the bridge must boot without the pool
+    VpnPool = None  # type: ignore[assignment]
+    vpn_pool = None
+    _saved_vpn = {}
+    print(f"[VPN] Пул узлов недоступен: {_vpn_import_error}")
+
+vpn_state: Dict[str, Any] = {
+    "source": "env" if PROXY_FALLBACK else "none",
+    "winner": None,
+    "last_probe_at": None,
+    "last_probe_reason": None,
+    "last_error": None if vpn_pool else "vpn_pool не загружен",
+    "probe_results": [],
+    "switches": 0,
+}
+vpn_lock = asyncio.Lock()
+_vpn_recovery_task: Optional[asyncio.Task] = None
+
+
 client_instance: Optional[GeminiClient] = None
 client_lock = asyncio.Lock()
 
@@ -199,11 +265,17 @@ bridge_state: Dict[str, Any] = {
     "last_auth_error": None,
     "last_quota_at": None,
     "last_quota_source": None,
+    "session_identity": None,
+    "registry_recovery": None,
 }
 
 # Requests currently generating on the shared client. A forced re-auth closes
 # the client, which kills every stream using it, so it must wait for them.
 bridge_state["inflight"] = 0
+
+# Set when the exit node changed: the live client still holds connections to
+# the old proxy, so the next request must rebuild it on the new one.
+bridge_state["vpn_dirty"] = False
 
 # Last "does this session really generate?" probe, shared by login.cmd polling.
 _auth_probe: Dict[str, Any] = {"at": 0.0, "ok": None, "error": None}
@@ -211,7 +283,12 @@ _auth_probe: Dict[str, Any] = {"at": 0.0, "ok": None, "error": None}
 async def refresh_cookies_from_browser() -> bool:
     """Pulls the Google session cookies from the bridge-owned Chrome and stores them.
 
-    Returns True when a new __Secure-1PSID was obtained.
+    Returns True when a new, signed-in __Secure-1PSID was obtained.
+
+    A signed-out Chrome profile still holds cookies, and they still generate on
+    flash-lite. Adopting them unconditionally replaced a working AI Pro session
+    with a guest one, which looked like "Google throttled us" for hours. The
+    harvested pair is now identified before it is allowed to overwrite anything.
     """
     if not await asyncio.to_thread(browser_debug_alive):
         return False
@@ -222,7 +299,21 @@ async def refresh_cookies_from_browser() -> bool:
     psidts = cookies.get("__Secure-1PSIDTS")
     if psid == os.getenv("GEMINI_SECURE_1PSID") and psidts == os.getenv("GEMINI_SECURE_1PSIDTS"):
         return False
-    print("[CDP] Получена свежая сессия Google из браузера моста.")
+
+    identity = await asyncio.to_thread(probe_session, psid, psidts or "", GEMINI_PROXY)
+    bridge_state["session_identity"] = {**identity, "at": time.time(), "source": "browser"}
+    if identity.get("authenticated") is False:
+        reason = identity.get("reason")
+        if reason == "captcha":
+            print("[CDP] Google показал CAPTCHA для этого выхода. Куки не приняты: "
+                  "смените узел (POST /admin/vpn?action=switch) или пройдите проверку в браузере моста.")
+        else:
+            print("[CDP] Браузер моста не залогинен (гостевая сессия). Куки НЕ приняты, "
+                  "чтобы не потерять рабочую сессию. Запустите login.cmd и войдите в аккаунт.")
+        return False
+
+    print("[CDP] Получена свежая сессия Google из браузера моста."
+          + (f" Аккаунт: {identity['account']}" if identity.get("account") else ""))
     await asyncio.to_thread(update_env_file, psid, psidts)
     return True
 
@@ -239,11 +330,40 @@ async def _retire_client(old_client) -> None:
         pass
 
 
+def unlock_verified_models(client) -> int:
+    """Clears the library's guest suppression once the account is really known.
+
+    gemini_webapi marks every model but the first unavailable whenever the status
+    RPC answers UNAUTHENTICATED, and that RPC is not authoritative. The app page
+    carries the signed-in account marker; when it does, the suppression is a false
+    negative that hides the whole Pro catalogue behind a working session.
+    """
+    identity = bridge_state.get("session_identity") or {}
+    if identity.get("authenticated") is not True:
+        return 0
+    unlocked = 0
+    for model in (client.list_models() or []):
+        if not getattr(model, "is_available", True):
+            model.is_available = True
+            unlocked += 1
+    return unlocked
+
+
 async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
     global client_instance
     async with client_lock:
         if not force_refresh and client_instance is not None and client_instance._running:
-            return client_instance
+            pool_gone = bool(
+                VPN_ENABLED and vpn_pool is not None
+                and vpn_state.get("source") == "pool"
+                and (not vpn_pool.is_running()
+                     or GEMINI_PROXY != (vpn_state.get("winner") or {}).get("proxy"))
+            )
+            if not bridge_state.get("vpn_dirty") and not pool_gone:
+                return client_instance
+            # The exit changed under the live client: its sockets still point at
+            # the old local port, so it must be rebuilt on the new one.
+            force_refresh = True
 
         # Dynamically reload .env to allow live cookie updates without restarting server
         load_env_file()
@@ -279,11 +399,21 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
                 except Exception:
                     pass
 
+        # Pick the exit before building the client. On a warm bridge this is a
+        # no-op; on startup it starts the private Xray pool and probes nodes.
+        proxy = await ensure_proxy(reason="client-init")
+        # Two independent reasons to move exit, each with its own budget. One
+        # shared flag meant a 429 switch consumed the only attempt, so a guest
+        # registry returned right after it was never retried on another node.
+        switched_for_429 = False
+        switched_for_registry = False
+        max_attempts = 4
+
         # Attempt initialization with retry
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             try:
-                print(f"[INFO] Авторизация GeminiClient в сессии Google (попытка {attempt+1}/3)...")
-                new_client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts, proxy=GEMINI_PROXY)
+                print(f"[INFO] Авторизация GeminiClient в сессии Google (попытка {attempt+1}/{max_attempts})...")
+                new_client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts, proxy=proxy)
                 await new_client.init(timeout=300, watchdog_timeout=120, auto_refresh=True, refresh_interval=600)
                 if getattr(new_client, "account_status", None) is not None:
                     from gemini_webapi.constants import AccountStatus
@@ -294,18 +424,70 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
                         # warning only: a genuinely dead session fails on generate.
                         print(f"[WARN] Статус аккаунта: {new_client.account_status.name}. "
                               "Это не приговор — проверяем генерацией.")
+                if attempt == 0 and getattr(getattr(new_client, "account_status", None), "name", None) == "UNAUTHENTICATED":
+                    # A saved profile may hold fresher rotated cookies than .env.
+                    # Reopen only our profile; never automate a login or purchase.
+                    await asyncio.to_thread(reopen_saved_profile)
+                    if await refresh_cookies_from_browser():
+                        await new_client.close()
+                        psid = os.getenv("GEMINI_SECURE_1PSID") or psid
+                        psidts = os.getenv("GEMINI_SECURE_1PSIDTS") or psidts
+                        continue
                 models = [m.model_name for m in (new_client.list_models() or [])]
+                usable = [m.model_name for m in selectable_models(new_client.list_models() or [])]
+                if len(usable) < 3:
+                    identity = await asyncio.to_thread(probe_session, psid, psidts or "", proxy)
+                    bridge_state["session_identity"] = {**identity, "at": time.time(), "source": "init"}
+                    restored = unlock_verified_models(new_client)
+                    if restored:
+                        print(f"[SESSION] Сессия подтверждена аккаунтом {identity.get('account')}: "
+                              f"снята ложная блокировка {restored} моделей (status-RPC соврал).")
+                        usable = [m.model_name for m in selectable_models(new_client.list_models() or [])]
+                    if len(usable) < 3:
+                        if identity.get("authenticated") is False and identity.get("reason") != "captcha":
+                            # A signed-out session is guest level on every exit, so
+                            # switching nodes cannot help and only spends probes.
+                            print("[SESSION] Сессия Google гостевая (аккаунт не залогинен). "
+                                  "Pro-модели недоступны ни на одном узле — запустите login.cmd.")
+                        elif not switched_for_registry:
+                            # A partial registry can also mean this exit was throttled.
+                            # Another exit usually restores the Pro models.
+                            current_exit = (vpn_state.get("winner") or {}).get("exit_ip")
+                            new_proxy = await ensure_proxy(
+                                switch=True, avoid_exit_ip=current_exit, reason="degraded-models")
+                            if new_proxy and new_proxy != proxy:
+                                await new_client.close()
+                                proxy = new_proxy
+                                switched_for_registry = True
+                                print("[VPN] Реестр моделей урезан — пробую другой выход.")
+                                continue
                 bridge_state["last_auth_refresh_at"] = time.time()
                 bridge_state["last_auth_error"] = None
                 print(f"[SUCCESS] GeminiClient успешно авторизован в gemini.google.com! "
-                      f"Модели аккаунта: {models or ['<пусто>']}")
-                if len(models) < 3:
-                    print("[WARN] Список моделей урезан (гостевой уровень). Аккаунт не отдаёт Pro-модели: "
-                          "проверьте 1PSIDTS и IP — Google отвечает так на 429 и на протухшую куку.")
+                      f"Модели аккаунта: {usable or models or ['<пусто>']}")
+                if len(usable) < 3:
+                    reason = (bridge_state.get("session_identity") or {}).get("reason")
+                    advice = {
+                        "guest_session": "аккаунт не залогинен — запустите login.cmd и войдите в окне Chrome моста.",
+                        "captcha": "Google требует CAPTCHA для этого выхода — смените узел или пройдите проверку в браузере моста.",
+                    }.get(reason, "проверьте 1PSIDTS и IP — Google отвечает так на 429 и на протухшую куку.")
+                    print(f"[WARN] Список моделей урезан (гостевой уровень): {advice}")
+                bridge_state["vpn_dirty"] = False
                 client_instance = new_client
                 return client_instance
             except Exception as e:
                 bridge_state["last_auth_error"] = str(e)
+                if is_rate_limited(e) and not switched_for_429:
+                    # A 429 is tied to the exit IP, not the account. Move to a
+                    # different exit and retry before telling the caller to wait.
+                    switched_for_429 = True
+                    current_exit = (vpn_state.get("winner") or {}).get("exit_ip")
+                    new_proxy = await ensure_proxy(
+                        switch=True, avoid_exit_ip=current_exit, reason="init-429")
+                    if new_proxy and new_proxy != proxy:
+                        proxy = new_proxy
+                        print("[VPN] 429 на авторизации — переключаю выход и пробую снова.")
+                        continue
                 if is_rate_limited(e):
                     # Retrying a 429 immediately is what keeps the session limited.
                     raise HTTPException(
@@ -313,8 +495,8 @@ async def get_gemini_client(force_refresh: bool = False) -> GeminiClient:
                         detail="Google ограничил сессию (429). Подождите несколько минут и не перезапускайте "
                                "мост подряд: каждый старт заново запрашивает токен доступа.",
                     )
-                print(f"[WARN] Сбой авторизации (попытка {attempt+1}/3): {e}")
-                if attempt < 2:
+                print(f"[WARN] Сбой авторизации (попытка {attempt+1}/{max_attempts}): {e}")
+                if attempt < max_attempts - 1:
                     if await refresh_cookies_from_browser():
                         psid = os.getenv("GEMINI_SECURE_1PSID") or psid
                         psidts = os.getenv("GEMINI_SECURE_1PSIDTS") or psidts
@@ -356,6 +538,201 @@ def is_transient_network_error(err: Exception) -> bool:
     ]
     return any(p in msg for p in patterns)
 
+
+# ------------------------------------------------------------- proxy pool
+def _probe_cookies() -> Dict[str, str]:
+    """Cookies for the lightweight Gemini page check (no token rotation)."""
+    load_env_file()
+    psid = (os.getenv("GEMINI_SECURE_1PSID") or os.getenv("__Secure_1PSID")
+            or os.getenv("SECURE_1PSID") or "")
+    psidts = (os.getenv("GEMINI_SECURE_1PSIDTS") or os.getenv("__Secure_1PSIDTS")
+              or os.getenv("SECURE_1PSIDTS") or "")
+    if not psid:
+        return {}
+    return {"__Secure-1PSID": psid, "__Secure-1PSIDTS": psidts}
+
+
+def vpn_public_state() -> Dict[str, Any]:
+    """Sanitized pool status: no node UUIDs, passwords or config paths."""
+    return {
+        "enabled": bool(VPN_ENABLED and vpn_pool),
+        "source": vpn_state["source"],
+        "current_proxy": GEMINI_PROXY,
+        "fallback_proxy": PROXY_FALLBACK,
+        "winner": vpn_state.get("winner"),
+        "last_probe_at": vpn_state.get("last_probe_at"),
+        "last_probe_reason": vpn_state.get("last_probe_reason"),
+        "last_error": vpn_state.get("last_error"),
+        "switches": vpn_state.get("switches", 0),
+        "probe_results": vpn_state.get("probe_results", []),
+        "pool": vpn_pool.public_state() if vpn_pool else {"available": False},
+    }
+
+
+async def ensure_proxy(reprobe: bool = False, switch: bool = False,
+                       avoid_exit_ip: Optional[str] = None,
+                       reason: str = "") -> Optional[str]:
+    """Returns the proxy the next Gemini client must use.
+
+    The first call starts the private Xray pool and probes every candidate.
+    Later calls reuse the winner unless `reprobe` asks for fresh numbers or
+    `switch` asks for a different exit (429 / degraded model registry).
+    """
+    global GEMINI_PROXY
+
+    if not VPN_ENABLED or vpn_pool is None:
+        return GEMINI_PROXY
+
+    async with vpn_lock:
+        current = vpn_state.get("winner") or {}
+        if (not reprobe and not switch and vpn_state["source"] == "pool"
+                and current.get("port") and vpn_pool.is_running()):
+            return GEMINI_PROXY
+
+        started = await asyncio.to_thread(vpn_pool.ensure_started)
+        if not started:
+            vpn_state["last_error"] = vpn_pool.last_error or "Xray не запустился"
+            vpn_state["last_probe_at"] = time.time()
+            if vpn_state["source"] == "pool":
+                GEMINI_PROXY = PROXY_FALLBACK
+                vpn_state["source"] = "env" if PROXY_FALLBACK else "none"
+                vpn_state["winner"] = None
+                bridge_state["vpn_dirty"] = True
+                print("[VPN] Пул остановлен — возвращаюсь на GEMINI_PROXY из .env.")
+            return GEMINI_PROXY
+
+        cookies = _probe_cookies()
+        print(f"[VPN] Проверяю {len(vpn_pool.ports)} узлов ({reason or 'probe'})...")
+        results = await vpn_pool.probe(cookies)
+        working = [r for r in results if r["ok"]]
+        results.sort(key=lambda r: (not r["ok"], r["latency_ms"] or 10**9))
+        vpn_state["last_probe_at"] = time.time()
+        vpn_state["last_probe_reason"] = reason or "probe"
+        vpn_state["probe_results"] = [
+            {
+                "label": r["label"], "country": r["country"], "port": r["port"],
+                "ok": r["ok"], "status": r["status"], "body_bytes": r["body_bytes"],
+                "latency_ms": r["latency_ms"], "exit_ip": r["exit_ip"],
+                "error": r["error"], "signed_in": r.get("signed_in"),
+            }
+            for r in results[:12]
+        ]
+
+        if not working:
+            vpn_state["last_error"] = "Ни один узел не прошёл проверку gemini.google.com"
+            if current.get("port") and vpn_pool.is_running():
+                # A transient probe failure must not tear down a session that
+                # is still generating through the current exit.
+                print("[VPN] Проба не удалась, но текущий узел жив — оставляю его.")
+                return GEMINI_PROXY
+            GEMINI_PROXY = PROXY_FALLBACK
+            vpn_state["source"] = "env" if PROXY_FALLBACK else "none"
+            vpn_state["winner"] = None
+            bridge_state["vpn_dirty"] = True
+            print("[VPN] Живых узлов нет — возвращаюсь на GEMINI_PROXY из .env.")
+            return GEMINI_PROXY
+
+        vpn_state["last_error"] = None
+
+        def best(rows):
+            # An exit where the account is guest level is reachable but useless
+            # for Pro models, so it loses to any exit that keeps the session.
+            return min(rows, key=lambda r: (r.get("signed_in") is False,
+                                            r["latency_ms"] or 10**9))
+
+        if switch:
+            candidates = [r for r in working if r["port"] != current.get("port")]
+            if avoid_exit_ip:
+                different_exit = [r for r in candidates if r.get("exit_ip") != avoid_exit_ip]
+                candidates = different_exit or candidates
+            candidates = candidates or working
+            winner = best(candidates)
+        elif current.get("port"):
+            winner = next((r for r in working if r["port"] == current["port"]), None)
+            if winner is None:
+                winner = best(working)
+        else:
+            winner = best(working)
+
+        old_proxy = GEMINI_PROXY
+        winner_state = {
+            "index_id": winner["index_id"],
+            "port": winner["port"],
+            "proxy": winner["proxy"],
+            "label": winner["label"],
+            "country": winner["country"],
+            "exit_ip": winner["exit_ip"],
+            "latency_ms": winner["latency_ms"],
+            "selected_at": time.time(),
+        }
+        vpn_state["winner"] = winner_state
+        vpn_state["source"] = "pool"
+        GEMINI_PROXY = winner["proxy"]
+
+        if old_proxy != GEMINI_PROXY:
+            vpn_state["switches"] = vpn_state.get("switches", 0) + 1
+            bridge_state["vpn_dirty"] = True
+            print(f"[VPN] Google идёт через {winner['label']} "
+                  f"({winner['country'] or '??'}), exit {winner['exit_ip'] or '?'}, "
+                  f"{winner['latency_ms']} мс.")
+        else:
+            print(f"[VPN] Оставляю {winner['label']} — {winner['latency_ms']} мс.")
+
+        vpn_pool.save_state({
+            "index_id": winner["index_id"],
+            "label": winner["label"],
+            "country": winner["country"],
+            "exit_ip": winner["exit_ip"],
+            "latency_ms": winner["latency_ms"],
+            "at": time.time(),
+        })
+        return GEMINI_PROXY
+
+
+def schedule_vpn_recovery(reason: str) -> None:
+    """Moves the bridge to another exit after a 429 without blocking the reply."""
+    global _vpn_recovery_task
+
+    if not VPN_ENABLED or vpn_pool is None:
+        return
+    if _vpn_recovery_task is not None and not _vpn_recovery_task.done():
+        return
+
+    async def runner() -> None:
+        try:
+            await asyncio.sleep(2)
+            current_exit = (vpn_state.get("winner") or {}).get("exit_ip")
+            proxy = await ensure_proxy(switch=True, avoid_exit_ip=current_exit,
+                                       reason=reason)
+            if proxy:
+                bridge_state["vpn_dirty"] = True
+                print("[VPN] Восстановление после 429 завершено; следующий запрос "
+                      "переинициализирует сессию через другой выход.")
+        except Exception as exc:  # noqa: BLE001 - background best effort
+            print(f"[VPN] Фоновое переключение не удалось: {exc}")
+
+    _vpn_recovery_task = asyncio.create_task(runner())
+
+
+async def vpn_maintenance_loop() -> None:
+    while True:
+        await asyncio.sleep(VPN_PROBE_INTERVAL)
+        try:
+            await ensure_proxy(reprobe=True, reason="interval")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[VPN] Плановая проверка узлов: {exc}")
+
+
+async def vpn_bootstrap() -> None:
+    """Selects an exit before the first Gemini client is built."""
+    if VPN_ENABLED and vpn_pool is not None:
+        try:
+            await ensure_proxy(reason="startup")
+        except Exception as exc:  # noqa: BLE001 - warmup still runs on fallback
+            print(f"[VPN] Стартовый выбор узла не удался: {exc}")
+    await warmup()
+
+
 async def cookie_persistence_loop():
     """Keeps .env in sync with the Google-rotated tokens of the live client."""
     ticks = 0
@@ -380,13 +757,14 @@ async def cookie_persistence_loop():
                     # 429 then, it stays partial and every request silently runs
                     # on flash-lite until a restart — which risks another 429.
                     # This refetch reuses the session and needs no new token.
-                    before = {m.model_name for m in (client_instance.list_models() or [])}
+                    before = {m.model_name for m in selectable_models(client_instance.list_models() or [])}
                     if len(before) < 3:
                         try:
                             await client_instance._fetch_user_status()
                         except Exception as refetch_err:
                             print(f"[MODELS] Переспрос реестра не удался: {refetch_err}")
-                        after = {m.model_name for m in (client_instance.list_models() or [])}
+                        unlock_verified_models(client_instance)
+                        after = {m.model_name for m in selectable_models(client_instance.list_models() or [])}
                         bridge_state["last_models_refresh_at"] = time.time()
                         if after != before:
                             print(f"[MODELS] Список моделей аккаунта обновился: {sorted(after)}")
@@ -429,6 +807,69 @@ async def cookie_persistence_loop():
         except Exception as e:
             print(f"[WARN] Цикл обновления сессии: {e}")
 
+REGISTRY_RECOVERY_MAX_ATTEMPTS = 4
+
+async def registry_recovery_loop():
+    """Restores a throttled model registry without a restart and without hammering.
+
+    A partial registry used to persist until the process was restarted. This waits
+    with a growing delay, moves exit once per attempt, never touches a session with
+    a request in flight, and stops asking after a few failures — a signed-out
+    account is not recoverable by retrying, and every retry costs a bootstrap token.
+    """
+    delay = 300.0
+    attempts = 0
+    next_at = time.time() + delay
+    while True:
+        await asyncio.sleep(30)
+        try:
+            if client_instance is None or not client_instance._running:
+                continue
+            usable = selectable_models(client_instance.list_models() or [])
+            if len(usable) >= 3:
+                if attempts:
+                    print("[RECOVERY] Реестр моделей восстановлен.")
+                attempts, delay = 0, 300.0
+                next_at = time.time() + delay
+                bridge_state["registry_recovery"] = {"attempts": 0, "last_result": "healthy"}
+                continue
+
+            identity = bridge_state.get("session_identity") or {}
+            if identity.get("authenticated") is False and identity.get("reason") != "captcha":
+                bridge_state["registry_recovery"] = {"attempts": attempts, "last_result": "signed_out"}
+                continue
+            if attempts >= REGISTRY_RECOVERY_MAX_ATTEMPTS:
+                bridge_state["registry_recovery"] = {"attempts": attempts, "last_result": "gave_up"}
+                continue
+            if bridge_state["inflight"] > 0 or time.time() < next_at:
+                continue
+
+            attempts += 1
+            print(f"[RECOVERY] Реестр урезан — попытка {attempts}/{REGISTRY_RECOVERY_MAX_ATTEMPTS} "
+                  "через другой выход.")
+            current_exit = (vpn_state.get("winner") or {}).get("exit_ip")
+            await ensure_proxy(switch=True, avoid_exit_ip=current_exit, reason="registry-recovery")
+            try:
+                client = await get_gemini_client(force_refresh=True)
+                unlock_verified_models(client)
+                restored = len(selectable_models(client.list_models() or []))
+            except Exception as exc:  # noqa: BLE001 - background best effort
+                print(f"[RECOVERY] Попытка не удалась: {exc}")
+                restored = 0
+            if restored >= 3:
+                attempts, delay = 0, 300.0
+                bridge_state["registry_recovery"] = {"attempts": 0, "last_result": "recovered"}
+            else:
+                delay = min(delay * 2, 1800.0)
+                bridge_state["registry_recovery"] = {
+                    "attempts": attempts, "last_result": "still_partial",
+                    "next_attempt_in_seconds": int(delay),
+                }
+            next_at = time.time() + delay
+        except Exception as exc:  # noqa: BLE001 - the loop must survive anything
+            print(f"[RECOVERY] Цикл восстановления: {exc}")
+
+
 async def warmup():
     try:
         cleanup_old_upload_cache(0)
@@ -444,12 +885,25 @@ async def lifespan(app: FastAPI):
     # until Google finished the bootstrap (init timeout is 5 minutes). A slow
     # bootstrap then looked like "the bridge is not running". The first request
     # still waits on the same lock, so nothing is duplicated.
-    asyncio.create_task(warmup())
+    # vpn_bootstrap picks an exit before warmup builds the Gemini client.
+    asyncio.create_task(vpn_bootstrap())
     asyncio.create_task(cookie_persistence_loop())
+    recovery_task = asyncio.create_task(registry_recovery_loop())
+    maintenance_task = None
+    if VPN_ENABLED and vpn_pool is not None:
+        maintenance_task = asyncio.create_task(vpn_maintenance_loop())
     print(f"[BOOT] Мост запущен на http://{HOST}:{PORT} · proxy={GEMINI_PROXY or 'нет'} · лог={LOG_PATH}")
     yield
     # Shutdown
     global client_instance
+    recovery_task.cancel()
+    if maintenance_task is not None:
+        maintenance_task.cancel()
+    if vpn_pool is not None:
+        try:
+            await asyncio.to_thread(vpn_pool.stop)
+        except Exception:
+            pass
     if client_instance:
         try:
             await client_instance.close()
@@ -515,24 +969,11 @@ def orchestrator_route(messages: List[ChatMessage], tools: Optional[List[Any]], 
     return "gemini-4-hydrogen", AGENT_THINKING
 
 def resolve_available_model(client, wanted: str) -> str:
-    """Falls back to a model the account actually lists right now.
-
-    Google sometimes returns a partial registry (only flash-lite) while the
-    session still generates. Hard-failing on "Unknown model name" turned that
-    into an outage, so pick the closest available model instead and say so.
-    """
+    """Resolve same-model aliases; explicit selections never change family."""
     try:
-        available = [m.model_name for m in (client.list_models() or [])]
-    except Exception:
-        return wanted
-    if not available or wanted in available:
-        return wanted
-    for cand in ("gemini-4-hydrogen", "gemini-pro", "gemini-carbon", "gemini-flash-lite"):
-        if cand in available:
-            print(f"[FALLBACK] Модели {wanted} нет в списке аккаунта {available}. Берём {cand}.")
-            return cand
-    print(f"[FALLBACK] Модели {wanted} нет в списке аккаунта {available}. Берём {available[0]}.")
-    return available[0]
+        return select_model(client.list_models() or [], wanted).model
+    except ModelSelectionError as exc:
+        raise HTTPException(status_code=503, detail={"code": exc.code, "message": str(exc)}) from exc
 
 def detect_file_extension(raw_bytes: bytes, mime_type: str = "", filename: str = "") -> str:
     """Inspects filename, magic bytes, and MIME type to ensure exact file extensions for Google Vision/Files/Video/Audio."""
@@ -666,14 +1107,21 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
     """
     system_prompts = [
         "You are an expert autonomous software engineer working directly in the user's IDE workspace.\n"
-        "You have full access to the workspace tools listed below: reading, creating and editing files, "
-        "running commands, and any MCP servers the client exposes.\n\n"
-        "Guidelines:\n"
-        "1. Direct File Changes: apply changes, fixes and refactoring to disk with the editing tools. "
-        "Do not ask the user to copy-paste code.\n"
-        "2. Proactive Inspection: when asked to inspect, check errors or verify code, call the appropriate tool "
-        "instead of guessing.\n"
-        "3. Complete Code: deliver clean, production-ready code with no incomplete placeholders."
+        + (
+            "You have full access to the workspace tools listed below: reading, creating and editing files, "
+            "running commands, and any MCP servers the client exposes.\n\n"
+            "Guidelines:\n"
+            "1. Direct File Changes: apply changes, fixes and refactoring to disk with the editing tools. "
+            "Do not ask the user to copy-paste code.\n"
+            "2. Proactive Inspection: when asked to inspect, check errors or verify code, call the appropriate tool "
+            "instead of guessing.\n"
+            "3. Complete Code: deliver clean, production-ready code with no incomplete placeholders."
+            if tools else
+            "This turn is a plain conversation: answer in text.\n\n"
+            "Guidelines:\n"
+            "1. Answer the question directly and completely, with production-ready code when code is asked for.\n"
+            "2. Base the answer on the conversation and the files already shown, not on guesses."
+        )
     ]
     dialogue_parts = []
     files_to_upload: List[Path] = []
@@ -697,12 +1145,10 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
             "```\n",
             "The tools listed above ARE available right now. They are executed by the client on your behalf: "
             "you emit a tool_call block, the client runs it and returns the next turn as 'Tool Result (<name>): ...'. "
-            "Never claim you lack tools or filesystem access, and never ask the user to run a tool for you.",
-            "Read the Tool Result and continue the task. Do not ask the user for information a tool already returned, "
-            "and do not re-call a tool with identical arguments just to see its output again.",
-            "There is NO limit on tool calls. Keep calling tools across as many turns as the task needs. "
-            "Never stop early, never claim a tool-call limit or step budget was reached, and never hand back "
-            "a plan instead of doing the work: apply the change and verify it.",
+            "Tool access stays enabled for the whole session, so keep calling tools across as many turns "
+            "as the task needs.",
+            "Read the Tool Result and continue the task. Apply the change with the editing tools, then "
+            "verify it with a read or a command. The work is finished when the change is on disk and checked.",
             "When the task is finished, reply in plain text with no tool_call block.\n",
         ]
 
@@ -754,6 +1200,16 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
         system_prompts.append(tool_directive)
 
     processed_messages = messages
+
+    # OpenCode sends tool results with a tool_call_id and no name. Rendering that
+    # id as the tool name told the model nothing about which call answered, so a
+    # turn with several calls could not be followed at all.
+    call_names: Dict[str, str] = {}
+    for m in processed_messages:
+        for tc in (m.tool_calls or []):
+            if isinstance(tc, dict) and tc.get("id"):
+                fn = tc.get("function") or {}
+                call_names[tc["id"]] = fn.get("name") or tc.get("name") or ""
 
     for m_idx, m in enumerate(processed_messages):
         text = ""
@@ -851,7 +1307,11 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
                                 try:
                                     req_dl = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                                     with urllib.request.urlopen(req_dl, timeout=15) as resp:
-                                        raw_bytes = resp.read()
+                                        raw_bytes = resp.read(MAX_REMOTE_MEDIA_BYTES + 1)
+                                    if len(raw_bytes) > MAX_REMOTE_MEDIA_BYTES:
+                                        print(f"[WARN] Медиафайл по URL больше {MAX_REMOTE_MEDIA_BYTES} байт, пропущен: {url}")
+                                        raw_bytes = None
+                                    else:
                                         mime = resp.headers.get_content_type() or ""
                                 except Exception as dl_err:
                                     print(f"[WARN] Ошибка скачивания медиафайла по URL {url}: {dl_err}")
@@ -882,11 +1342,15 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
                     tc_name = tc_fn.get("name") or (tc.get("name") if isinstance(tc, dict) else "")
                     tc_args = tc_fn.get("arguments") or (tc.get("arguments") if isinstance(tc, dict) else {})
                     args_val = tc_args if isinstance(tc_args, str) else json.dumps(tc_args, ensure_ascii=False)
-                    parts.append(f"```tool_call\n{{\"name\": \"{tc_name}\", \"arguments\": {args_val}}}\n```")
+                    tc_id = tc.get("id") if isinstance(tc, dict) else None
+                    call_tag = f" [call: {tc_id}]" if tc_id else ""
+                    parts.append(f"```tool_call\n{{\"name\": {json.dumps(tc_name)}, \"arguments\": {args_val}}}\n```{call_tag}")
             dialogue_parts.append(f"Assistant: {' '.join(parts)}")
         elif m.role in ("tool", "function"):
-            tool_name = m.name or m.tool_call_id or "tool"
-            dialogue_parts.append(f"Tool Result ({tool_name}): {text}")
+            call_id = m.tool_call_id or ""
+            tool_name = m.name or call_names.get(call_id) or call_id or "tool"
+            call_tag = f", call: {call_id}" if call_id else ""
+            dialogue_parts.append(f"Tool Result ({tool_name}{call_tag}): {text}")
         else:
             dialogue_parts.append(f"{m.role.capitalize()}: {text}")
 
@@ -899,9 +1363,8 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
     action_reminder = ""
     if tools and dialogue_parts:
         action_reminder = (
-            "\n\n[Continue the task now. If the work is not finished and verified, emit the next "
-            "tool_call block. Do not reply with a diagnosis, a plan or a summary while changes are "
-            "still unapplied. There is no tool-call limit.]"
+            "\n\n[Tools are enabled. Continue the task now: emit the next tool_call block, apply the "
+            "change and verify it. Reply in plain text only once the work is complete and checked.]"
         )
     if dialogue_parts:
         if len(dialogue_parts) == 1 and dialogue_parts[0].startswith("User: ") and not system_prompts:
@@ -921,9 +1384,22 @@ def parse_openai_messages(messages: List[ChatMessage], tools: Optional[List[Any]
                 break
             dialogue_parts.pop(0)
             dropped += 1
+        # A tool result without the call that produced it reads as an unexplained
+        # observation, and the model answers it instead of continuing the task.
+        while len(dialogue_parts) > 1 and dialogue_parts[0].startswith("Tool Result ("):
+            dialogue_parts.pop(0)
+            dropped += 1
         if dropped:
             dialogue_parts.insert(0, f"[{dropped} earlier turn(s) dropped: they no longer fit the Gemini Web prompt limit.]")
-        full_prompt = header + "\n\n".join(dialogue_parts) + action_reminder + "\n\nAssistant:"
+        tail = action_reminder + "\n\nAssistant:"
+        body = "\n\n".join(dialogue_parts)
+        if len(header) + len(body) + len(tail) > MAX_PROMPT_CHARS:
+            # Two retained turns can still be too big — one file read is enough.
+            # Keep the newest text: the tail is what the model has to act on.
+            marker = "[earlier context trimmed to fit the Gemini Web prompt limit]\n\n"
+            keep = MAX_PROMPT_CHARS - len(header) - len(marker) - len(tail)
+            body = marker + (body[-keep:] if keep > 0 else "")
+        full_prompt = header + body + tail
 
     return full_prompt.strip(), files_to_upload
 
@@ -955,13 +1431,18 @@ def normalize_stops(stop: Optional[Union[str, List[str]]]) -> List[str]:
     items = [stop] if isinstance(stop, str) else list(stop)
     return [s for s in items if isinstance(s, str) and s][:4]
 
-def output_limits(text: str, stops: List[str], max_tokens: Optional[int]) -> tuple[int, Optional[str]]:
+def output_limits(text: str, stops: List[str], max_tokens: Optional[int],
+                  complete: bool = False) -> tuple[int, Optional[str]]:
     """Enforces stop and max_tokens here, because Gemini Web accepts neither.
 
     Returns how much of the cumulative text may be emitted and whether generation
     should end. While no stop has matched, a tail of len(stop)-1 is held back so a
     sequence split across chunks is still caught — that also keeps the emitted
     prefix from ever having to shrink.
+
+    `complete` marks the finished text. The hold-back exists only for a sequence
+    that may still arrive; applying it to a finished answer cut the last
+    characters off every non-streamed reply that carried a stop sequence.
     """
     limit = len(text)
     reason = None
@@ -979,9 +1460,10 @@ def output_limits(text: str, stops: List[str], max_tokens: Optional[int]) -> tup
             if i != -1 and (earliest is None or i < earliest):
                 earliest = i
         if earliest is not None:
-            limit = min(limit, earliest)
-            reason = reason or "stop"
-        else:
+            if earliest <= limit:
+                limit = earliest
+                reason = "stop"
+        elif not complete:
             guard = max(len(s) for s in stops) - 1
             if guard > 0:
                 limit = min(limit, max(0, len(text) - guard))
@@ -989,8 +1471,9 @@ def output_limits(text: str, stops: List[str], max_tokens: Optional[int]) -> tup
     return limit, reason
 
 CONTINUE_NUDGE = (
-    "You stopped while the task was still in progress. If any change is still unapplied or unverified, "
-    "emit the next tool_call block now. If the task really is complete, reply with the final answer only."
+    "The tools are live in this turn and the task is still in progress. If any change is unapplied "
+    "or unverified, emit the next tool_call block now. If the task really is complete, reply with "
+    "the final answer only."
 )
 
 # How many continuation attempts a stalled turn may cost. Each one is a whole
@@ -1005,6 +1488,15 @@ _STALL_MARKERS = (
     "here's the plan", "here is the plan", "вот план", "план действий",
     "would you like me to", "хотите, чтобы я", "should i proceed",
     "let me know if you want me to", "please provide", "предоставьте",
+    # A flash-class model invents an exhausted tool budget when it would rather
+    # describe the work than do it. OpenCode does have a real step limit, but it
+    # announces it by sending tool_choice "none" and no tools at all, and both
+    # nudge sites require tool_names — so these markers can only fire on a turn
+    # where tools really are on offer.
+    "ran out of tool calls", "out of tool calls", "no tool calls remaining",
+    "0 tool calls", "maximum number of tool calls", "tool calls has been exceeded",
+    "maximum steps", "tools are disabled", "tool execution is currently disabled",
+    "закончились вызовы инструментов", "лимит вызовов инструментов",
 )
 
 
@@ -1022,6 +1514,19 @@ def looks_like_stall(text: str) -> bool:
     if "```tool_call" in t or "<tool_call>" in t:
         return False
     return any(p in t for p in _STALL_MARKERS)
+
+def nudge_budget(text: str, agent_turn: bool) -> int:
+    """How many continuation attempts this reply may cost.
+
+    An agent turn used to earn the full budget unconditionally, so every completed
+    turn paid two extra generations to re-ask a final answer that was already
+    correct. Clean prose on an agent turn now gets one rescue attempt; a
+    recognised stall still gets the full budget.
+    """
+    if looks_like_stall(text):
+        return CONTINUE_NUDGES
+    return min(1, CONTINUE_NUDGES) if agent_turn else 0
+
 
 def repair_json(raw: str) -> Any:
     """Parses the JSON models actually emit, not just well-formed JSON.
@@ -1169,9 +1674,10 @@ def extract_tool_calls(text: str, tool_names: Optional[set] = None) -> Optional[
 
     # 1. Code blocks. An explicit tool_call tag is a call on its own; any other
     #    tag (```json, ```js, bare ```) also needs an arguments-shaped key.
-    cb_pattern = r"```(?:[a-zA-Z0-9_\-]+)?\s*([\{\[][\s\S]*?)\s*```"
+    cb_pattern = r"```([a-zA-Z0-9_\-]+)?\s*([\{\[][\s\S]*?)\s*```"
     for m in re.finditer(cb_pattern, text):
-        raw = m.group(1).strip()
+        tag = (m.group(1) or "").lower()
+        raw = m.group(2).strip()
         try:
             parsed = repair_json(raw)
             items = parsed if isinstance(parsed, list) else [parsed]
@@ -1179,7 +1685,10 @@ def extract_tool_calls(text: str, tool_names: Optional[set] = None) -> Optional[
                 if isinstance(item, dict):
                     name = item.get("name") or item.get("function") or item.get("tool")
                     args = item.get("arguments") or item.get("parameters") or item.get("args") or item.get("params") or item.get("input") or {}
-                    if name and any(k in item for k in ARG_KEYS):
+                    # An explicit tool fence needs no arguments key: a no-argument
+                    # call is valid, and requiring one dropped it whenever another
+                    # call in the same reply had already produced a result.
+                    if name and (any(k in item for k in ARG_KEYS) or tag in TOOL_FENCE_TAGS):
                         add_call(name, args)
         except Exception:
             # Handle multiple JSON objects concatenated inside a single code block
@@ -1298,6 +1807,27 @@ def safe_stream_prefix(text: str, tool_names: Optional[set]) -> int:
 
     return max(0, limit)
 
+def session_diagnosis() -> Dict[str, Any]:
+    """What is actually wrong with the session, and the one action that fixes it."""
+    identity = bridge_state.get("session_identity") or {}
+    models = []
+    if client_instance is not None and client_instance._running:
+        models = [m.model_name for m in selectable_models(client_instance.list_models() or [])]
+    if identity.get("reason") == "captcha":
+        return {"signed_in": False, "problem": "captcha", "account": None,
+                "action": "Google требует CAPTCHA для этого выхода: POST /admin/vpn?action=switch "
+                          "или пройдите проверку в браузере моста."}
+    if identity.get("authenticated") is False:
+        return {"signed_in": False, "problem": "signed_out", "account": None,
+                "action": "Запустите login.cmd и войдите в аккаунт Google в окне Chrome моста."}
+    if len(models) < 3:
+        return {"signed_in": identity.get("authenticated"), "problem": "partial_registry",
+                "account": identity.get("account"),
+                "action": "Реестр моделей урезан. Мост сам пробует другой выход; "
+                          "ускорить — POST /admin/reinit?switch=true."}
+    return {"signed_in": True, "problem": None, "account": identity.get("account"), "action": None}
+
+
 @app.get("/health")
 async def health_check():
     load_env_file()
@@ -1308,7 +1838,7 @@ async def health_check():
     account_status = None
     if is_active and client_instance:
         raw_models = client_instance.list_models() or []
-        models = [m.model_name for m in raw_models]
+        models = [m.model_name for m in selectable_models(raw_models)]
         quotas = client_instance._quotas or {}
         account_status = getattr(getattr(client_instance, "account_status", None), "name", None)
 
@@ -1321,7 +1851,9 @@ async def health_check():
         "client_active": is_active,
         "account_status": account_status,
         "active_models": models,
-        "degraded": bool(is_active and models and len(models) < 3),
+        "degraded": bool(is_active and len(models) < 3),
+        "session": session_diagnosis(),
+        "registry_recovery": bridge_state.get("registry_recovery"),
         "quotas": quotas,
         "endpoint": f"http://{HOST}:{PORT}/v1",
         # The bridge used to be diagnosable only from its console, which is
@@ -1341,63 +1873,30 @@ async def health_check():
             "inflight_requests": bridge_state["inflight"],
             "log": str(LOG_PATH),
         },
+        "vpn": vpn_public_state(),
     }
 
 @app.get("/v1/models")
 @app.get("/v1beta/models")
 @app.get("/models")
 async def list_models():
-    models_list = [
-        {"id": "gemini-orchestrator", "name": "Gemini Orchestrator (Auto: Carbon + Hydrogen)"},
-        {"id": "gemini-carbon", "name": "Gemini Carbon (Глубокие рассуждения)"},
-        {"id": "gemini-pro", "name": "Gemini Pro (Сложные задачи)"},
-        {"id": "gemini-4-hydrogen-high", "name": "Gemini 4 Hydrogen (Высокий Thinking)"},
-        {"id": "gemini-4-hydrogen", "name": "Gemini 4 Hydrogen (Повседневный кодинг)"},
-        {"id": "gemini-flash-lite", "name": "Gemini Flash Lite (Быстрые ответы)"},
-    ]
-
-    live = set()
+    models = []
     if client_instance is not None and client_instance._running:
-        try:
-            live = {m.model_name for m in (client_instance.list_models() or [])}
-        except Exception:
-            live = set()
+        models = client_instance.list_models() or []
+    return {**model_catalog(models), "session": session_diagnosis()}
 
-    def served_by(mid: str) -> str:
-        if "orchestrator" in mid:
-            return "gemini-4-hydrogen"
-        if "flash" in mid or "lite" in mid:
-            return "gemini-flash-lite"
-        if "carbon" in mid:
-            return "gemini-carbon"
-        if "pro" in mid:
-            return "gemini-pro"
-        return "gemini-4-hydrogen"
 
-    return {
-        "object": "list",
-        "account_models": sorted(live),
-        # False means "the account list is not known yet", not "the model works".
-        # Reporting every model as available while the client was down made a
-        # dead bridge look healthy.
-        "known": bool(live),
-        "data": [
-            {
-                "id": m["id"],
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "google",
-                "permission": [],
-                "root": m["id"],
-                "parent": None,
-                # When Google returns a partial registry the bridge falls back to
-                # a weaker model. Say so here instead of letting the caller think
-                # it is talking to Carbon.
-                "available": bool(live) and served_by(m["id"]) in live,
-            }
-            for m in models_list
-        ],
-    }
+@app.post("/v1/models/refresh")
+async def refresh_models():
+    """Recover the bridge-owned browser session; discover without generating a ping."""
+    updated = False
+    if client_instance is None or getattr(getattr(client_instance, "account_status", None), "name", None) == "UNAUTHENTICATED":
+        updated = await refresh_cookies_from_browser()
+    client = await get_gemini_client(force_refresh=updated)
+    await client._fetch_user_status()
+    unlock_verified_models(client)
+    bridge_state["last_models_refresh_at"] = time.time()
+    return {**model_catalog(client.list_models() or []), "session": session_diagnosis()}
 
 @app.post("/auth/refresh")
 async def auth_refresh():
@@ -1440,7 +1939,7 @@ async def auth_refresh():
                 "detail": "Сессия Google недействительна (проверено менее 30 с назад). "
                           "Запустите login.cmd и войдите в аккаунт в окне Chrome моста.",
             }
-    models = [m.model_name for m in (client.list_models() or [])]
+    models = [m.model_name for m in selectable_models(client.list_models() or [])]
     bridge_state["last_auth_refresh_at"] = time.time()
     # The cached quota was computed against the previous session; a fresh one
     # must not be answered from it.
@@ -1448,8 +1947,59 @@ async def auth_refresh():
     degraded = len(models) < 3
     return {"ok": True, "browser_alive": browser_alive, "session_updated": updated,
             "account_status": status_name, "account_models": models,
-            "degraded": degraded,
+            "degraded": degraded, "session": session_diagnosis(),
             "reason": "guest_session" if degraded else None}
+
+
+@app.get("/admin/vpn")
+async def vpn_status():
+    """Current exit, last probe table and pool health (no node secrets)."""
+    return {"ok": True, **vpn_public_state()}
+
+
+@app.post("/admin/vpn")
+async def vpn_admin(action: str = "probe"):
+    """probe = re-check exits and keep a live winner; switch = move to another exit."""
+    if not VPN_ENABLED or vpn_pool is None:
+        raise HTTPException(status_code=503, detail="Автовыбор узлов отключён (VPN_AUTOSWITCH=0).")
+    if action not in ("probe", "switch"):
+        raise HTTPException(status_code=400, detail="action должен быть probe или switch.")
+    current_exit = (vpn_state.get("winner") or {}).get("exit_ip")
+    proxy = await ensure_proxy(
+        reprobe=(action == "probe"),
+        switch=(action == "switch"),
+        avoid_exit_ip=current_exit if action == "switch" else None,
+        reason=f"admin-{action}",
+    )
+    if action == "switch" and proxy:
+        bridge_state["vpn_dirty"] = True
+    return {"ok": True, "action": action, "current_proxy": proxy,
+            **vpn_public_state()}
+
+@app.post("/admin/reinit")
+async def admin_reinit(switch: bool = False):
+    """Rebuilds the Google session on demand, without restarting the process.
+
+    Restarting was the only way to retry a throttled registry, and every restart
+    spends a fresh bootstrap token — the very thing that earns the 429.
+    """
+    if switch and VPN_ENABLED and vpn_pool is not None:
+        current_exit = (vpn_state.get("winner") or {}).get("exit_ip")
+        await ensure_proxy(switch=True, avoid_exit_ip=current_exit, reason="admin-reinit")
+    load_env_file()
+    identity = await asyncio.to_thread(
+        probe_session, os.getenv("GEMINI_SECURE_1PSID") or "",
+        os.getenv("GEMINI_SECURE_1PSIDTS") or "", GEMINI_PROXY)
+    bridge_state["session_identity"] = {**identity, "at": time.time(), "source": "admin"}
+    try:
+        client = await get_gemini_client(force_refresh=True)
+    except HTTPException as exc:
+        return {"ok": False, "session": session_diagnosis(), "detail": exc.detail}
+    unlock_verified_models(client)
+    _quota_cache["at"] = 0.0
+    return {"ok": True, "session": session_diagnosis(),
+            "account_models": [m.model_name for m in selectable_models(client.list_models() or [])]}
+
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -2024,7 +2574,7 @@ def generate_local_title(prompt: str) -> str:
     return title.capitalize() if title else "Сессия"
 
 def is_google_glitch_text(text: str) -> bool:
-    """True only when the whole reply is a Google error page.
+    """True only when the whole reply is a Google error or canned non-answer.
 
     A substring search anywhere in the answer also matched ordinary prose about
     error handling ("if an error occurred, please try again"), which then got
@@ -2044,6 +2594,13 @@ def is_google_glitch_text(text: str) -> bool:
         "please try again",
         "error occurred",
         "temporarily unavailable",
+        # The web UI's refusal shell. It arrives as a normal 200 response with a
+        # finish reason of "stop", so an agent read it as the model's final
+        # answer and the task dead-ended on a coding request.
+        "having a hard time fulfilling",
+        "can i help you with something else instead",
+        "i'm still learning how to respond",
+        "i am still learning how to respond",
     )
     return any(p in t for p in patterns)
 
@@ -2051,6 +2608,7 @@ def is_google_glitch_text(text: str) -> bool:
 @app.post("/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     cleanup_old_upload_cache()
+    incoming_tools = len(req.tools or [])
     if req.tool_choice == "none":
         req.tools = None
     forced_tool = None
@@ -2075,7 +2633,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     stops = normalize_stops(req.stop)
     # Parsed before any Google call: title generation is answered locally, and
     # it must keep working while the session is degraded or rate-limited.
-    prompt, files_to_upload = parse_openai_messages(req.messages, req.tools, tool_directive)
+    # Parsing decodes base64, writes uploads and may download a remote URL. On
+    # the event loop that stalled every other request, /health included.
+    prompt, files_to_upload = await asyncio.to_thread(
+        parse_openai_messages, req.messages, req.tools, tool_directive)
 
     if not prompt and not files_to_upload:
         raise HTTPException(status_code=400, detail="Messages and files cannot be empty")
@@ -2092,7 +2653,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # like "write a function to generate a title for each blog post".
     last_user = next((m for m in reversed(req.messages) if m.role == "user"), None)
     last_user_text = str(last_user.content or "").lower() if last_user else ""
-    is_title_request = not req.tools and "reply with only the title" in last_user_text
+    is_title_request = (req.model == "gemini-local-title" and not req.tools
+                        and "reply with only the title" in last_user_text)
 
     if is_title_request:
         title = generate_local_title(prompt)
@@ -2122,48 +2684,25 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # request used to fail with the whole session's error for no reason.
     client = await get_gemini_client()
 
-    model_id = req.model.lower().strip()
     effort = (req.reasoning_effort or "").lower().strip()
-    extended_thinking = True
-    gemini_model_param = "gemini-4-hydrogen"
+    routed_model, routed_thinking = orchestrator_route(req.messages, req.tools, effort, prompt)
+    try:
+        selection = select_model(client.list_models() or [], req.model, routed_model, routed_thinking)
+    except ModelSelectionError as exc:
+        raise HTTPException(status_code=503, detail={"code": exc.code, "message": str(exc)}) from exc
+    gemini_model_param = selection.model
+    extended_thinking = selection.thinking
+    def check_replacement_model(replacement):
+        # Retry only the same concrete model, never re-route mid-response.
+        nonlocal gemini_model_param, resp_model
+        gemini_model_param = resolve_available_model(replacement, gemini_model_param)
+        resp_model = gemini_model_param
 
-    # Support model modifiers from Sophomoresty/gemini-web2api (@think=true / @think=false / @think=0)
-    explicit_think_override = None
-    if "@think=" in model_id:
-        base_part, think_part = model_id.split("@think=", 1)
-        model_id = base_part.strip()
-        think_val = think_part.split()[0].strip()
-        if think_val in ("false", "0", "off", "none"):
-            explicit_think_override = False
-        elif think_val in ("true", "1", "on", "high"):
-            explicit_think_override = True
-
-    if "flash" in model_id or "lite" in model_id:
-        gemini_model_param = "gemini-flash-lite"
-        extended_thinking = False
-    elif "carbon" in model_id:
-        gemini_model_param = "gemini-carbon"
-        extended_thinking = True if explicit_think_override is None else explicit_think_override
-    elif "orchestrator" in model_id:
-        gemini_model_param, routed_thinking = orchestrator_route(req.messages, req.tools, effort, prompt)
-        extended_thinking = routed_thinking if explicit_think_override is None else explicit_think_override
-    elif "high" in model_id:
-        gemini_model_param = "gemini-4-hydrogen"
-        extended_thinking = True if explicit_think_override is None else explicit_think_override
-    elif "pro" in model_id:
-        gemini_model_param = "gemini-pro"
-        extended_thinking = True if explicit_think_override is None else explicit_think_override
-    else:
-        gemini_model_param = "gemini-4-hydrogen"
-        extended_thinking = False if explicit_think_override is None else explicit_think_override
-
-    print(f"[ROUTE] {req.model} -> {gemini_model_param}, thinking={extended_thinking}")
-    routed_model = gemini_model_param
-    gemini_model_param = resolve_available_model(client, gemini_model_param)
-    # The orchestrator is a router: landing on hydrogen is its job, not a
-    # downgrade. Only an unavailable concrete model counts as a fallback.
-    model_fallback = gemini_model_param != routed_model
+    model_fallback = False
     resp_model = gemini_model_param
+    print(f"[ROUTE] {req.model} -> {gemini_model_param}, thinking={extended_thinking}, "
+          f"tools={incoming_tools}, choice={req.tool_choice}, agent_turn={agent_turn}, "
+          f"prompt_chars={len(prompt)}")
 
     # Upload files / images / videos / audios with retry
     file_data = None
@@ -2194,6 +2733,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 if upload_attempt == 0 and is_auth_or_session_error(upload_err):
                     print(f"[WARN] Ошибка загрузки файлов ({upload_err}), переподключаемся...")
                     client = await get_gemini_client(force_refresh=True)
+                    check_replacement_model(client)
                     continue
                 print(f"[ERROR] Ошибка загрузки файлов: {upload_err}")
                 raise HTTPException(status_code=500, detail=f"Не удалось загрузить медиафайл в Gemini: {upload_err}")
@@ -2217,7 +2757,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     finish_override = None
 
                     chunk_count = 0
-                    async for chunk in client._generate(
+                    async for chunk in generate_once(client,
                         prompt=prompt or "Please analyze the attached inputs.",
                         req_file_data=file_data,
                         model=gemini_model_param,
@@ -2304,7 +2844,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
                     # Automatic recovery if Google returned a transient web glitch text
                     if is_google_glitch_text(collected_full_text):
-                        if attempt == 0:
+                        if attempt == 0 and not last_sent_text and not last_sent_thought:
                             print(f"[RETRY] Временный сбой Google Web: '{collected_full_text.strip()}'. Повторный вызов...")
                             await asyncio.sleep(0.3)
                             continue
@@ -2323,20 +2863,20 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         # Only retry while nothing has been shown, otherwise the
                         # client would receive the prose twice.
                         print(f"[TOOL_FIX] Битый вызов в стриме, повтор: {problems}")
-                        prompt, _ = parse_openai_messages(
-                            req.messages, req.tools,
+                        prompt, _ = await asyncio.to_thread(
+                            parse_openai_messages, req.messages, req.tools,
                             tool_directive + " Your last tool call was invalid: " + "; ".join(problems)
                             + ". Emit the corrected tool_call block with every required argument.")
                         continue
 
                     if (not tool_calls and not finish_override and tool_names
-                            and nudges < CONTINUE_NUDGES
-                            and (agent_turn or looks_like_stall(collected_full_text))):
+                            and nudges < nudge_budget(collected_full_text, agent_turn)):
                         nudges += 1
                         print("[CONTINUE] Модель остановилась посреди задачи — попытка продолжить "
                               f"({nudges}/{CONTINUE_NUDGES}, стрим).")
-                        prompt, _ = parse_openai_messages(req.messages, req.tools,
-                                                          tool_directive + " " + CONTINUE_NUDGE)
+                        prompt, _ = await asyncio.to_thread(
+                            parse_openai_messages, req.messages, req.tools,
+                            tool_directive + " " + CONTINUE_NUDGE)
                         continue
 
                     if tool_calls:
@@ -2417,12 +2957,23 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     return
 
                 except Exception as stream_err:
+                    if last_sent_text or last_sent_thought:
+                        # Never restart generation after any visible output.
+                        bridge_state["last_error"] = type(stream_err).__name__
+                        err_payload = {"error": {"message": "Поток прерван после частичного ответа. Автоматический повтор не выполнен.",
+                                                 "type": "gemini_partial_stream_error"}}
+                        yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
                     if is_rate_limited(stream_err):
                         # Log the real Google message: the generic 429 detail in
                         # the client response is not enough to tell a short
                         # per-session limit from an IP-level block.
                         bridge_state["last_error"] = f"429: {stream_err}"
                         print(f"[429] Google ограничил стрим: {stream_err}")
+                        # A 429 during generation is exit-IP specific; move the
+                        # bridge to another node so the next request recovers.
+                        schedule_vpn_recovery("stream-429")
                         err_payload = {
                             "error": {
                                 "message": "Google ограничил сессию (429). Подождите несколько минут.",
@@ -2436,6 +2987,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         print(f"[WARN] Сбой сессии во время стрима ({stream_err}). Автоматическое восстановление сессии Google...")
                         try:
                             client = await get_gemini_client(force_refresh=True)
+                            check_replacement_model(client)
                             continue
                         except Exception as refresh_err:
                             print(f"[ERROR] Не удалось восстановить сессию: {refresh_err}")
@@ -2486,7 +3038,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
             async def collect_reply():
                 last = None
-                async for ch in client._generate(
+                async for ch in generate_once(client,
                     prompt=prompt or "Please analyze the attached inputs.",
                     req_file_data=file_data,
                     model=gemini_model_param,
@@ -2517,7 +3069,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             reply_content = getattr(last_chunk, "text", "") or ""
             reply_thoughts = getattr(last_chunk, "thoughts", None)
 
-            cap, cap_reason = output_limits(reply_content, stops, req.max_tokens)
+            cap, cap_reason = output_limits(reply_content, stops, req.max_tokens, complete=True)
             reply_content = reply_content[:cap]
 
             if is_google_glitch_text(reply_content):
@@ -2539,14 +3091,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 first_thoughts = reply_thoughts
 
             if (not tool_calls and not cap_reason and tool_names
-                    and nudges < CONTINUE_NUDGES
-                    and (agent_turn or looks_like_stall(reply_content))):
+                    and nudges < nudge_budget(reply_content, agent_turn)):
                 # The recurring failure of a text protocol: the model diagnoses the
                 # bug and hands back a plan instead of editing.
                 nudges += 1
                 print(f"[CONTINUE] Модель остановилась посреди задачи — попытка продолжить "
                       f"({nudges}/{CONTINUE_NUDGES}, non-stream).")
-                prompt, _ = parse_openai_messages(req.messages, req.tools, tool_directive + " " + CONTINUE_NUDGE)
+                prompt, _ = await asyncio.to_thread(
+                    parse_openai_messages, req.messages, req.tools, tool_directive + " " + CONTINUE_NUDGE)
                 continue
 
             if not tool_calls and not cap_reason and nudges and first_reply:
@@ -2559,8 +3111,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             problems = tool_call_problems(tool_calls, req.tools) if tool_calls else []
             if problems and attempt == 0:
                 print(f"[TOOL_FIX] Битый вызов, просим исправить: {problems}")
-                prompt, _ = parse_openai_messages(
-                    req.messages, req.tools,
+                prompt, _ = await asyncio.to_thread(
+                    parse_openai_messages, req.messages, req.tools,
                     tool_directive + " Your last tool call was invalid: " + "; ".join(problems)
                     + ". Emit the corrected tool_call block with every required argument.")
                 continue
@@ -2568,8 +3120,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             if not tool_calls and not cap_reason and (forced_tool or req.tool_choice == "required"):
                 if attempt == 0:
                     print("[TOOL_CHOICE] Обязательный вызов не состоялся — повтор с усиленной директивой.")
-                    prompt, _ = parse_openai_messages(
-                        req.messages, req.tools,
+                    prompt, _ = await asyncio.to_thread(
+                        parse_openai_messages, req.messages, req.tools,
                         tool_directive + " Your previous reply was plain text, which is not allowed here. "
                                          "Output only a tool_call block now.")
                     continue
@@ -2621,12 +3173,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             if is_rate_limited(e):
                 bridge_state["last_error"] = f"429: {e}"
                 print(f"[429] Google ограничил генерацию: {e}")
+                schedule_vpn_recovery("generate-429")
                 raise HTTPException(status_code=429,
                                     detail="Google ограничил сессию (429). Подождите несколько минут.")
             if attempt == 0 and is_auth_or_session_error(e):
                 print(f"[WARN] Сбой сессии ({e}). Выполняем авто-восстановление сессии...")
                 try:
                     client = await get_gemini_client(force_refresh=True)
+                    check_replacement_model(client)
                     continue
                 except Exception:
                     pass
@@ -2730,7 +3284,7 @@ def chat_result_to_response(result: Dict[str, Any], model: str) -> Dict[str, Any
     return {
         "id": f"resp_{uuid.uuid4().hex[:16]}", "object": "response",
         "created_at": result.get("created", int(time.time())), "status": "completed",
-        "model": model, "output": output, "error": None,
+        "model": result.get("model", model), "output": output, "error": None,
         "usage": {"input_tokens": usage.get("prompt_tokens", 0),
                   "output_tokens": usage.get("completion_tokens", 0),
                   "total_tokens": usage.get("total_tokens", 0)},

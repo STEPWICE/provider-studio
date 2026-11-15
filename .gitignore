@@ -1,0 +1,11 @@
+# Another tool's local state (databases, snapshots, checkpoints)
+.sharrowkin/
+
+# Machine-specific Windows shortcuts
+*.lnk
+
+# Agent scratch sandboxes
+.scratch-*/
+
+__pycache__/
+*.pyc

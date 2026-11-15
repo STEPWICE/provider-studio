@@ -1,3 +1,46 @@
 {
-  "$schema": "https://opencode.ai/config.json"
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "gemini-web-bridge-google-ai-pro": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Gemini Web Bridge (Google AI Pro)",
+      "options": { "baseURL": "http://127.0.0.1:8010/v1", "apiKey": "none" },
+      "models": {
+        "gemini-orchestrator": {
+          "name": "Gemini Orchestrator (auto route)",
+          "limit": { "context": 175000, "output": 65536 },
+          "reasoning": true,
+          "tool_call": true
+        },
+        "gemini-4-hydrogen": {
+          "name": "Gemini 4 Hydrogen",
+          "limit": { "context": 175000, "output": 65536 },
+          "tool_call": true
+        },
+        "gemini-4-hydrogen-high": {
+          "name": "Gemini 4 Hydrogen (Thinking)",
+          "limit": { "context": 175000, "output": 65536 },
+          "reasoning": true,
+          "tool_call": true
+        },
+        "gemini-pro": {
+          "name": "Gemini Pro",
+          "limit": { "context": 175000, "output": 65536 },
+          "reasoning": true,
+          "tool_call": true
+        },
+        "gemini-carbon": {
+          "name": "Gemini Carbon (deep reasoning)",
+          "limit": { "context": 175000, "output": 65536 },
+          "reasoning": true,
+          "tool_call": true
+        },
+        "gemini-flash-lite": {
+          "name": "Gemini Flash Lite (works even signed out)",
+          "limit": { "context": 175000, "output": 65536 },
+          "tool_call": true
+        }
+      }
+    }
+  }
 }

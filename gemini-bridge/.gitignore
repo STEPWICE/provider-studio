@@ -1,5 +1,7 @@
 # Live Google session cookies — never commit
 .env
+.env.tmp
+.env.previous
 
 # Cached Code Assist OAuth access token
 .codeassist-token.json
@@ -16,3 +18,6 @@ __pycache__/
 # Runtime artifacts
 uploads/
 *.log
+
+# Private Xray pool config (contains node credentials) and its state
+.vpn-pool/
