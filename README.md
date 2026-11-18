@@ -47,10 +47,10 @@ required» — это тариф, а не ключ; выбрасывать кл�
 останавливает пачку — но только пока ни одна модель не прошла, иначе
 это ошибка конкретной модели, а не аккаунта.
 
-**15 пресетов.** Gemini Web Bridge (Google AI Pro), OpenRouter, Google AI Studio, NVIDIA NIM, DeepSeek,
+**13 пресетов.** OpenRouter, Google AI Studio, NVIDIA NIM, DeepSeek,
 Anthropic, OpenAI, Groq, Together AI, Mistral, Cerebras, Z.ai, Ollama,
 LM Studio + ручной ввод. Base URL, формат API и имя переменной
-подставляются сами. Для Gemini Web Bridge встроен живой мониторинг квот и дашборд.
+подставляются сами.
 
 Отметки о бесплатных тарифах датированы днём проверки, а не взяты из
 головы. Если на странице провайдера точных чисел нет — их и не будет в
