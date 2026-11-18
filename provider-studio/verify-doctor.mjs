@@ -87,6 +87,19 @@ function applyOk(configObj, label) {
     fixes.some((f) => f.id === "plaintext-key" && f.needsEnvSetup === true), JSON.stringify(fixes));
 }
 
+// --------------------------------------------------- плейсхолдер — не секрет
+{
+  const { changes, fixes } = D.buildAutoFixChanges({
+    $schema: "https://opencode.ai/config.json",
+    provider: { a: { npm: "x", options: { baseURL: "http://127.0.0.1:11434/v1", apiKey: "none" }, models: { m: {} } } },
+    model: "a/m",
+  });
+  check("плейсхолдер не переезжает в env",
+    !changes.some((c) => JSON.stringify(c.path).includes("apiKey") || JSON.stringify(c.value || "").includes("A_API_KEY")),
+    JSON.stringify(changes));
+  check("фикса про открытый ключ нет", !fixes.some((f) => f.id === "plaintext-key"), JSON.stringify(fixes));
+}
+
 // ------------------------------------------------------- отсутствующая переменная — вручную
 {
   delete process.env.PS_DOCTOR_ABSENT;

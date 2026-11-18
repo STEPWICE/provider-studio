@@ -18,7 +18,7 @@ import { join, dirname } from "node:path";
 import {
   MODALITIES, MODEL_STATUSES, PROVIDER_FIELDS,
   MODEL_FIELDS, looksLikePackage, isCustomProviderBlock,
-  decodeApiKey, detectApiFormat, suggestEnvVarName,
+  decodeApiKey, isPlaceholderKey, detectApiFormat, suggestEnvVarName,
   buildModelEntry,
 } from "./formats.mjs";
 import { lookupEnv, resolveKeyRef } from "./env.mjs";
@@ -178,6 +178,10 @@ function normaliseKeyValue(apiKey, key, changes, fixes, skipped, existingEnv) {
   }
   const decoded = decodeApiKey(apiKey);
   if (decoded.useEnvVar) return apiKey;
+  // A placeholder ("none" for a local bridge) is not a secret: moving it into an
+  // environment variable only adds a variable that must exist for the provider
+  // to keep working, and if the write fails the key silently becomes "".
+  if (isPlaceholderKey(apiKey)) return apiKey;
   // Открытый ключ в файле, который коммитят и показывают. См. комментарий
   // в fixApiKeyValue: в конфиге остаётся ссылка. Значение не теряется:
   // при применении сервер записывает его в переменную окружения сам

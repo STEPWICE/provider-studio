@@ -27,26 +27,6 @@ export const FREE_TIER_CHECKED = "2026-09-17";
 
 export const PRESETS = [
   {
-    id: "gemini-web-bridge-google-ai-pro",
-    label: "Gemini Web Bridge (Google AI Pro)",
-    hint: "Локальный мост к Google AI Pro (Carbon, Pro, Hydrogen, Orchestrator).",
-    baseURL: "http://127.0.0.1:8010/v1",
-    apiFormat: "openai-chat",
-    envVarName: "",
-    needsKey: false,
-    discover: true,
-    freeTier: {
-      summary: "Не отдельный бесплатный тариф: мост расходует квоту вашей подписки Google AI Pro.",
-      limits: [
-        "Модели берются из аккаунта: Carbon, Pro, Hydrogen, Flash-Lite; оркестратор выбирает сам.",
-        "Остаток кредитов и время сброса показывает мост: /v1/quota и /dashboard.",
-        "Нужен вход в Google через login.cmd; куки вручную копировать не требуется.",
-      ],
-      source: "https://gemini.google.com/app",
-      checked: "2026-11-14",
-    },
-  },
-  {
     id: "openrouter",
     label: "OpenRouter",
     hint: "Шлюз к сотням моделей, есть бесплатные.",
@@ -99,23 +79,6 @@ export const PRESETS = [
       source: "https://ai.google.dev/gemini-api/docs/rate-limits",
       checked: FREE_TIER_CHECKED,
     },
-  },
-  {
-    id: "gemini-web-bridge",
-    label: "Gemini Web Bridge (Google AI Pro)",
-    hint: "Локальный мост к моделям Google AI Pro (Carbon, Pro, Hydrogen) через сессию браузера.",
-    baseURL: "http://127.0.0.1:8010/v1",
-    apiFormat: "openai-chat",
-    envVarName: "GEMINI_BRIDGE_KEY",
-    needsKey: false,
-    discover: true,
-    models: [
-      { id: "gemini-orchestrator", name: "Gemini Orchestrator (Auto)", contextWindow: 175000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
-      { id: "gemini-carbon", name: "Gemini Carbon", contextWindow: 175000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
-      { id: "gemini-pro", name: "Gemini Pro", contextWindow: 175000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
-      { id: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen", contextWindow: 175000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: false, toolUse: true },
-      { id: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (Высокий)", contextWindow: 175000, maxOutput: 64000, inputTypes: ["text", "image"], outputTypes: ["text"], reasoning: true, toolUse: true },
-    ],
   },
   {
     id: "nvidia-nim",

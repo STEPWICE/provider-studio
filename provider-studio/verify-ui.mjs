@@ -55,9 +55,9 @@ console.log(leaks.length ? `KEY LEAK RISKS: ${leaks.join("; ")}` : "clipboard pa
 // front end goes through it.
 const serverJs = readFileSync("server.mjs", "utf8");
 const serverRoutes = new Set(
-  [...serverJs.matchAll(/url\.pathname === "(\/api\/[a-z-]+)"/g)].map((m) => m[1])
+  [...serverJs.matchAll(/url\.pathname === "(\/api\/[a-z0-9-]+)"/g)].map((m) => m[1])
 );
-const clientRoutes = new Set([...js.matchAll(/"(\/api\/[a-z-]+)"/g)].map((m) => m[1]));
+const clientRoutes = new Set([...js.matchAll(/"(\/api\/[a-z0-9-]+)"/g)].map((m) => m[1]));
 const unreachable = [...serverRoutes].filter((r) => !clientRoutes.has(r));
 const phantom = [...clientRoutes].filter((r) => !serverRoutes.has(r));
 console.log(`api routes: server ${serverRoutes.size}, used by ui ${clientRoutes.size}`);
@@ -67,7 +67,7 @@ console.log(phantom.length ? `ROUTES THE SERVER DOES NOT HAVE: ${phantom.join(",
 // A write without the hash it was previewed against cannot be conflict-checked,
 // so the guard would silently degrade to last-write-wins.
 const guards = [];
-for (const route of ["/api/apply", "/api/remove-provider", "/api/rename-provider"]) {
+for (const route of ["/api/apply", "/api/remove-provider", "/api/rename-provider", "/api/migrate-v2-apply"]) {
   // Grab the api(...) call for this route and check the body mentions the hash.
   const re = new RegExp(`"${route.replace(/\//g, "\\/")}"[\\s\\S]{0,400}?\\)`, "g");
   const calls = [...js.matchAll(re)].map((m) => m[0]);

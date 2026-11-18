@@ -53,7 +53,9 @@ export function loadCredentials() {
   try {
     const file = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
     for (const acc of Array.isArray(file) ? file : file.accounts || []) {
-      if (acc && acc.token) creds.push({ id: acc.id || acc.email || `oauth-${creds.length}`, kind: "oauth", value: acc.token });
+      if (acc && acc.token && (!acc.expires || acc.expires > Date.now())) {
+        creds.push({ id: acc.id || acc.email || `oauth-${creds.length}`, kind: "oauth", value: acc.token });
+      }
     }
   } catch {}
   // Аккаунты, вошедшие через `opencode auth login`: CLI сам обновляет токены в БД.
@@ -351,15 +353,33 @@ export function createZenGate({ port = 8790, subs = ["BlancVPN", "VPNLiberty", "
     stats,
     reloadCredentials() { state = createState(loadCredentials()); },
     start() {
-      return new Promise((r) => server.listen(port, "127.0.0.1", () => { ensureExits().catch((e) => console.error("[zenpool] ensureExits error:", e.message)); r(); }));
+      return new Promise((resolve, reject) => {
+        const onBindError = (e) => {
+          if (e.code === "EADDRINUSE") {
+            // Порт занят отдельным экземпляром шлюза: API Studio ходит в него
+            // по HTTP, свои выходы не поднимаем и таймер не держим.
+            clearInterval(timer);
+            console.error(`[zenpool] порт ${port} занят — используем внешний шлюз`);
+            resolve(false);
+          } else reject(e);
+        };
+        server.once("error", onBindError);
+        server.listen(port, "127.0.0.1", () => {
+          server.removeListener("error", onBindError);
+          server.on("error", (e) => console.error("[zenpool] server error:", e.message));
+          ensureExits().catch((e) => console.error("[zenpool] ensureExits error:", e.message));
+          resolve(true);
+        });
+      });
     },
-    stop() { clearInterval(timer); mgr.stopAll(); server.close(); },
+    stop() { clearInterval(timer); mgr.stopAll(); if (server.listening) server.close(); },
   };
 }
 
 if (process.argv[1] && process.argv[1].endsWith("zengate.mjs")) {
   const gate = createZenGate();
-  gate.start().then(async () => {
+  gate.start().then(async (bound) => {
+    if (!bound) { console.log("zenpool: порт 8790 уже занят внешним шлюзом — этот экземпляр не нужен"); process.exit(0); }
     console.log(`zenpool gateway on http://127.0.0.1:8790/v1 (creds: ${loadCredentials().length})`);
     const live = await gate.mgr.checkAll();
     console.log("exits:", gate.mgr.status().map((e) => `${e.alive ? "LIVE" : "dead"} ${e.remarks}`).join(" | ") || "none");

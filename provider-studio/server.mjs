@@ -9,7 +9,7 @@ import {
 } from "./src/opencode.mjs";
 import { buildPreview } from "./src/diff.mjs";
 import { parseJsonc } from "./src/jsonc-edit.mjs";
-import { applySchemaChanges } from "./src/schema.mjs";
+import { applySchemaChanges, planSchemaMigration, detectSchema } from "./src/schema.mjs";
 import { buildAutoFixChanges, planRefresh, runSelfCheck, isFreeEntry, buildRefreshChanges } from "./src/doctor.mjs";
 import { smartAudit } from "./src/smart-audit.mjs";
 import { loadDigest } from "./src/digest.mjs";
@@ -22,6 +22,7 @@ import {
   MAX_POOL_KEYS,
 } from "./src/keypool.mjs";
 import { PRESETS } from "./src/presets.mjs";
+import { createZenGate } from "./src/zengate.mjs";
 import {
   backupConfig, listBackups, restoreBackup, validateConfig, testConnection,
   fetchModels, testCompletion, introducedErrors,
@@ -905,6 +906,11 @@ function serveStatic(res, urlPath, req) {
   res.end("Not found");
 }
 
+// Пул Zen: шлюз живёт внутри сервера Studio; если порт уже занят отдельным
+// экземпляром (node src/zengate.mjs), API ниже просто ходит в него по HTTP.
+const zenGate = createZenGate();
+zenGate.start().catch(() => {});
+
 const server = http.createServer(async (req, res) => {
   // A client that disconnects mid-request must not crash the process:
   // without a listener, an error on the dead socket is raised as an
@@ -1456,6 +1462,22 @@ const server = http.createServer(async (req, res) => {
     // when a model id is given, otherwise a connection check) plus a
     // best-effort balance lookup. Keys are never echoed back — only masks.
     // Deliberately NOT runBatch: one dead key must not abort the rest.
+    if (url.pathname === "/api/zenpool-status" && req.method === "GET") {
+      try {
+        const r = await fetch("http://127.0.0.1:8790/status", { signal: AbortSignal.timeout(5000) });
+        return json(res, 200, { ok: true, ...(await r.json()) });
+      } catch {
+        return json(res, 200, { ok: false, error: "Шлюз zenpool не отвечает на 127.0.0.1:8790" });
+      }
+    }
+    if (url.pathname === "/api/zenpool-reload" && req.method === "POST") {
+      try {
+        const r = await fetch("http://127.0.0.1:8790/reload", { method: "POST", signal: AbortSignal.timeout(5000) });
+        return json(res, 200, { ok: true, ...(await r.json()) });
+      } catch {
+        return json(res, 200, { ok: false, error: "Шлюз zenpool не отвечает на 127.0.0.1:8790" });
+      }
+    }
     if (url.pathname === "/api/pool-check" && req.method === "POST") {
       const body = await readBody(req);
       const { provider, keys } = readPoolInput(body);
@@ -1772,17 +1794,6 @@ const server = http.createServer(async (req, res) => {
               ok: true, reach: "unknown",
               message: "Проба невозможна: у провайдера нет своего Base URL — адрес берётся из npm-пакета",
             };
-        let quota = null;
-        if (base && (base.includes("8010") || key.includes("gemini"))) {
-          try {
-            const quotaUrl = base.replace(/\/v1\/?$/, "") + "/v1/quota";
-            // The bridge answers from a 30 s cache, but a cold miss still costs
-            // one Google round trip. 1.5 s was shorter than that, so the badge
-            // never appeared.
-            const qResp = await fetch(quotaUrl, { signal: AbortSignal.timeout(5000) });
-            if (qResp.ok) quota = await qResp.json();
-          } catch (_) {}
-        }
         return {
           key,
           baseURL: base,
@@ -1790,7 +1801,6 @@ const server = http.createServer(async (req, res) => {
           isDefault: String(cfg.config?.model || "").startsWith(key + "/"),
           ok: conn.ok,
           conn: conn.message,
-          quota,
           // reach/fault let the UI separate "their server is down" from "your
           // key is wrong" instead of showing one undifferentiated red line.
           reach: conn.reach || null,
@@ -1834,6 +1844,7 @@ const server = http.createServer(async (req, res) => {
         ok: true, path: cfg.path, issues, providers,
         model: cfg.config?.model || null, backups: listBackups(),
         proxy: proxyUsed || null,
+        schema: cfg.config ? detectSchema(cfg.config) : null,
         smart: smartAudit(cfg.config),
       });
     }
@@ -1906,6 +1917,67 @@ const server = http.createServer(async (req, res) => {
         hash: committed.hash || "", backupFile: committed.backupFile || null,
         backups: listBackups(), diff: buildPreview(cfg.raw, applied.text),
         envWrites: envWrites.length ? envWrites : undefined,
+      });
+    }
+
+    // Перевод legacy-схемы (`provider`) в нативную V2 (`providers`).
+    // Отдельное действие, а не часть автофикса: на V1-бинарнике читается
+    // только legacy-блок, поэтому молчаливая миграция сломала бы провайдеров.
+    // Сначала diff, запись — только после подтверждения, как везде.
+    if (url.pathname === "/api/migrate-v2-preview" && req.method === "POST") {
+      const body = await readBody(req);
+      const cfg = readConfig(body.configPath);
+      if (!cfg.config) {
+        return json(res, 400, { ok: false, error: "opencode config не разобран: " + (cfg.error || "неизвестная ошибка"), path: cfg.path });
+      }
+      const plan = planSchemaMigration(cfg.config);
+      if (!plan.ok) {
+        return json(res, 400, {
+          ok: false, path: cfg.path, error: plan.error || "Конфиг нельзя перевести на схему V2 без ручных правок",
+          blocked: plan.blocked || [], lost: plan.lost || [],
+        });
+      }
+      if (plan.already) {
+        return json(res, 200, { ok: true, already: true, path: cfg.path, hash: cfg.hash || "", diff: buildPreview(cfg.raw, cfg.raw), changes: [] });
+      }
+      const applied = applySchemaChanges(cfg.raw, cfg.config, plan.changes);
+      if (!applied.ok) return json(res, 400, { ok: false, error: applied.error, path: cfg.path });
+      return json(res, 200, {
+        ok: true, already: false, path: cfg.path, hash: cfg.hash || "",
+        providers: plan.providers || [], lost: plan.lost || [],
+        diff: buildPreview(cfg.raw, applied.text), remaining: validateConfig(applied.value),
+      });
+    }
+
+    if (url.pathname === "/api/migrate-v2-apply" && req.method === "POST") {
+      const body = await readBody(req);
+      const cfg = readConfig(body.configPath);
+      if (!cfg.config) {
+        return json(res, 400, { ok: false, error: "opencode config не разобран: " + (cfg.error || "неизвестная ошибка"), path: cfg.path });
+      }
+      const plan = planSchemaMigration(cfg.config);
+      if (!plan.ok) {
+        return json(res, 400, {
+          ok: false, path: cfg.path, error: plan.error || "Конфиг нельзя перевести на схему V2 без ручных правок",
+          blocked: plan.blocked || [], lost: plan.lost || [],
+        });
+      }
+      if (plan.already) {
+        return json(res, 200, { ok: true, noop: true, already: true, path: cfg.path, hash: cfg.hash || "", backups: listBackups() });
+      }
+      const applied = applySchemaChanges(cfg.raw, cfg.config, plan.changes);
+      if (!applied.ok) return json(res, 400, { ok: false, error: applied.error, path: cfg.path });
+      const remaining = validateConfig(applied.value);
+      const committed = commitPlan(
+        { ok: true, configPath: cfg.path, before: cfg.raw, after: applied.text, changes: applied.changes, hash: cfg.hash || "" },
+        { expectedHash: body.hash, backup: (p) => backupConfig(p, "before-v2-migration") },
+      );
+      if (!committed.ok) return json(res, committed.conflict ? 409 : 400, committed);
+      recordUndo(committed.configPath || "", committed.backupFile, "Перевод конфига на схему V2", committed.hash || "");
+      return json(res, 200, {
+        ok: true, path: committed.configPath, providers: plan.providers || [], lost: plan.lost || [],
+        remaining, hash: committed.hash || "", backupFile: committed.backupFile || null,
+        backups: listBackups(), diff: buildPreview(cfg.raw, applied.text),
       });
     }
 

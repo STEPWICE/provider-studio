@@ -377,6 +377,7 @@ async function init() {
   $("#btnDiscover").addEventListener("click", () => withLoading($("#btnDiscover"), openDiscover));
   $("#btnDiag").addEventListener("click", () => withLoading($("#btnDiag"), diagnose));
   $("#btnEnvAudit").addEventListener("click", () => withLoading($("#btnEnvAudit"), runEnvAudit));
+  $("#btnZenpool").addEventListener("click", () => withLoading($("#btnZenpool"), runZenpoolStatus));
   $("#discoverClose").addEventListener("click", closeDiscover);
   $("#discoverCancel").addEventListener("click", closeDiscover);
   $("#discoverAdd").addEventListener("click", addDiscovered);
@@ -3570,29 +3571,6 @@ function finishWizard() {
 }
 
 /**
- * Quota badge for a provider that exposes /v1/quota.
- *
- * The numbers are only shown when the bridge actually has them. It used to
- * fabricate "0 из 2400 израсходовано" whenever Google's status RPC was unhappy,
- * so a working session looked like an exhausted plan and the badge read
- * "0 кр." — worse than saying nothing.
- */
-function quotaBadge(p) {
-  const q = p.quota;
-  if (!q) return "";
-  const h5 = q.window_5h || {};
-  const w = q.weekly || {};
-  const link = `href="http://127.0.0.1:8010/dashboard" target="_blank"`;
-  const style = `background:rgba(56,189,248,0.15);color:#38bdf8;border:1px solid rgba(56,189,248,0.3);text-decoration:none;`;
-  const known = typeof h5.remaining_credits === "number";
-  if (!known) {
-    return `<a ${link} class="tag" style="${style}" title="Мост не получил от Google счётчики квоты: ${esc(q.reason || "нет данных")}. Нажмите для открытия дашборда">⚡ квота: нет данных ↗</a>`;
-  }
-  const weekly = typeof w.remaining_credits === "number" ? ` · ${Math.round(w.remaining_credits / 1000)}k (нед)` : "";
-  return `<a ${link} class="tag" style="${style}" title="Лимит 5h: ${h5.remaining_credits}/${h5.total_credits} кредитов. Нажмите для открытия дашборда">⚡ ${h5.remaining_credits} кр. (5h)${weekly} ↗</a>`;
-}
-
-/**
  * Three states, not two. A 401 means the endpoint answered, so the old boolean
  * `ok` rendered a rejected key as "✓ доступен" — technically true about the
  * server, useless to the user, and it hid the actual fault.
@@ -3694,7 +3672,6 @@ async function diagnose() {
       <span class="diag-name">${esc(p.key)}</span>
       ${p.isDefault ? `<span class="tag">по умолчанию</span>` : ""}
       <span class="diag-meta">${p.nModels} ${plural(p.nModels, "модель", "модели", "моделей")}</span>
-      ${quotaBadge(p)}
       ${reachBadge(p)}
     </div>
     <div class="diag-sub muted">${esc(p.conn || "")} · ${esc(p.baseURL || "—")}${typeof p.ms === "number" ? ` · ${p.ms} мс` : ""}</div>`;
@@ -3735,6 +3712,10 @@ async function diagnose() {
       <button class="btn btn-mini" id="diagSelfCheck" type="button">Самопроверка</button>
       <button class="btn btn-mini" id="diagCopyReport" type="button" title="Скопировать сводку в буфер — без ключей">Скопировать отчёт</button>
     </div>
+    ${r.schema === "v1" ? `<div class="diag-fix">
+      <button class="btn btn-mini" id="diagMigrateV2" type="button">Перевести на схему V2</button>
+      <span class="diag-sub">provider → providers: без этого OpenCode V2 молча отбрасывает reasoning/attachment</span>
+    </div>` : ""}
     <div class="diag-fix">
       <label class="check-line"><input type="checkbox" id="diagPrune" /> удалять модели, которых больше нет на сервере</label>
     </div>
@@ -3753,6 +3734,8 @@ async function diagnose() {
 
   const autoBtn = $("#diagAutoFix");
   if (autoBtn) autoBtn.onclick = () => doAutoFix();
+  const migrateBtn = $("#diagMigrateV2");
+  if (migrateBtn) migrateBtn.onclick = () => doMigrateV2();
   const refreshBtn = $("#diagRefreshModels");
   if (refreshBtn) refreshBtn.onclick = () => doRefreshModels();
   const selfBtn = $("#diagSelfCheck");
@@ -3907,6 +3890,60 @@ async function runEnvAudit() {
   });
 }
 
+async function runZenpoolStatus() {
+  setStatus("Читаю пул Zen…", "");
+  const r = await apiSafe("/api/zenpool-status");
+  setStatus("", "");
+  const el = $("#issues");
+  el.hidden = false;
+  syncSidePlaceholder();
+  if (!r || !r.ok) {
+    el.innerHTML = `<div class="result-card"><h3>Zen-пул</h3><div class="err-line">✕ ${esc((r && r.error) || "Шлюз не отвечает")}</div>
+      <div class="diag-sub muted">Шлюз живёт внутри сервера Studio (порт 8790). Запусти сервер заново или отдельно: node src/zengate.mjs.</div></div>`;
+    showReports();
+    return;
+  }
+  const creds = asArray(r.creds);
+  const exits = asArray(r.exits);
+  const s = r.stats || {};
+  const live = exits.filter((e) => e.alive).length;
+  let html = `<div class="result-card"><h3>Zen-пул</h3>`;
+  html += `<div class="ok-line" style="color:var(--muted)">запросов: ${s.requests || 0} · успешных: ${s.ok || 0} · ротаций: ${s.rotated || 0} · через выходы: ${s.exitUsed || 0}</div>`;
+  if (s.lastError) html += `<div class="diag-sub muted">последняя ошибка: ${esc(s.lastError)}</div>`;
+  html += `<div class="diag-sect">Аккаунты и ключи (${creds.length})</div>`;
+  if (!creds.length) html += `<div class="diag-sub muted">— нет аккаунтов: войди через scripts/zen-login.cmd, шлюз подхватит токен из opencode.db —</div>`;
+  for (const c of creds) {
+    const flags = [c.dead && "мёртв", c.daily && "суточная квота", c.cooldown && "кулдаун"].filter(Boolean).join(", ");
+    html += `<div class="diag-row"><span class="diag-name">${esc(c.id)}</span><span class="diag-meta">${esc(c.kind)} · использован ${c.used || 0} раз${flags ? " · " + esc(flags) : ""}</span></div>`;
+    if (c.lastError) html += `<div class="diag-sub muted">${esc(c.lastError)}</div>`;
+  }
+  html += `<div class="diag-sect">Выходы VPN (${live}/${exits.length} живых)</div>`;
+  if (!exits.length) html += `<div class="diag-sub muted">— выходы ещё не подняты, шлюз прогревает их в фоне —</div>`;
+  for (const e of exits) {
+    html += `<div class="diag-row"><span class="diag-name">${esc(e.remarks)}</span><span class="diag-meta">${esc(e.sub)} · ${e.alive ? `✓ ${e.ms} мс` : "✕ мёртв"}</span></div>`;
+  }
+  html += `<div class="diag-sub muted">Квота бесплатных моделей Zen привязана к exit IP: при 429 шлюз гасит выход на 10 минут и пробует следующий. Аккаунты не обходят IP-лимит, но ротация выходов — обходит.</div>`;
+  html += `<div class="diag-sect">Действия</div>
+    <div class="diag-fix"><button class="btn btn-mini" id="zenpoolRerun" type="button">Обновить</button>
+    <button class="btn btn-mini" id="zenpoolReload" type="button">Перечитать аккаунты</button></div>`;
+  html += `</div>`;
+  el.innerHTML = html;
+  showReports();
+  const rerun = $("#zenpoolRerun");
+  if (rerun) rerun.onclick = () => runZenpoolStatus();
+  const reload = $("#zenpoolReload");
+  if (reload) reload.onclick = async () => {
+    setBtnLoading(reload, true);
+    try {
+      const rr = await apiSafe("/api/zenpool-reload", { method: "POST" });
+      toast(rr && rr.ok ? "Аккаунты перечитаны" : ((rr && rr.error) || "Шлюз не отвечает"), rr && rr.ok ? "ok" : "err");
+      await runZenpoolStatus();
+    } finally {
+      setBtnLoading(reload, false);
+    }
+  };
+}
+
 async function cleanAllOrphans(btn) {
   if (!confirm("Удалить все неиспользуемые переменные-сироты из окружения пользователя?")) return;
   if (btn) setBtnLoading(btn, true);
@@ -3942,11 +3979,62 @@ async function removeOrphanEnv(name, btn) {
 }
 
 /**
- * Автоисправление конфига: preview -> diff -> подтверждение -> запись.
- * Чинит только однозначное (мусорные поля, ключ не в том месте, $VAR,
- * неполные limit/cost, висячий default). Переменная окружения и пустой список
- * моделей остаются ручными шагами — о них пишет remaining.
+ * Перевод legacy-схемы (`provider`) в нативную V2 (`providers`).
+ *
+ * Отдельная кнопка, а не автофикс: на V1-бинарнике читается только legacy-блок,
+ * поэтому миграция должна быть осознанным действием. Preview → diff → запись,
+ * как в остальных путях. `lost` перечисляет поля, у которых в V2 нет аналога.
  */
+async function doMigrateV2() {
+  const st = $("#diagActionStatus");
+  const out = $("#diagActionOut");
+  if (st) st.textContent = "Считаю миграцию…";
+  if (out) out.innerHTML = "";
+  const r = await apiSafe("/api/migrate-v2-preview", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ configPath: state.configPath }),
+  });
+  if (!r || !r.ok) {
+    if (st) st.textContent = "";
+    return toast((r && r.error) || "Миграция невозможна", "err");
+  }
+  if (r.already) {
+    if (st) st.textContent = "Конфиг уже на схеме V2 — переводить нечего.";
+    return;
+  }
+  state.configHash = r.hash || state.configHash;
+  const providers = asArray(r.providers);
+  const lost = asArray(r.lost);
+  if (st) st.textContent = `Провайдеров к переводу: ${providers.length}`;
+  openDiff({
+    title: "Перевод конфига на схему V2",
+    meta: `<div class="diff-path">${esc(r.path || "")}</div>
+      <div class="diff-stat"><span class="plus">+${r.diff ? r.diff.added : 0}</span>
+      <span class="minus">-${r.diff ? r.diff.removed : 0}</span></div>`,
+    diff: r.diff,
+    hint: `provider → providers: ${providers.join(", ")}`
+      + (lost.length ? `; без аналога в V2: ${lost.map((x) => `${x.provider}/${x.model} (${asArray(x.fields).join(", ")})`).join("; ")}` : ""),
+    confirmLabel: `Перевести (${providers.length})`,
+    onConfirm: async () => {
+      closeDiff();
+      const res = await apiSafe("/api/migrate-v2-apply", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ configPath: state.configPath, hash: state.configHash }),
+      });
+      if (res && res.conflict) await refreshConfigState();
+      if (!res || !res.ok) return toast((res && res.error) || "Не удалось перевести конфиг", "err");
+      if (res.hash) state.configHash = res.hash;
+      if (res.backupFile) setBackupInfo(`\u21bb Автобэкап: ${res.backupFile}`);
+      refreshBackups();
+      refreshUndo();
+      toast(`Переведено провайдеров: ${asArray(res.providers).length}`, "ok");
+      await refreshConfigState();
+      await diagnose();
+    },
+  });
+}
+
+
 async function doAutoFix() {
   const st = $("#diagActionStatus");
   const out = $("#diagActionOut");

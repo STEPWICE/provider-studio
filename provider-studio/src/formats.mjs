@@ -56,7 +56,7 @@ export const PROVIDER_FIELDS = [
 
 /** Fields opencode accepts on a model entry (V1 and V2 shapes). */
 export const MODEL_FIELDS = [
-  "id", "name", "family", "release_date", "attachment", "reasoning", "temperature",
+  "id", "name", "family", "release_date", "releaseDate", "type", "attachment", "reasoning", "temperature",
   "tool_call", "interleaved", "cost", "limit", "modalities", "experimental",
   "status", "provider", "options", "headers", "variants",
   "capabilities", "modelID", "settings", "package", "compatibility", "body", "disabled",
@@ -761,10 +761,27 @@ export function decodeApiKey(apiKey) {
   return { useEnvVar: false, envVarName: "", apiKey: raw };
 }
 
+/**
+ * Placeholder credentials: the literal value means "no key here", not a secret.
+ *
+ * Local servers (Ollama, LM Studio) are told to use `none`, and hand-written
+ * hand-written blocks often carry `dummy`/`test`. Treating those as plaintext
+ * leaks produced a warning the user could only silence by moving the word
+ * "none" into an environment variable — pure churn, and a new failure mode when
+ * the variable is missing. The key is only a leak when it is an actual secret.
+ */
+const PLACEHOLDER_KEYS = new Set(["none", "null", "nil", "n/a", "na", "dummy", "test", "placeholder", "local", "empty", "no-key", "nokey", "changeme", "x", "xxx", "-", "0"]);
+
+export function isPlaceholderKey(apiKey) {
+  const decoded = decodeApiKey(apiKey);
+  if (decoded.useEnvVar || decoded.useFile || !decoded.apiKey) return false;
+  return PLACEHOLDER_KEYS.has(decoded.apiKey.toLowerCase());
+}
+
 /** True when the value looks like a plaintext secret rather than a reference. */
 export function isPlaintextKey(apiKey) {
   const decoded = decodeApiKey(apiKey);
-  return !decoded.useEnvVar && !decoded.useFile && decoded.apiKey.length > 0;
+  return !decoded.useEnvVar && !decoded.useFile && decoded.apiKey.length > 0 && !isPlaceholderKey(apiKey);
 }
 
 /** Suggests an env var name for a provider key: `baitestik` -> `BAITESTIK_API_KEY`. */

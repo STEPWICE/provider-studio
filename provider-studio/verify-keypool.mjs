@@ -179,15 +179,31 @@ eq("plugin entry appended", K.mergePluginEntry(["a"], "b"), ["a", "b"]);
   check("pool status never renders raw keys", !/pool-key-row[^]*\$\{[^}]*\bkey\b/.test(js) || js.includes("x.mask"));
 }
 
-// ------------------------------------------------- gorouter is gone
+// ------------------------------------------------- retired presets are gone
 {
   const presets = await import("./src/presets.mjs");
   check("gorouter preset removed", !presets.PRESETS.some((p) => p.id === "gorouter"));
+  check("gemini web bridge presets removed",
+    !presets.PRESETS.some((p) => /gemini-web-bridge/i.test(p.id)));
+  const serverJs = readFileSync(new URL("./server.mjs", import.meta.url), "utf8");
+  const appJs = readFileSync(new URL("./public/app.js", import.meta.url), "utf8");
+  check("bridge quota probe removed", !/\/v1\/quota|8010/.test(serverJs));
+  check("bridge dashboard badge removed", !/quotaBadge|8010\/dashboard/.test(appJs));
   const rootPath = new URL("../opencode.json", import.meta.url);
   if (existsSync(rootPath)) {
     const root = JSON.parse(readFileSync(rootPath, "utf8"));
-    const keys = Object.keys(root.provider || {});
-    check("repo opencode.json has no custom providers", keys.length === 0, keys.join(","));
+    // Both schemas: the repo config was on the legacy one and can be migrated.
+    const blocks = { ...(root.provider || {}), ...(root.providers || {}) };
+    const keys = Object.keys(blocks);
+    // A local model server may legitimately use a placeholder key. What must
+    // never be committed is a real credential: a literal key that is not a
+    // placeholder.
+    const leaked = keys.filter((k) => {
+      const v = blocks[k]?.options?.apiKey ?? blocks[k]?.settings?.apiKey;
+      return typeof v === "string" && v && !/^\{env:/.test(v) && !/^\{file:/.test(v)
+        && !/^(none|null|nil|n\/a|na|dummy|test|placeholder|local|empty|no-key|nokey|changeme|x|xxx|-|0)$/i.test(v);
+    });
+    check("repo opencode.json ships no real key", leaked.length === 0, leaked.join(","));
     check("repo opencode.json has no gorouter", !keys.includes("gorouter"));
   } else {
     check("repo opencode.json exists", false);

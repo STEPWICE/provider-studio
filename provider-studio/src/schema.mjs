@@ -84,11 +84,78 @@ function deepClone(v) {
   return v;
 }
 
+const isFiniteNumber = (v) => typeof v === "number" && Number.isFinite(v);
+
+/**
+ * V1 cost → V2 cost.
+ *
+ * The two schemas disagree on more than names: V1 spells cache prices as
+ * `cache_read`/`cache_write` at the top level, while V2 nests them under
+ * `cache: { read, write }`; V1 has a single `context_over_200k` surcharge, V2
+ * expresses the same thing as a second entry in a cost array with
+ * `tier: { type: "context", size }`. Copying a V1 cost object verbatim into a V2
+ * config produced a block opencode rejects (`additionalProperties: false`), so
+ * the conversion is spelled out instead of delegated to deepClone.
+ *
+ * Returns undefined when there is nothing representable: a half-filled cost is
+ * worse than none, since `input`/`output` are required together.
+ */
+function costToV2(cost) {
+  if (!isPlainObject(cost)) return cost;
+  const one = (src) => {
+    if (!isPlainObject(src) || !isFiniteNumber(src.input) || !isFiniteNumber(src.output)) return null;
+    const out = { input: src.input, output: src.output };
+    const read = isFiniteNumber(src.cache_read) ? src.cache_read : src.cache?.read;
+    const write = isFiniteNumber(src.cache_write) ? src.cache_write : src.cache?.write;
+    if (isFiniteNumber(read) || isFiniteNumber(write)) {
+      out.cache = {};
+      if (isFiniteNumber(read)) out.cache.read = read;
+      if (isFiniteNumber(write)) out.cache.write = write;
+    }
+    return out;
+  };
+  const base = one(cost);
+  const over = isPlainObject(cost.context_over_200k) ? one(cost.context_over_200k) : null;
+  if (over) {
+    // A tier without a base price has nothing to surcharge.
+    if (!base) return undefined;
+    return [base, { ...over, tier: { type: "context", size: 200000 } }];
+  }
+  return base || undefined;
+}
+
+/** V2 cost (object or tiered array) → the V1 fields the form and the audits read. */
+function costToLegacy(cost) {
+  if (Array.isArray(cost)) {
+    const withTier = cost.find((c) => isPlainObject(c) && isPlainObject(c.tier));
+    const base = cost.find((c) => isPlainObject(c) && !isPlainObject(c.tier)) || cost[0];
+    const out = costToLegacy(base);
+    if (!isPlainObject(out)) return out;
+    if (isPlainObject(withTier)) out.context_over_200k = costToLegacy(withTier);
+    return out;
+  }
+  if (!isPlainObject(cost)) return cost;
+  const out = { ...cost };
+  // `tier` only exists in the V2 array form; the V1 shape expresses it with
+  // context_over_200k, so it must not leak into the per-model view.
+  delete out.tier;
+  if (isPlainObject(cost.cache)) {
+    if (isFiniteNumber(cost.cache.read)) out.cache_read = cost.cache.read;
+    if (isFiniteNumber(cost.cache.write)) out.cache_write = cost.cache.write;
+    delete out.cache;
+  }
+  return out;
+}
+
 /**
  * V2 model entry → the V1 flags the tool reads.
  *
  * `capabilities` is kept untouched: it carries `reasoning.effort`, which the
- * form has no input for and must therefore survive a round-trip.
+ * form has no input for and must therefore survive a round-trip. The scalar
+ * names that V2 renamed (`releaseDate`, the nested cost) are mirrored back to
+ * their V1 spelling as well — without that, the form, the doctor and every
+ * audit see a model with no release date and no cache prices, and a save then
+ * writes the loss back to disk.
  */
 export function modelToLegacy(m) {
   if (!isPlainObject(m)) return m;
@@ -109,6 +176,10 @@ export function modelToLegacy(m) {
   }
   if (caps && typeof caps.tools === "boolean") out.tool_call = caps.tools;
   if (caps && typeof caps.temperature === "boolean") out.temperature = caps.temperature;
+  if (typeof m.releaseDate === "string" && m.releaseDate && m.release_date === undefined) {
+    out.release_date = m.releaseDate;
+  }
+  if (m.cost !== undefined) out.cost = costToLegacy(m.cost);
   return out;
 }
 
@@ -199,6 +270,9 @@ export function capabilitiesFromLegacy(m) {
   const prev = isPlainObject(m?.capabilities) ? m.capabilities : {};
   const input = listOrNull(m?.modalities?.input) || listOrNull(prev.input) || ["text"];
   const output = listOrNull(m?.modalities?.output) || listOrNull(prev.output) || ["text"];
+  // An explicit legacy flag wins: the V1 view always carries one when the block
+  // declared a capability, so a deleted flag must stay deleted (a fallback to
+  // the old `capabilities` value re-added it on every save).
   const caps = {
     tools: m?.tool_call !== false,
     input: input.length ? input : ["text"],
@@ -218,7 +292,25 @@ export function capabilitiesFromLegacy(m) {
   return caps;
 }
 
-const V2_SCALAR_MODEL_FIELDS = ["modelID", "family", "releaseDate", "package", "compatibility", "body", "cost", "disabled", "variants", "headers", "settings"];
+const V2_SCALAR_MODEL_FIELDS = ["modelID", "type", "family", "package", "compatibility", "body", "disabled", "headers", "settings"];
+
+/**
+ * V1 `variants` (an object keyed by id) → V2's list form.
+ *
+ * The form and `buildModelEntry` already produce the V2 array, so it passes
+ * through untouched. The legacy object form only carried `disabled`, which has
+ * no V2 equivalent — those entries are dropped rather than invented.
+ */
+function variantsToV2(variants) {
+  if (Array.isArray(variants)) return variants;
+  if (!isPlainObject(variants)) return undefined;
+  const out = [];
+  for (const [id, v] of Object.entries(variants)) {
+    if (!id || (isPlainObject(v) && v.disabled === true)) continue;
+    out.push({ id });
+  }
+  return out.length ? out : undefined;
+}
 
 /** V1 model entry → V2 model entry. */
 export function modelToV2(m) {
@@ -228,8 +320,33 @@ export function modelToV2(m) {
   for (const f of V2_SCALAR_MODEL_FIELDS) {
     if (m[f] !== undefined) out[f] = m[f];
   }
+  // V2 spelled the date camelCase. The V1 view exposes `release_date`, so
+  // copying the scalar list alone silently dropped it on every V2 write.
+  const release = typeof m.releaseDate === "string" && m.releaseDate
+    ? m.releaseDate
+    : (typeof m.release_date === "string" && m.release_date ? m.release_date : "");
+  if (release) out.releaseDate = release;
   out.capabilities = capabilitiesFromLegacy(m);
   if (isPlainObject(m.limit)) out.limit = { ...m.limit };
+  if (m.cost !== undefined) {
+    const cost = costToV2(m.cost);
+    if (cost !== undefined) out.cost = cost;
+  }
+  if (m.variants !== undefined) {
+    const variants = variantsToV2(m.variants);
+    if (variants !== undefined) out.variants = variants;
+  }
+  // Legacy model-provider knob for the reasoning field; V2 moved it into
+  // `compatibility`. Without the mapping a re-save lost it silently.
+  const interleaved = typeof m.interleaved === "string"
+    ? m.interleaved
+    : (isPlainObject(m.interleaved) && typeof m.interleaved.field === "string" ? m.interleaved.field : "");
+  if (interleaved) {
+    out.compatibility = {
+      ...(isPlainObject(out.compatibility) ? out.compatibility : {}),
+      reasoningField: interleaved,
+    };
+  }
   return out;
 }
 
@@ -404,6 +521,70 @@ function deepEqual(a, b) {
   const kb = Object.keys(b);
   if (ka.length !== kb.length) return false;
   return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqual(a[k], b[k]));
+}
+
+// ------------------------------------------------------- V1 → V2 migration
+// `provider` is the legacy map: opencode V2 still reads it, but it drops the
+// per-model `attachment`/`reasoning` flags and ignores `capabilities` inside it
+// ("omitted unsupported legacy setting"). There was no way to get from that
+// shape to the native `providers` one in this tool — the warning existed, the
+// fix did not. The migration is deliberately explicit (a separate action, never
+// part of the silent auto-fix): on a V1 binary the legacy block is the only one
+// that is read, so converting a config behind the user's back would break them.
+
+/**
+ * Provider-level fields V2 has no slot for. They are not cosmetic: `type` marks
+ * non-API blocks, and `api`/`id`/`whitelist`/`blacklist` change how requests go
+ * out, so converting a block that carries them would silently change behaviour.
+ */
+const V2_LOST_PROVIDER_FIELDS = ["type", "api", "id", "whitelist", "blacklist"];
+
+/** Model-level legacy fields V2 dropped; reported, not fatal. */
+const V2_LOST_MODEL_FIELDS = ["status", "experimental", "options", "provider"];
+
+/**
+ * Plan for rewriting a legacy `provider` map as native `providers`.
+ *
+ * Returns `{ ok, changes, providers, lost, already }`. `ok:false` means the
+ * document cannot be converted without a human decision (`blocked` says why);
+ * nothing is guessed or half-converted.
+ */
+export function planSchemaMigration(config) {
+  if (detectSchema(config) === SCHEMA_V2) return { ok: true, already: true, changes: [] };
+  const providers = isPlainObject(config?.provider) ? config.provider : null;
+  if (!providers) return { ok: false, error: "В конфиге нет блока provider — переводить нечего" };
+
+  const blocked = [];
+  const lost = [];
+  const converted = {};
+  for (const [key, block] of Object.entries(providers)) {
+    if (!isPlainObject(block)) {
+      blocked.push({ provider: key, fields: [], reason: "блок не является объектом" });
+      continue;
+    }
+    const lostProviders = V2_LOST_PROVIDER_FIELDS.filter((f) => block[f] !== undefined);
+    if (lostProviders.length) {
+      blocked.push({ provider: key, fields: lostProviders, reason: "поля не существуют в схеме V2" });
+      continue;
+    }
+    for (const [mid, m] of Object.entries(isPlainObject(block.models) ? block.models : {})) {
+      if (!isPlainObject(m)) continue;
+      const gone = V2_LOST_MODEL_FIELDS.filter((f) => m[f] !== undefined);
+      if (gone.length) lost.push({ provider: key, model: mid, fields: gone });
+    }
+    converted[key] = toV2Block(block);
+  }
+  if (blocked.length) return { ok: false, blocked, lost };
+  return {
+    ok: true,
+    already: false,
+    providers: Object.keys(converted),
+    lost,
+    changes: [
+      { op: "set", path: ["providers"], value: converted },
+      { op: "delete", path: ["provider"] },
+    ],
+  };
 }
 
 /**

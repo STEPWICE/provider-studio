@@ -5,3 +5,4 @@ node_modules/
 
 # Build output: the exe embeds a whole Node runtime (~88 MB).
 dist/
+data/zen-accounts.json

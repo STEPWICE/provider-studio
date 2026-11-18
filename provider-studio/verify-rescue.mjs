@@ -180,6 +180,11 @@ check("the suggestion uses {env:...}",
     .find((i) => i.id === "bad-env-ref")?.suggest === "{env:MY_KEY}");
 check("a plaintext key is flagged",
   has({ provider: { a: { npm: "x", options: { apiKey: "sk-abcdef123456" }, models: {} } } }, "plaintext-key"));
+// A local model server is told to use the literal "none"; flagging it as a
+// leaked secret produced a warning whose only fix was moving the word "none"
+// into an environment variable.
+check("a placeholder key is not a leak",
+  !has({ provider: { a: { npm: "x", options: { baseURL: "http://127.0.0.1:11434/v1", apiKey: "none" }, models: {} } } }, "plaintext-key"));
 check("a malformed {env:} is an error",
   has({ provider: { a: { npm: "x", options: { apiKey: "{env:}" }, models: {} } } }, "malformed-env-ref"));
 process.env.PS_TEST_KEY_PRESENT = "yes";

@@ -411,7 +411,7 @@ function validateV2Compat(config, issues) {
       issues.push(issue("warn", "v2-dropped-model-fields",
         `Провайдер «${key}»: OpenCode V2 отбрасывает legacy-поля attachment/reasoning — ` +
         `${dropped.join("; ")}. Возможности модели теперь описываются в capabilities; ` +
-        `картинки V2 принимает по умолчанию, reasoning-настройки стоит выставить явно`,
+        `переведи конфиг на схему V2 (providers), иначе reason-настройки не доедут до модели`,
         { provider: key }));
     }
   }
@@ -1009,7 +1009,7 @@ export function classifyProbeError(e) {
   const code = e?.cause?.code || e?.code || nested || "";
   const msg = String(e?.cause?.message || e?.message || "");
   if (name === "TimeoutError" || name === "AbortError") {
-    return { kind: "timeout", label: "таймаут", hint: "сервер не ответил вовремя, скорее всего он лежит или закрыт файрволом" };
+    return { kind: "timeout", label: "таймаут", hint: "сервер не ответил за отведённое время — возможно, он лежит, закрыт файрволом или просто медленный; повтори проверку" };
   }
   if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
     return { kind: "dns", label: "домен не найден", hint: "проверь адрес или DNS" };
@@ -1125,7 +1125,7 @@ export async function testConnection({ baseURL, apiFormat, apiKey } = {}) {
   for (const c of candidates) {
     let r;
     try {
-      r = await guardedRequest(c, { headers, timeoutMs: 8000, blockLocal: guard.blockLocal });
+      r = await guardedRequest(c, { headers, timeoutMs: 12000, blockLocal: guard.blockLocal });
     } catch (e) {
       lastClass = classifyProbeError(e);
       lastErr = lastClass.label;

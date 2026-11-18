@@ -303,6 +303,142 @@ eq("an empty providers map alone is still V2", S.detectSchema({ providers: {} })
   check("legacy reasoning in a V1 document is still flagged", ids(v1).includes("v2-dropped-model-fields"));
 }
 
+// ------------------------------------------------ full V1 → V2 model conversion
+// The V1 view is symmetric only if the write-back converts the renamed scalars
+// too. These cases pin the fields that used to be copied verbatim (cost) or
+// dropped entirely (releaseDate, type, interleaved).
+
+{
+  const legacy = {
+    name: "m",
+    modalities: { input: ["text", "image"], output: ["text"] },
+    attachment: true,
+    reasoning: true,
+    tool_call: true,
+    release_date: "2026-01-02",
+    limit: { context: 1000, output: 100 },
+    cost: { input: 1, output: 2, cache_read: 0.1, cache_write: 0.2 },
+    interleaved: "reasoning_content",
+  };
+  const v2 = S.modelToV2(legacy);
+  eq("release_date becomes releaseDate", v2.releaseDate, "2026-01-02");
+  eq("V1 cache prices become a V2 cache object", v2.cost, { input: 1, output: 2, cache: { read: 0.1, write: 0.2 } });
+  eq("no V1 cost key survives", Object.keys(v2.cost).sort(), ["cache", "input", "output"]);
+  eq("interleaved becomes compatibility.reasoningField", v2.compatibility, { reasoningField: "reasoning_content" });
+  eq("legacy flags are gone from the V2 entry",
+    ["attachment", "reasoning", "tool_call", "modalities", "release_date"].filter((f) => f in v2), []);
+
+  const back = S.modelToLegacy(v2);
+  eq("releaseDate is readable as release_date again", back.release_date, "2026-01-02");
+  eq("cache prices are back in V1 form", back.cost, { input: 1, output: 2, cache_read: 0.1, cache_write: 0.2 });
+  eq("the V2 type survives a rewrite", S.modelToV2({ name: "m", type: "chat" }).type, "chat");
+}
+
+{
+  const tiered = S.modelToV2({ cost: { input: 1, output: 2, context_over_200k: { input: 3, output: 4 } } });
+  eq("a context surcharge becomes a tiered cost array", tiered.cost,
+    [{ input: 1, output: 2 }, { input: 3, output: 4, tier: { type: "context", size: 200000 } }]);
+  eq("a tiered cost reads back as context_over_200k", S.modelToLegacy({ cost: tiered.cost }).cost,
+    { input: 1, output: 2, context_over_200k: { input: 3, output: 4 } });
+  eq("a half-filled cost is dropped, not written invalid", S.modelToV2({ cost: { input: 1 } }).cost, undefined);
+}
+
+{
+  // Round-trip of the fields that live only in V2 form: a rename must not
+  // launder `type`, `releaseDate` or the nested cache prices away.
+  const doc = {
+    providers: {
+      p: {
+        package: "@ai-sdk/openai-compatible",
+        settings: { apiKey: "{env:P_KEY}" },
+        models: {
+          m: {
+            name: "m",
+            type: "chat",
+            releaseDate: "2026-01-02",
+            cost: { input: 1, output: 2, cache: { read: 0.1 } },
+            capabilities: { tools: true, input: ["text"], output: ["text"], reasoning: { supported: true, effort: ["low"] } },
+            limit: { context: 1000, output: 100 },
+          },
+        },
+      },
+    },
+    model: "p/m",
+  };
+  const adapted = S.adaptChanges(
+    [{ op: "merge", path: ["provider", "p"], value: { name: "P2" } }],
+    S.shadowLegacyProviders(doc),
+  );
+  const written = adapted.find((c) => c.path[0] === "providers")?.value;
+  eq("model type survives a V2 rewrite", written?.models.m.type, "chat");
+  eq("releaseDate survives a V2 rewrite", written?.models.m.releaseDate, "2026-01-02");
+  eq("nested cache prices survive a V2 rewrite", written?.models.m.cost, { input: 1, output: 2, cache: { read: 0.1 } });
+}
+
+// ------------------------------------------------------------- V1 → V2 migration
+
+{
+  const doc = {
+    $schema: "https://opencode.ai/config.json",
+    provider: {
+      p: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "P",
+        env: ["P_KEY"],
+        options: {
+          baseURL: "https://x.dev/v1",
+          apiKey: "{env:P_KEY}",
+          headers: { "x-app": "cli" },
+        },
+        models: {
+          m: {
+            name: "m",
+            modalities: { input: ["text", "image"], output: ["text"] },
+            attachment: true,
+            reasoning: true,
+            tool_call: true,
+            limit: { context: 1000, output: 100 },
+            cost: { input: 0, output: 0 },
+          },
+        },
+      },
+    },
+    model: "p/m",
+  };
+  const plan = S.planSchemaMigration(doc);
+  check("a legacy document can be migrated", plan.ok && !plan.already, JSON.stringify(plan.blocked || plan.error));
+  const applied = S.applySchemaChanges(JSON.stringify(doc, null, 2), doc, plan.changes);
+  check("the migration applies", applied.ok, applied.error || "");
+  const parsed = parseJsonc(applied.text);
+  check("the migrated file parses", parsed.ok, parsed.error || "");
+  if (parsed.ok) {
+    const out = parsed.value;
+    check("the legacy map is gone", !("provider" in out));
+    eq("the V2 map holds the provider", Object.keys(out.providers), ["p"]);
+    const block = out.providers.p;
+    eq("npm becomes package", block.package, "@ai-sdk/openai-compatible");
+    eq("headers move to the provider top level", block.headers, { "x-app": "cli" });
+    eq("settings keep the address and key", block.settings, { baseURL: "https://x.dev/v1", apiKey: "{env:P_KEY}" });
+    eq("capabilities are rebuilt", block.models.m.capabilities,
+      { tools: true, input: ["text", "image"], output: ["text"], reasoning: { supported: true } });
+    eq("no legacy model flags survive",
+      ["attachment", "reasoning", "tool_call", "modalities"].filter((f) => f in block.models.m), []);
+    eq("the default model is untouched", out.model, "p/m");
+    const envIds = new Set(["env-missing", "env-not-inherited", "env-truncated"]);
+    check("the migrated document validates", (await import("./src/rescue.mjs")).validateConfig(out)
+      .every((i) => i.severity !== "error" || envIds.has(i.id)));
+  }
+}
+
+{
+  const blocked = S.planSchemaMigration({ provider: { local: { type: "local", npm: "x" } } });
+  check("a block V2 cannot express blocks the migration", !blocked.ok);
+  eq("the blocking field is named", blocked.blocked[0].fields, ["type"]);
+
+  const already = S.planSchemaMigration({ providers: { p: { package: "x" } } });
+  check("a V2 document is reported as already migrated", already.ok && already.already);
+}
+
 // ------------------------------------------------------------------- summary
 
 console.log("");
