@@ -1,26 +1,30 @@
 // src/zengate.mjs — локальный шлюз пула аккаунтов Zen для OpenCode/OpenChamber.
 //
-// Zen отдаёт бесплатные модели двум способом: анонимно (квота на exit IP)
-// и по логину/ключу аккаунта (квота на аккаунт). Шлюз крутит и то и другое:
-// сначала аккаунты напрямую, затем те же аккаунты и анонимные попытки через
-// живые выходы VPNLiberty/Hynet (src/exits.mjs). Суточная квота аккаунта
-// выводит его из ротации до следующих суток UTC, 429/5xx — кулдаун,
-// региональный отказ — следующий выход с тем же аккаунтом.
+// Проверено 2026-11-18: квота бесплатных моделей Zen привязана к exit IP
+// (429 FreeUsageLimitError), аккаунтный OAuth-токен её не обходит, но клиент
+// обязан представляться OpenCode (User-Agent opencode/<channel>/<ver>/<name>
+// + x-opencode-client). Шлюз крутит аккаунты (OAuth из opencode.db, ключи из
+// ZEN_API_KEY[_N] / data/zen-accounts.json) и анонимные попытки через живые
+// выходы BlancVPN/VPNLiberty/Hynet (src/exits.mjs). 429 по OAuth гасит выход
+// на 10 минут, а не аккаунт; суточный бан — только для ключей с billing-отказом.
 //
-// Секреты живут в переменных окружения ZEN_API_KEY[_N] или в
-// data/zen-accounts.json (OAuth-токены), в код не попадают.
+// Секреты живут в переменных окружения ZEN_API_KEY[_N], в
+// data/zen-accounts.json или в opencode.db, в код не попадают.
 
 import http from "node:http";
 import https from "node:https";
 import tls from "node:tls";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { ExitManager, loadNodes } from "./exits.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const ZEN_BASE = "https://opencode.ai/inference/openai/v1";
 const ACCOUNTS_FILE = path.join(HERE, "..", "data", "zen-accounts.json");
+const OPENCODE_DB = "C:/Users/STEPWICE/.local/share/opencode/opencode.db";
 
 const DAILY_RE = /requests per day|tokens per day|free-models-per-day|per-day|daily.?limit|usage limit reached|used today's free messages|free messages/i;
 const RATE_RE = /rate.?limit|too many requests|请求过于频繁|限流/i;
@@ -50,6 +54,20 @@ export function loadCredentials() {
     const file = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
     for (const acc of Array.isArray(file) ? file : file.accounts || []) {
       if (acc && acc.token) creds.push({ id: acc.id || acc.email || `oauth-${creds.length}`, kind: "oauth", value: acc.token });
+    }
+  } catch {}
+  // Аккаунты, вошедшие через `opencode auth login`: CLI сам обновляет токены в БД.
+  try {
+    const db = new DatabaseSync(OPENCODE_DB, { readOnly: true });
+    const rows = db.prepare("SELECT value FROM credential WHERE integration_id='opencode' AND active=1").all();
+    db.close();
+    for (const r of rows) {
+      try {
+        const c = JSON.parse(r.value);
+        if (c.type === "oauth" && c.access && c.expires > Date.now() && !creds.some((x) => x.value === c.access)) {
+          creds.push({ id: c.metadata?.email || "opencode-account", kind: "oauth", value: c.access, orgId: c.metadata?.orgID || "" });
+        }
+      } catch {}
     }
   } catch {}
   return creds;
@@ -143,7 +161,7 @@ function pipeToClient(upstream, clientRes, isFetch) {
   }
 }
 
-export function createZenGate({ port = 8790, subs = ["VPNLiberty", "Hynet"], maxExits = 3 } = {}) {
+export function createZenGate({ port = 8790, subs = ["BlancVPN", "VPNLiberty", "Hynet"], maxExits = 3 } = {}) {
   let state = createState(loadCredentials());
   const mgr = new ExitManager();
   const stats = { requests: 0, ok: 0, rotated: 0, exitUsed: 0, lastError: "" };
@@ -201,6 +219,15 @@ export function createZenGate({ port = 8790, subs = ["VPNLiberty", "Hynet"], max
   async function attempt(cred, exit, url, method, headers, body) {
     const h = { ...headers };
     delete h.host; delete h["content-length"]; delete h.connection;
+    // Бесплатные модели Zen требуют клиент OpenCode: шлюз представляется им.
+    const ses = "ses_" + crypto.randomBytes(12).toString("hex");
+    h["user-agent"] = "opencode/latest/2.2.5/cli";
+    h["x-opencode-client"] = "cli";
+    h["x-opencode-session"] = ses;
+    h["x-opencode-session-id"] = ses;
+    h["x-session-affinity"] = ses;
+    h["x-session-id"] = ses;
+    if (cred && cred.orgId) h["x-opencode-org-id"] = cred.orgId;
     if (cred && cred.kind !== "anon") h.authorization = `Bearer ${cred.value}`;
     else delete h.authorization;
     if (exit) return await tunnelRequest({ host: "127.0.0.1", port: exit.port }, url, { method, headers: h, body });
@@ -260,6 +287,15 @@ export function createZenGate({ port = 8790, subs = ["VPNLiberty", "Hynet"], max
             exit.quotaUntil = Date.now() + 600000;
             quotaHit = true;
           }
+          continue;
+        }
+        if (cred.kind === "oauth" && (status === 429 || DAILY_RE.test(text))) {
+          // Квота бесплатных моделей привязана к exit IP, а не к аккаунту:
+          // гасим выход, аккаунт отправляем в короткий кулдаун, а не в суточный.
+          if (exit) { exit.alive = false; exit.quotaUntil = Date.now() + 600000; }
+          cred.cooldownUntil = Date.now() + 60000;
+          cred.lastError = `ip quota (${status})`;
+          quotaHit = true;
           continue;
         }
         const verdict = note(cred, status, text);
