@@ -54,7 +54,7 @@ export function loadCredentials() {
     const file = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
     for (const acc of Array.isArray(file) ? file : file.accounts || []) {
       if (acc && acc.token && (!acc.expires || acc.expires > Date.now())) {
-        creds.push({ id: acc.id || acc.email || `oauth-${creds.length}`, kind: "oauth", value: acc.token });
+        creds.push({ id: acc.id || acc.email || `oauth-${creds.length}`, kind: "oauth", value: acc.token, expires: acc.expires || 0 });
       }
     }
   } catch {}
@@ -67,7 +67,7 @@ export function loadCredentials() {
       try {
         const c = JSON.parse(r.value);
         if (c.type === "oauth" && c.access && c.expires > Date.now() && !creds.some((x) => x.value === c.access)) {
-          creds.push({ id: c.metadata?.email || "opencode-account", kind: "oauth", value: c.access, orgId: c.metadata?.orgID || "" });
+          creds.push({ id: c.metadata?.email || "opencode-account", kind: "oauth", value: c.access, orgId: c.metadata?.orgID || "", expires: c.expires || 0 });
         }
       } catch {}
     }
@@ -76,7 +76,7 @@ export function loadCredentials() {
 }
 
 function createState(creds) {
-  return creds.map((c) => ({ ...c, dead: false, dailyUntil: 0, cooldownUntil: 0, fails: 0, used: 0, lastError: "" }));
+  return creds.map((c) => ({ ...c, dead: false, dailyUntil: 0, cooldownUntil: 0, fails: 0, used: 0, lastError: "", expires: c.expires || 0 }));
 }
 
 function alive(state, now) {
@@ -171,6 +171,8 @@ export function createZenGate({ port = 8790, subs = ["BlancVPN", "VPNLiberty", "
   let candidates = [];
   let candidateAt = 0;
   const deadSkip = new Map();
+  let warming = null;
+  const startedAt = Date.now();
 
   function refreshCandidates() {
     const now = Date.now();
@@ -194,9 +196,26 @@ export function createZenGate({ port = 8790, subs = ["BlancVPN", "VPNLiberty", "
     return candidates;
   }
 
-  async function ensureExits() {
+  /** Прогрев выходов: запрос ждёт только первый живой (minLive=1), фоновый
+   * таймер добирает пул до maxExits. Параллельные вызовы не плодят xray. */
+  function ensureExits(minLive = maxExits) {
+    if (warming) return minLive <= 1 ? Promise.resolve(mgr.live()) : warming;
+    warming = warmExits(minLive).finally(() => { warming = null; });
+    return warming;
+  }
+
+  async function warmExits(minLive) {
+    const now = Date.now();
+    // Забенченные по квоте выходы: срок вышел — пробуем снова, вдруг IP остыл.
+    for (const e of mgr.exits.values()) {
+      if (!e.alive && e.quotaUntil && e.quotaUntil <= now) {
+        e.quotaUntil = 0;
+        await mgr.check(e.node.id);
+        if (e.alive) console.error(`[zenpool] exit ${e.node.remarks} реабилитирован после квоты`);
+      }
+    }
     const live = mgr.live();
-    if (live.length >= Math.min(maxExits, 1)) return live;
+    if (live.length >= Math.min(minLive, maxExits)) return live;
     refreshCandidates();
     for (const node of candidates) {
       if (mgr.exits.has(node.id)) { await mgr.check(node.id); continue; }
@@ -211,9 +230,9 @@ export function createZenGate({ port = 8790, subs = ["BlancVPN", "VPNLiberty", "
       console.error(`[zenpool] exit ${node.remarks} alive=${entry.alive} ms=${entry.ms}`);
       // Hynet — личный VPS: его IP не выжжен толпой, ретраим чаще общих нод.
       if (!entry.alive) deadSkip.set(node.id, Date.now() + (node.sub.toLowerCase() === "hynet" ? 90000 : 300000));
-      // Одного живого выхода достаточно для фолбэка; остальные добираем
-      // фоновым обновлением, иначе запрос ждёт перебора всех мёртвых нод.
-      if (mgr.live().length >= 1) break;
+      // Запросу достаточно одного живого выхода; остальные добирает фон,
+      // иначе клиент ждёт перебора всех мёртвых нод.
+      if (mgr.live().length >= minLive) break;
     }
     return mgr.live();
   }
@@ -254,7 +273,7 @@ export function createZenGate({ port = 8790, subs = ["BlancVPN", "VPNLiberty", "
     for (let round = 0; round < 2; round++) {
       const tries = [];
       if (round === 0) for (const c of order) tries.push({ cred: c, exit: null });
-      const exits = await ensureExits();
+      const exits = await ensureExits(1);
       for (const exit of exits) {
         for (const c of order) tries.push({ cred: c, exit });
         tries.push({ cred: anon, exit });
@@ -315,10 +334,21 @@ export function createZenGate({ port = 8790, subs = ["BlancVPN", "VPNLiberty", "
   const server = http.createServer((req, res) => {
     const u = new URL(req.url, "http://local");
     if (u.pathname === "/status") {
+      const now = Date.now();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
+        startedAt,
+        uptimeSec: Math.round((now - startedAt) / 1000),
+        subs,
+        maxExits,
+        models: FREE_MODELS,
         stats,
-        creds: state.map((s) => ({ id: s.id, kind: s.kind, dead: s.dead, daily: s.dailyUntil > Date.now(), cooldown: s.cooldownUntil > Date.now(), used: s.used, lastError: s.lastError })),
+        creds: state.map((s) => ({
+          id: s.id, kind: s.kind, dead: s.dead,
+          daily: s.dailyUntil > now, dailyUntil: s.dailyUntil,
+          cooldown: s.cooldownUntil > now, cooldownUntil: s.cooldownUntil,
+          expires: s.expires || 0, used: s.used, lastError: s.lastError,
+        })),
         exits: mgr.status(),
       }, null, 2));
       return;

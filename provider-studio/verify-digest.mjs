@@ -128,10 +128,11 @@ function stubFetch(map) {
   check("без сети отдаётся протухший кэш, а не ошибка", d.ok === true && d.stale === true, JSON.stringify(d).slice(0, 160));
   eq("данные из кэша целы", d.perks.map((p) => p.id), ["p1"]);
 
-  // Кэша нет вообще — честная ошибка, а не исключение.
+  // Кэша нет вообще — встроенный датированный снимок, а не красный экран.
   D.clearDigestCache();
   const d2 = await D.loadDigest({ fetchImpl: dead });
-  check("без кэша и сети — ok:false", d2.ok === false, JSON.stringify(d2).slice(0, 160));
+  check("без кэша и сети — снимок с fallback:true", d2.ok === true && d2.fallback === true && d2.stale === true, JSON.stringify(d2).slice(0, 160));
+  check("снимок датирован и не пуст", d2.as_of === "2026-11-18" && d2.perks.length > 0 && d2.news.length > 0, d2.as_of);
   check("списки пустые, а не мусор", Array.isArray(d2.perks) && Array.isArray(d2.news));
 }
 
@@ -140,7 +141,7 @@ function stubFetch(map) {
   const bad = stubFetch(() => ({ nonsense: 1 }));
   D.clearDigestCache();
   const d = await D.loadDigest({ fetchImpl: bad });
-  check("битый фид без кэша — ok:false", d.ok === false, JSON.stringify(d).slice(0, 160));
+  check("битый фид без кэша — снимок, а не ошибка", d.ok === true && d.fallback === true, JSON.stringify(d).slice(0, 160));
 
   // Битый фид при живом кэше — кэш побеждает (стабильность важнее свежести).
   const good = stubFetch((u) => (u.includes("perks") ? PERKS : NEWS));

@@ -232,7 +232,7 @@ export class ExitManager {
   status() {
     return [...this.exits.values()].map((e) => ({
       id: e.node.id, remarks: e.node.remarks, sub: e.node.sub, port: e.port,
-      alive: e.alive, ms: e.ms, checkedAt: e.checkedAt,
+      alive: e.alive, ms: e.ms, checkedAt: e.checkedAt, quotaUntil: e.quotaUntil || 0,
     }));
   }
 }

@@ -1,7 +1,8 @@
 import http from "node:http";
 import path from "node:path";
 import { existsSync, readFileSync, renameSync, unlinkSync, statSync, rmSync } from "node:fs";
-import { exec, execFile } from "node:child_process";
+import { exec, execFile, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   readConfig, readConfigAtPath, setDefaultModel,
   planProviderChange, planProvidersRemoval, removeProviders, renameProvider,
@@ -1476,6 +1477,39 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, ...(await r.json()) });
       } catch {
         return json(res, 200, { ok: false, error: "Шлюз zenpool не отвечает на 127.0.0.1:8790" });
+      }
+    }
+    // Честная проверка пула: один реальный completion через шлюз, а не /models.
+    if (url.pathname === "/api/zenpool-test" && req.method === "POST") {
+      try {
+        const r = await fetch("http://127.0.0.1:8790/v1/chat/completions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "hy4-flash-free", messages: [{ role: "user", content: "Reply with exactly: POOL-OK" }], max_tokens: 10 }),
+          signal: AbortSignal.timeout(120000),
+        });
+        const text = await r.text();
+        if (r.ok) {
+          let reply = "";
+          try { reply = JSON.parse(text).choices?.[0]?.message?.content || ""; } catch {}
+          return json(res, 200, { ok: true, status: r.status, reply });
+        }
+        return json(res, 200, { ok: false, status: r.status, detail: text.slice(0, 400) });
+      } catch (e) {
+        return json(res, 200, { ok: false, error: `Шлюз zenpool не отвечает: ${e?.message || e}` });
+      }
+    }
+    // Вход в ещё один аккаунт Zen: отдельное окно консоли с zen-login.cmd
+    // (device-код нужно подтверждать в браузере, UI Studio для этого не место).
+    if (url.pathname === "/api/zenpool-login" && req.method === "POST") {
+      const script = fileURLToPath(new URL("./scripts/zen-login.cmd", import.meta.url));
+      if (!existsSync(script)) return json(res, 200, { ok: false, error: "scripts/zen-login.cmd не найден" });
+      try {
+        const child = spawn("cmd.exe", ["/c", "start", "Zen-пул: вход", script], { detached: true, stdio: "ignore" });
+        child.unref();
+        return json(res, 200, { ok: true });
+      } catch (e) {
+        return json(res, 200, { ok: false, error: e?.message || String(e) });
       }
     }
     if (url.pathname === "/api/pool-check" && req.method === "POST") {

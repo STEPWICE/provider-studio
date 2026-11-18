@@ -28,6 +28,54 @@ export const DIGEST_TTL_MS = 6 * 60 * 60 * 1000;
 
 const CACHE_FILE = () => join(dataDir(), "digest-cache.json");
 
+// Встроенный снимок проверенной халявы: отдаётся, когда борд лежит и кэша нет
+// вовсе (первый запуск без сети). Это не данные борда, а локально проверенные
+// факты с датой проверки — UI помечает их как снимок, а не как свежий фид.
+export const FALLBACK_SNAPSHOT = {
+  at: Date.UTC(2026, 10, 18),
+  as_of: "2026-11-18",
+  perks: {
+    as_of: "2026-11-18",
+    items: [
+      {
+        id: "local-tokenharbor-free", provider: "TokenHarbor", product: "Free tier", kind: "free-tier",
+        related_model: "deepseek-v4.1-flash:free", grant_mode: "auto", perk_class: "free-tier",
+        title_en: "TokenHarbor: free DeepSeek V4.1 Flash / MiMo v2.6 Flash / DeepSeek V4 Flash",
+        summary_en: "Verified 2026-11-10: real completions and tool calls via Anthropic-style /v1/messages with a Claude Code token.",
+        claim_en: "Use a Claude Code token as Bearer key against https://tokenharbor.ai.",
+        starts: "2026-11-10", ends: "", status: "active", source: "https://tokenharbor.ai",
+      },
+      {
+        id: "local-coarena-free", provider: "CoArena", product: "Free tier", kind: "free-tier",
+        related_model: "deepseek-v4-1-flash-1017", grant_mode: "auto", perk_class: "free-tier",
+        title_en: "CoArena: free gpt-6-luna / gemini-3-8-flash / deepseek-v4-1-flash-1017",
+        summary_en: "Verified 2026-11-18: pool keys alive, free tier limited to these three models; paid ids return payment_required.",
+        claim_en: "Any live COARENA_API_KEY against https://coarena.ai/api/v1.",
+        starts: "2026-11-18", ends: "", status: "active", source: "https://coarena.ai",
+      },
+      {
+        id: "local-zen-free", provider: "OpenCode", product: "Zen", kind: "free-tier",
+        related_model: "hy4-flash-free", grant_mode: "auto", perk_class: "free-tier",
+        title_en: "OpenCode Zen: 13 free models, quota keyed by exit IP",
+        summary_en: "Verified 2026-11-18: free models answer only with OpenCode client headers; the daily quota follows the exit IP, so rotating VPN exits (zenpool gateway) restores access.",
+        claim_en: "Run the zenpool gateway (port 8790) and point the zenpool provider at it.",
+        starts: "2026-11-18", ends: "", status: "active", source: "https://opencode.ai",
+      },
+    ],
+  },
+  news: {
+    as_of: "2026-11-18",
+    items: [
+      {
+        id: "local-ailyre-down", provider: "Ailyre", product: "Board", impact: "outage",
+        title_en: "Ailyre board feeds down (HTTP 530 / Cloudflare 1033)",
+        summary_en: "Since 2026-11-18 both perks.json and news.json fail from every network path; the digest shows this local snapshot until the board recovers.",
+        starts: "2026-11-18", ends: "", status: "active", source: "https://board.ailyre.com",
+      },
+    ],
+  },
+};
+
 function clean(v) {
   return typeof v === "string" ? v.trim() : "";
 }
@@ -151,7 +199,8 @@ function shape(raw, kind) {
 
 /**
  * Грузит дайджест: свежий кэш — сразу, иначе сеть, при её недоступности —
- * протухший кэш с stale:true. Без кэша и без сети — честная ошибка.
+ * протухший кэш с stale:true. Без кэша и без сети — встроенный датированный
+ * снимок с fallback:true, а не ошибка.
  *
  * Фиды независимы: висящий news.json не убивает свежий perks.json (и
  * наоборот) — раньше Promise.all ронял всё целиком, и вместо половины халявы
@@ -205,20 +254,19 @@ export async function loadDigest({ timeoutMs = 15000, refresh = false, fetchImpl
       partial: true, error: errors.join("; "),
     });
   }
-  // Сюда попадаем, только когда нет ни свежего, ни кэшированного: полный
-  // провал сети без подстраховки — честная ошибка. (Ветка «протухший кэш»
-  // выше: целый кэш всегда даёт обе половины и уходит через неё.)
-  return {
-    ok: false, as_of: "", perks: [], news: [], ended: 0,
-    stale: false, partial: false, cachedAt: 0, error: `Дайджест недоступен: ${errors.join("; ") || "нет сети"}`,
-  };
+  // Ни свежего, ни кэшированного: борд лежит и кэша нет. Вместо красного
+  // экрана — встроенный датированный снимок проверенной халявы (fallback:true).
+  return present(FALLBACK_SNAPSHOT, {
+    stale: true, cachedAt: FALLBACK_SNAPSHOT.at, fallback: true,
+    error: `Борд недоступен (${errors.join("; ") || "нет сети"}) — показан локальный снимок`,
+  });
 }
 
 function errText(e) {
   return String(e?.message || e || "неизвестная ошибка");
 }
 
-function present(payload, { stale, cachedAt, error = "", partial = false }) {
+function present(payload, { stale, cachedAt, error = "", partial = false, fallback = false }) {
   const perks = payload?.perks && Array.isArray(payload.perks.items) ? payload.perks : { as_of: "", items: [] };
   const news = payload?.news && Array.isArray(payload.news.items) ? payload.news : { items: [] };
   const { live, ended } = splitPerks(perks.items);
@@ -230,6 +278,7 @@ function present(payload, { stale, cachedAt, error = "", partial = false }) {
     ended,
     stale: !!stale,
     partial: !!partial,
+    fallback: !!fallback,
     cachedAt,
     error,
   };

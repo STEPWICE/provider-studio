@@ -3890,6 +3890,104 @@ async function runEnvAudit() {
   });
 }
 
+function zenLeftMin(ts) {
+  return Math.max(1, Math.ceil((ts - Date.now()) / 60000));
+}
+
+function zenTestLine() {
+  const t = state.zenpoolTest;
+  if (!t) return "";
+  if (t.ok) return `<div class="ok-line">✓ чат работает: ${esc((t.reply || "200").slice(0, 120))}</div>`;
+  if (t.status === 429 || /FreeUsageLimit|исчерпаны/i.test(t.detail || "")) {
+    return `<div class="warn-line">⏳ квоты исчерпаны на всех exit IP — шлюз сам реабилитирует выходы каждые 10 минут, аккаунты не при чём</div>`;
+  }
+  return `<div class="err-line">✕ ${esc(t.error || `HTTP ${t.status || "?"}: ${(t.detail || "").slice(0, 200)}`)}</div>`;
+}
+
+function paintZenpool(r) {
+  const el = $("#issues");
+  const creds = asArray(r.creds);
+  const exits = asArray(r.exits);
+  const s = r.stats || {};
+  const now = Date.now();
+  const live = exits.filter((e) => e.alive && (e.quotaUntil || 0) <= now).length;
+  const upMin = Math.floor((r.uptimeSec || 0) / 60);
+  let html = `<div class="result-card"><h3>Zen-пул</h3>`;
+  html += `<div class="ok-line" style="color:var(--muted)">запросов: ${s.requests || 0} · успешных: ${s.ok || 0} · ротаций: ${s.rotated || 0} · через выходы: ${s.exitUsed || 0} · шлюз работает ${upMin} мин</div>`;
+  if (s.lastError) html += `<div class="diag-sub muted">последняя ошибка: ${esc(s.lastError)}</div>`;
+  html += `<div class="diag-sect">Проверка</div>
+    <div class="diag-fix"><button class="btn btn-mini" id="zenpoolTest" type="button">Проверить чат</button>
+    <button class="btn btn-mini" id="zenpoolLogin" type="button">Войти в ещё аккаунт</button>
+    <button class="btn btn-mini" id="zenpoolReload" type="button">Перечитать аккаунты</button>
+    <button class="btn btn-mini" id="zenpoolRerun" type="button">Обновить</button></div>
+    <div id="zenpoolTestResult">${zenTestLine()}</div>`;
+  html += `<div class="diag-sect">Аккаунты и ключи (${creds.length})</div>`;
+  if (!creds.length) html += `<div class="diag-sub muted">— нет аккаунтов: нажми «Войти в ещё аккаунт», шлюз подхватит токен из opencode.db —</div>`;
+  for (const c of creds) {
+    const flags = [];
+    if (c.dead) flags.push("мёртв");
+    if (c.daily) flags.push(`суточная квота${c.dailyUntil > now ? ` (ещё ~${zenLeftMin(c.dailyUntil)} мин)` : ""}`);
+    if (c.cooldown) flags.push(`кулдаун (ещё ~${zenLeftMin(c.cooldownUntil)} мин)`);
+    const exp = c.expires ? ` · токен до ${new Date(c.expires).toLocaleDateString("ru-RU")}` : "";
+    html += `<div class="diag-row"><span class="diag-name">${esc(c.id)}</span><span class="diag-meta">${esc(c.kind)} · использован ${c.used || 0} раз${exp}${flags.length ? " · " + esc(flags.join(", ")) : ""}</span></div>`;
+    if (c.lastError) html += `<div class="diag-sub muted">${esc(c.lastError)}</div>`;
+  }
+  html += `<div class="diag-sect">Выходы VPN (${live}/${exits.length} живых, цель ${r.maxExits || 3})</div>`;
+  if (!exits.length) html += `<div class="diag-sub muted">— выходы ещё не подняты, шлюз прогревает их в фоне —</div>`;
+  for (const e of exits) {
+    let st;
+    if ((e.quotaUntil || 0) > now) st = `⏳ квота IP (ещё ~${zenLeftMin(e.quotaUntil)} мин)`;
+    else if (e.alive) st = `✓ ${e.ms} мс`;
+    else st = "✕ мёртв";
+    html += `<div class="diag-row"><span class="diag-name">${esc(e.remarks)}</span><span class="diag-meta">${esc(e.sub)} · ${st}</span></div>`;
+  }
+  html += `<div class="diag-sub muted">Квота бесплатных моделей Zen привязана к exit IP: при 429 шлюз гасит выход на 10 минут и пробует следующий. Аккаунты не обходят IP-лимит, но ротация выходов — обходит. Панель обновляется сама каждые 15 секунд.</div>`;
+  html += `</div>`;
+  el.innerHTML = html;
+  showReports();
+  const rerun = $("#zenpoolRerun");
+  if (rerun) rerun.onclick = () => runZenpoolStatus();
+  const test = $("#zenpoolTest");
+  if (test) test.onclick = async () => {
+    setBtnLoading(test, true);
+    state.zenpoolTesting = true;
+    const box = $("#zenpoolTestResult");
+    if (box) box.innerHTML = `<div class="diag-sub muted">Проверяю реальный completion через пул… (до 2 минут)</div>`;
+    try {
+      const tr = await apiSafe("/api/zenpool-test", { method: "POST" });
+      state.zenpoolTest = tr || { ok: false, error: "нет ответа от Studio" };
+      const b2 = $("#zenpoolTestResult");
+      if (b2) b2.innerHTML = zenTestLine();
+      if (tr && tr.ok) toast("Zen-пул: чат работает", "ok");
+    } finally {
+      state.zenpoolTesting = false;
+      setBtnLoading(test, false);
+    }
+  };
+  const login = $("#zenpoolLogin");
+  if (login) login.onclick = async () => {
+    setBtnLoading(login, true);
+    try {
+      const lr = await apiSafe("/api/zenpool-login", { method: "POST" });
+      if (lr && lr.ok) toast("Окно входа открыто: подтверди код в браузере, потом «Перечитать аккаунты»", "ok");
+      else toast((lr && lr.error) || "Не удалось открыть окно входа", "err");
+    } finally {
+      setBtnLoading(login, false);
+    }
+  };
+  const reload = $("#zenpoolReload");
+  if (reload) reload.onclick = async () => {
+    setBtnLoading(reload, true);
+    try {
+      const rr = await apiSafe("/api/zenpool-reload", { method: "POST" });
+      toast(rr && rr.ok ? "Аккаунты перечитаны" : ((rr && rr.error) || "Шлюз не отвечает"), rr && rr.ok ? "ok" : "err");
+      await runZenpoolStatus();
+    } finally {
+      setBtnLoading(reload, false);
+    }
+  };
+}
+
 async function runZenpoolStatus() {
   setStatus("Читаю пул Zen…", "");
   const r = await apiSafe("/api/zenpool-status");
@@ -3903,45 +4001,20 @@ async function runZenpoolStatus() {
     showReports();
     return;
   }
-  const creds = asArray(r.creds);
-  const exits = asArray(r.exits);
-  const s = r.stats || {};
-  const live = exits.filter((e) => e.alive).length;
-  let html = `<div class="result-card"><h3>Zen-пул</h3>`;
-  html += `<div class="ok-line" style="color:var(--muted)">запросов: ${s.requests || 0} · успешных: ${s.ok || 0} · ротаций: ${s.rotated || 0} · через выходы: ${s.exitUsed || 0}</div>`;
-  if (s.lastError) html += `<div class="diag-sub muted">последняя ошибка: ${esc(s.lastError)}</div>`;
-  html += `<div class="diag-sect">Аккаунты и ключи (${creds.length})</div>`;
-  if (!creds.length) html += `<div class="diag-sub muted">— нет аккаунтов: войди через scripts/zen-login.cmd, шлюз подхватит токен из opencode.db —</div>`;
-  for (const c of creds) {
-    const flags = [c.dead && "мёртв", c.daily && "суточная квота", c.cooldown && "кулдаун"].filter(Boolean).join(", ");
-    html += `<div class="diag-row"><span class="diag-name">${esc(c.id)}</span><span class="diag-meta">${esc(c.kind)} · использован ${c.used || 0} раз${flags ? " · " + esc(flags) : ""}</span></div>`;
-    if (c.lastError) html += `<div class="diag-sub muted">${esc(c.lastError)}</div>`;
-  }
-  html += `<div class="diag-sect">Выходы VPN (${live}/${exits.length} живых)</div>`;
-  if (!exits.length) html += `<div class="diag-sub muted">— выходы ещё не подняты, шлюз прогревает их в фоне —</div>`;
-  for (const e of exits) {
-    html += `<div class="diag-row"><span class="diag-name">${esc(e.remarks)}</span><span class="diag-meta">${esc(e.sub)} · ${e.alive ? `✓ ${e.ms} мс` : "✕ мёртв"}</span></div>`;
-  }
-  html += `<div class="diag-sub muted">Квота бесплатных моделей Zen привязана к exit IP: при 429 шлюз гасит выход на 10 минут и пробует следующий. Аккаунты не обходят IP-лимит, но ротация выходов — обходит.</div>`;
-  html += `<div class="diag-sect">Действия</div>
-    <div class="diag-fix"><button class="btn btn-mini" id="zenpoolRerun" type="button">Обновить</button>
-    <button class="btn btn-mini" id="zenpoolReload" type="button">Перечитать аккаунты</button></div>`;
-  html += `</div>`;
-  el.innerHTML = html;
-  showReports();
-  const rerun = $("#zenpoolRerun");
-  if (rerun) rerun.onclick = () => runZenpoolStatus();
-  const reload = $("#zenpoolReload");
-  if (reload) reload.onclick = async () => {
-    setBtnLoading(reload, true);
-    try {
-      const rr = await apiSafe("/api/zenpool-reload", { method: "POST" });
-      toast(rr && rr.ok ? "Аккаунты перечитаны" : ((rr && rr.error) || "Шлюз не отвечает"), rr && rr.ok ? "ok" : "err");
-      await runZenpoolStatus();
-    } finally {
-      setBtnLoading(reload, false);
+  paintZenpool(r);
+  // Автообновление, пока панель открыта: другой отчёт вытеснит #zenpoolRerun
+  // из DOM, и таймер сам себя остановит. Во время тест-чата не перерисовываем.
+  if (state.zenpoolTimer) clearInterval(state.zenpoolTimer);
+  state.zenpoolTimer = setInterval(async () => {
+    if (!document.getElementById("zenpoolRerun")) {
+      clearInterval(state.zenpoolTimer);
+      state.zenpoolTimer = null;
+      return;
     }
-  };
+    if (state.zenpoolTesting) return;
+    const rr = await apiSafe("/api/zenpool-status");
+    if (rr && rr.ok && document.getElementById("zenpoolRerun")) paintZenpool(rr);
+  }, 15000);
 }
 
 async function cleanAllOrphans(btn) {
@@ -4325,7 +4398,9 @@ function paintDigest() {
   const perks = asArray(r.perks);
   const news = asArray(r.news);
   const when = r.as_of ? `данные борда на ${esc(r.as_of)}` : "дата неизвестна";
-  const stale = r.stale ? ` · <span class="warn-line">кэш (сеть недоступна)</span>` : "";
+  const stale = r.fallback
+    ? ` · <span class="warn-line">борд недоступен — локальный снимок проверенной халявы</span>`
+    : r.stale ? ` · <span class="warn-line">кэш (сеть недоступна)</span>` : "";
   // Один фид висит, второй свеж: показываем что есть, а не красный экран.
   const partial = r.partial ? ` · <span class="warn-line">часть не загрузилась (${esc(r.error || "")})</span>` : "";
   const chip = (id, label, title) =>
