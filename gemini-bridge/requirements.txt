@@ -1,5 +1,0 @@
-gemini-webapi>=2.1.1
-fastapi>=0.115.0
-uvicorn>=0.30.0
-curl-cffi>=0.16.0
-pydantic>=2.10.0
